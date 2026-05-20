@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Private keys — NEVER commit
+_bundled_keys.py
+
+# Release / installer output
+release/
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
+
+# Whisper models — too large for GitHub (downloaded by installer)
+models/base/model.bin
+models/small/model.bin
+models/large-v3-turbo/
+
+# Logs and runtime data
+*.log
+build_log.txt
+crash.txt
+stderr.txt
+config.json
+history.json
+
+# OS
+.DS_Store
+Thumbs.db

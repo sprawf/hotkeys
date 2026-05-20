@@ -1,0 +1,28 @@
+# ── UI ────────────────────────────────────────────────────────────────────────
+customtkinter>=5.2.0
+pillow>=10.0.0
+
+# ── Hotkeys & clipboard ───────────────────────────────────────────────────────
+keyboard>=0.13.5
+pyperclip>=1.8.2
+pywin32>=306          # win32clipboard (used by core/typer.py)
+
+# ── System tray ───────────────────────────────────────────────────────────────
+pystray>=0.19.5
+
+# ── Text-refine providers ─────────────────────────────────────────────────────
+groq>=0.4.0
+cerebras-cloud-sdk>=1.0.0
+httpx>=0.25.0
+certifi>=2024.0.0
+
+# ── Speech-to-text (Whisper) ──────────────────────────────────────────────────
+faster-whisper>=1.0.0
+sounddevice>=0.4.6
+numpy>=1.24.0
+onnxruntime>=1.16.0
+noisereduce>=3.0.0
+
+# ── Optional: local Qwen GGUF (heavy — skip for cloud-only builds) ────────────
+# llama-cpp-python>=0.2.0
+# huggingface-hub>=0.20.0
