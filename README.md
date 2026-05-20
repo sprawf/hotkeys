@@ -1,48 +1,67 @@
 # ⚡ Hotkeys
 
-> **Rewrite any text, in any app, in under a second. No copy-paste. No switching windows. Just a hotkey.**
+**Rewrite any text, in any app, instantly. No copy-paste. No switching windows. Just a hotkey.**
 
-Hotkeys sits silently in your system tray and gives you two superpowers:
+Select text anywhere → press `Alt+Shift+W` → AI rewrites it and pastes it back. Done.  
+Works in Gmail, Notion, Slack, Word, VS Code, Discord — every app on your computer.
 
-- **AI Text Refiner** — select any text anywhere, press a hotkey, it gets rewritten by AI and pasted back instantly
-- **Voice-to-Text** — press a hotkey, speak, release — your words appear wherever your cursor is
-
-Works in every app. Notion, Gmail, Slack, Word, VS Code, browsers — anywhere.
+[![Windows](https://img.shields.io/badge/Windows-Download_v1.0-0078D6?style=for-the-badge&logo=windows)](https://github.com/sprawf/hotkeys/releases/download/v1.0.0/Hotkeys-v1.0-win64.zip)
+[![Mac](https://img.shields.io/badge/Mac-Installer-999999?style=for-the-badge&logo=apple)](https://github.com/sprawf/hotkeys/raw/main/install_mac.command)
+[![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.10+-blue?style=for-the-badge&logo=python)](https://python.org)
 
 ---
 
-## What makes it different
+## What it does
 
-Most AI writing tools live inside a browser tab or a separate window. You have to copy your text, switch apps, paste, wait, copy again, switch back, paste again.
+Most AI writing tools require you to open a browser tab, paste your text, wait, copy the result, switch back, and paste again. **That's 7 steps.**
 
-Hotkeys does it **in place**. Select text → press `Alt+Shift+W` → it's already rewritten and pasted back. Never leave the app you're in.
+Hotkeys does it in **1 step** — without leaving whatever you're typing in.
 
-The **prompt library** is what makes it powerful. Build a collection of reusable instructions:
+It lives in your system tray and gives you two superpowers:
 
-- *"Fix grammar and spelling"*
-- *"Make this sound more professional"*
-- *"Translate to Spanish"*
-- *"Make this shorter"*
-- *"Rewrite this as bullet points"*
+🖊️ **AI Text Refiner** — select any text, press a hotkey, it's rewritten and pasted back in under a second  
+🎙️ **Voice to Text** — press a hotkey, speak, your words appear wherever your cursor is — fully offline
 
-One click on any prompt → applied to your selected text → pasted back. Instantly.
+---
+
+## Demo
+
+> *Demo GIF coming soon — select text → press hotkey → text rewritten in place*
+
+---
+
+## The Prompt Library
+
+This is what makes Hotkeys genuinely useful. Build a personal library of reusable AI instructions:
+
+| Prompt | What it does |
+|---|---|
+| Fix grammar | Silently fixes typos and grammar without changing your tone |
+| Make professional | Rewrites casual text into formal language |
+| Make shorter | Trims your text down without losing meaning |
+| Translate to Spanish | Instantly translates in place |
+| Bullet points | Converts a wall of text into a clean list |
+| ELI5 | Rewrites complex text in simple language |
+
+One click on any prompt → applied → pasted back. Build as many as you want.
 
 ---
 
 ## Features
 
-| Feature | Description |
-|---|---|
-| 🎙️ Voice to text | Press hotkey → speak → text appears in any app |
-| ✍️ AI text refiner | Select text → hotkey → AI rewrites it in place |
-| 📚 Prompt library | Save and reuse your favourite AI instructions |
-| 🔍 Live search | Search your prompt library as you type |
-| 🔄 Drag to reorder | Drag prompts to organise them your way |
-| 📋 History | Browse all your past transcriptions |
-| 🔇 Noise reduction | Works even in noisy environments |
-| 🚀 Push-to-talk | Hold hotkey to record, release to transcribe |
-| ⚡ Instant paste | Output appears directly where your cursor is |
-| 🖥️ System tray | Runs in the background, zero UI clutter |
+| | Feature | Notes |
+|---|---|---|
+| ✍️ | **AI text refiner** | Works in any app, any text field |
+| 📚 | **Prompt library** | Save unlimited reusable AI prompts |
+| 🔍 | **Prompt search** | Find prompts instantly as you type |
+| 🔄 | **Drag to reorder** | Organise prompts by drag and drop |
+| 🎙️ | **Voice to text** | Fully offline, no data sent anywhere |
+| 🔇 | **Noise reduction** | Works in noisy environments |
+| 🚀 | **Push-to-talk** | Hold to record, release to transcribe |
+| 📋 | **Transcription history** | Browse and copy past recordings |
+| ⚡ | **Instant paste** | Output types directly where your cursor is |
+| 🖥️ | **System tray** | Zero UI clutter, always available |
 
 ---
 
@@ -59,47 +78,49 @@ All hotkeys are customisable in Settings.
 
 ---
 
-## AI Providers
-
-Hotkeys works with **Cerebras** and **Groq** — both offer free API tiers that are fast enough for real-time use.
-
-| Provider | Speed | Free tier |
-|---|---|---|
-| Cerebras | ~0.3s | ✅ Yes — [cerebras.ai](https://cerebras.ai) |
-| Groq | ~0.5s | ✅ Yes — [console.groq.com](https://console.groq.com) |
-
-Sign up, grab a free API key, paste it in Settings. Done.
-
----
-
 ## Installation
 
-### Windows
+### ⊞ Windows — one click, no setup
 
-1. Download the latest release: **[Hotkeys-v1.0-win64.zip](https://github.com/sprawf/hotkeys/releases)**
-2. Extract anywhere
+1. **[Download Hotkeys-v1.0-win64.zip](https://github.com/sprawf/hotkeys/releases/download/v1.0.0/Hotkeys-v1.0-win64.zip)**
+2. Extract the zip anywhere
 3. Double-click `Hotkeys.exe`
-4. The ⚡HK icon appears in your taskbar tray
+4. The ⚡HK icon appears in your taskbar tray — you're done
 
-No Python. No setup. No dependencies. Just run it.
-
----
-
-### Mac
-
-1. Download the installer: **[install_mac.command](https://github.com/sprawf/hotkeys/raw/main/install_mac.command)**
-2. Right-click it → **Open** (Mac security step, one time only)
-3. A terminal window opens and installs everything automatically (~10 min)
-4. Follow the on-screen prompt to grant keyboard permission
-5. Double-click **Hotkeys.command** on your Desktop to launch
-
-The installer handles Python, all packages, and the AI models (~600 MB download). You don't need to install anything manually.
+No Python. No pip. No dependencies. It just works.
 
 ---
 
-## Screenshots
+###  Mac — automated installer
 
-*Coming soon*
+1. **[Download install_mac.command](https://github.com/sprawf/hotkeys/raw/main/install_mac.command)**
+2. Right-click it → **Open** → click **Open** again (Mac security prompt)
+3. A terminal window installs everything automatically (~10 min, 600 MB models)
+4. Grant keyboard permission when prompted (one-time, 30 seconds)
+5. Double-click **Hotkeys.command** on your Desktop — done
+
+---
+
+## AI Providers — both free
+
+Hotkeys uses Cerebras or Groq for text refinement. Both are free and take 2 minutes to set up.
+
+| Provider | Speed | Free tier | Sign up |
+|---|---|---|---|
+| **Cerebras** | ~0.3s | ✅ Yes | [cerebras.ai](https://cerebras.ai) |
+| **Groq** | ~0.5s | ✅ Yes | [console.groq.com](https://console.groq.com) |
+
+Sign up → copy your API key → paste it in Hotkeys Settings. Done.
+
+Voice-to-text works without any API key — it runs fully offline on your device.
+
+---
+
+## Privacy
+
+- 🔒 **Voice is transcribed locally** — the Whisper model runs on your computer, nothing is sent to any server
+- 🌐 **Text refinement** goes to Cerebras or Groq — same as any AI assistant you already use
+- 🚫 No analytics, no telemetry, no account required
 
 ---
 
@@ -114,35 +135,32 @@ python -m venv venv
 venv\Scripts\pip install -r requirements.txt
 venv\Scripts\python main.py
 
-# Mac
+# Mac / Linux
 python3 -m venv venv
 venv/bin/pip install -r requirements_mac.txt
 venv/bin/python3 main.py
 ```
 
-Models are downloaded automatically on first run if not present locally.
-
 ---
 
 ## Tech stack
 
-- **UI** — CustomTkinter (dark themed, no web view)
-- **Speech-to-text** — faster-whisper (Whisper small/base models, runs fully offline)
-- **VAD** — Silero VAD (auto-stops recording when you stop speaking)
-- **AI providers** — Cerebras, Groq (cloud, requires API key)
-- **Hotkeys** — keyboard library (global, works across all apps)
-- **Tray** — pystray
-
----
-
-## Privacy
-
-- Voice is transcribed **locally on your device** — never sent to any server
-- Text refinement is sent to Cerebras or Groq (whichever you configure) — same as any AI assistant
-- No analytics, no telemetry, no accounts required
+| Component | Library |
+|---|---|
+| UI | CustomTkinter |
+| Speech-to-text | faster-whisper (runs offline) |
+| Voice activity detection | Silero VAD |
+| AI text refinement | Cerebras / Groq API |
+| Global hotkeys | keyboard |
+| System tray | pystray |
+| Packaging | PyInstaller |
 
 ---
 
 ## License
 
-MIT — free to use, modify, and distribute.
+MIT — free to use, fork, and build on.
+
+---
+
+*If this saved you time, consider leaving a ⭐ — it helps others find it.*
