@@ -145,6 +145,20 @@ def _test_vad():
 
 check('SileroVAD', _test_vad)
 
+# ── 7b. faster_whisper internal VAD model ─────────────────────────────────────
+
+def _test_fw_vad():
+    """faster_whisper/assets/silero_vad_v6.onnx must exist — used internally
+    during transcribe() regardless of whether we pass vad_filter=True."""
+    import faster_whisper
+    fw_assets = os.path.join(os.path.dirname(faster_whisper.__file__), 'assets')
+    vad_path = os.path.join(fw_assets, 'silero_vad_v6.onnx')
+    assert os.path.isfile(vad_path), f'faster_whisper internal VAD missing: {vad_path}'
+    size_kb = os.path.getsize(vad_path) // 1024
+    return f'{size_kb} KB'
+
+check('faster_whisper internal silero_vad_v6.onnx', _test_fw_vad)
+
 # ── 7. Platform-specific paths ────────────────────────────────────────────────
 log.info('\n── Platform checks ──────────────────────────────────────────')
 
