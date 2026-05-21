@@ -282,6 +282,7 @@ class App:
             'whisper:start':    lambda _: self._whisper_start_recording(),
             'whisper:stop':     lambda _: self._whisper_stop_recording(),
             'whisper:cancel':   lambda _: self._whisper_cancel_recording(),
+            'reload_hotkeys':   lambda _: self._reload_hotkeys_manual(),
             'whisper:status':   self._on_transcriber_status_event,
             'whisper:result':   self._on_whisper_result,
             'whisper:error':    self._on_whisper_error,
@@ -310,18 +311,37 @@ class App:
         })
 
     def _register_hotkeys(self) -> None:
-        keyboard.unhook_all()
+        """Register all global hotkeys, forcefully resetting the keyboard listener first."""
+        # ── Step 1: full teardown ─────────────────────────────────────────────
+        try:
+            keyboard.unhook_all()
+        except Exception:
+            pass
+
+        # Force-stop the keyboard listener thread so it gets a clean slate on
+        # the next add_hotkey call.  After multiple hard-kill / restart cycles
+        # the listener thread can become a ghost — new hooks are added but
+        # never actually fire.
+        try:
+            if hasattr(keyboard, '_listener') and keyboard._listener is not None:
+                keyboard._listener.stop()
+                keyboard._listener = None
+        except Exception:
+            pass
+
+        time.sleep(0.15)   # give the OS a moment to flush the hook chain
+
+        # ── Step 2: register with one automatic retry ─────────────────────────
         hk  = self._hotkey_cfg()
         ptt = self.config.get('push_to_talk', False)
-        try:
+
+        def _do_register():
             keyboard.add_hotkey(hk.get('refine',  'alt+shift+w'), self._hk_refine,  suppress=True)
             keyboard.add_hotkey(hk.get('library', 'alt+shift+e'), self._hk_library, suppress=True)
 
             if ptt:
-                # Push-to-talk: hold to record, release to stop.
-                # Use the last component of the whisper hotkey string as the PTT key.
-                whisper_hk  = hk.get('whisper', 'ctrl+enter')
-                ptt_key     = whisper_hk.split('+')[-1]
+                whisper_hk = hk.get('whisper', 'ctrl+enter')
+                ptt_key    = whisper_hk.split('+')[-1]
                 keyboard.on_press_key(
                     ptt_key,
                     lambda _: self._q.put(('whisper:start', None)),
@@ -337,9 +357,42 @@ class App:
                 keyboard.add_hotkey(hk.get('whisper', 'ctrl+enter'), self._hk_whisper, suppress=True)
 
             keyboard.add_hotkey('escape', self._hk_escape, suppress=False)
+
+        try:
+            _do_register()
             logger.info(f'Hotkeys registered: {hk}  PTT={ptt}')
         except Exception as e:
-            logger.error(f'Hotkey registration failed: {e}')
+            logger.warning(f'Hotkey registration failed ({e}) — retrying in 0.5 s')
+            time.sleep(0.5)
+            try:
+                keyboard.unhook_all()
+                _do_register()
+                logger.info(f'Hotkeys registered (retry ok): {hk}')
+            except Exception as e2:
+                logger.error(f'Hotkey registration failed after retry: {e2}')
+
+    def _reload_hotkeys_manual(self) -> None:
+        """Full reset from tray menu — cancels anything stuck, re-registers hotkeys."""
+        logger.info('Manual reload requested from tray.')
+        # Cancel any stuck recording
+        try:
+            if self._whisper_recording:
+                self._whisper_cancel_recording()
+        except Exception:
+            pass
+        # Cancel any stuck refine
+        try:
+            self.refine_overlay.hide()
+        except Exception:
+            pass
+        # Hide all overlays
+        try:
+            self.whisper_overlay.hide()
+        except Exception:
+            pass
+        # Re-register hotkeys cleanly
+        self._register_hotkeys()
+        self._notify('Hotkeys reset ⚡', 'All hotkeys reloaded and ready.')
 
     def _hk_refine(self) -> None:
         logger.info('Refine hotkey fired.')
@@ -674,9 +727,25 @@ class App:
         img = Image.new('RGBA', (64, 64), (0, 0, 0, 0))
         d   = ImageDraw.Draw(img)
         d.rounded_rectangle([2, 2, 62, 62], radius=14, fill='#1a1a2e')
+        # Try platform fonts in order; fall back to default PIL font
+        _font_candidates = [
+            'C:/Windows/Fonts/segoeui.ttf',          # Windows
+            '/System/Library/Fonts/Helvetica.ttc',   # macOS
+            '/System/Library/Fonts/Arial.ttf',       # macOS alt
+            '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',  # Linux
+        ]
+        fnt = None
+        for _fc in _font_candidates:
+            try:
+                fnt = ImageFont.truetype(_fc, 22)
+                break
+            except Exception:
+                continue
         try:
-            fnt = ImageFont.truetype('C:/Windows/Fonts/segoeui.ttf', 22)
-            d.text((8, 14), '⚡HK', fill='#a0a0ff', font=fnt)
+            if fnt:
+                d.text((8, 14), 'HK', fill='#a0a0ff', font=fnt)
+            else:
+                d.text((10, 20), 'HK', fill='#a0a0ff')
         except Exception:
             d.text((10, 20), 'HK', fill='#a0a0ff')
         return img
@@ -723,6 +792,7 @@ class App:
                 checked=lambda item: self.config.get('push_to_talk', False),
             ),
             pystray.Menu.SEPARATOR,
+            pystray.MenuItem('↺  Reload hotkeys', lambda: self._q.put(('reload_hotkeys', None))),
             pystray.MenuItem('Quit', self._quit),
         )
 
@@ -767,9 +837,9 @@ class App:
     def _watch_singleton_socket(self) -> None:
         """Background thread: waits for a new instance to signal QUIT.
 
-        Before acting on the signal we confirm a live Hotkeys process exists —
-        this filters out stale QUIT messages left over from rapid-launch races
-        where the sender has already exited.
+        The TCP connection itself is proof a new instance is running — we
+        do not do a secondary PID check, because in dist builds the process
+        name / cmdline heuristic is unreliable during the brief startup window.
         """
         if not _singleton_sock:
             return
@@ -780,12 +850,9 @@ class App:
                     conn.recv(16)
                 finally:
                     conn.close()
-                # Only quit if a real new instance is actually still running
-                if _find_other_hotkeys_pids():
-                    logger.info('New instance launched — shutting down gracefully.')
-                    self.root.after(0, self._quit)
-                    return
-                # else: stale QUIT from an already-dead launcher — ignore
+                logger.info('New instance launched — shutting down gracefully.')
+                self.root.after(0, self._quit)
+                return
             except Exception:
                 return   # socket closed during normal _quit()
 
@@ -842,17 +909,22 @@ _SINGLETON_PORT = 47_294   # localhost IPC port
 def _find_other_hotkeys_pids() -> list[int]:
     """Return PIDs of other TOP-LEVEL Hotkeys instances only.
 
-    The venv pythonw.exe is a launcher that spawns the real Python interpreter
-    as a child, then waits inside a Windows Job Object.  If we kill the launcher
-    (our own parent/ancestor), the Job Object closes and kills us too.
+    Works for both frozen dist builds (Hotkeys.exe / Hotkeys) and source
+    runs (python / pythonw / python3 … main.py).
 
-    We therefore exclude our entire lineage — both descendants AND ancestors —
-    from the kill list.  Only genuine *other* root instances are returned.
+    Excludes our entire lineage (descendants AND ancestors) so we never
+    accidentally kill the venv launcher (our parent) which would collapse
+    its Windows Job Object and kill us too.
     """
-    import psutil
-    my_pid = os.getpid()
+    try:
+        import psutil
+    except ImportError:
+        return []
 
-    # Build the set of PIDs we must never touch: our children AND our parents.
+    my_pid    = os.getpid()
+    is_frozen = getattr(sys, 'frozen', False)   # True when bundled by PyInstaller
+
+    # Build the set of PIDs we must never touch: us, our children, our parents.
     safe: set[int] = {my_pid}
     try:
         for c in psutil.Process(my_pid).children(recursive=True):
@@ -869,22 +941,33 @@ def _find_other_hotkeys_pids() -> list[int]:
     except Exception:
         pass
 
-    # First pass — collect all candidate PIDs
+    # Exe names to match (both platforms, case-insensitive)
+    FROZEN_NAMES  = {'hotkeys.exe', 'hotkeys'}
+    SOURCE_NAMES  = {'pythonw.exe', 'python.exe', 'python3', 'python',
+                     'python3.11', 'python3.12', 'hotkeys.exe', 'hotkeys'}
+
     candidates: dict[int, int] = {}   # pid → parent_pid
     for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'ppid']):
         try:
             if proc.pid in safe:
                 continue
             name = (proc.info['name'] or '').lower()
-            if name not in ('pythonw.exe', 'python.exe', 'hotkeys.exe'):
-                continue
-            cmdline = ' '.join(proc.info['cmdline'] or []).lower()
-            if 'hotkeys' in cmdline and 'main.py' in cmdline:
-                candidates[proc.pid] = proc.info.get('ppid') or 0
+
+            if is_frozen:
+                # Dist build: just match by executable name — no cmdline needed
+                if name in FROZEN_NAMES:
+                    candidates[proc.pid] = proc.info.get('ppid') or 0
+            else:
+                # Source run: python interpreter running main.py inside Hotkeys dir
+                if name not in SOURCE_NAMES:
+                    continue
+                cmdline = ' '.join(proc.info['cmdline'] or []).lower()
+                if 'main.py' in cmdline and 'hotkeys' in cmdline:
+                    candidates[proc.pid] = proc.info.get('ppid') or 0
         except Exception:
             pass
 
-    # Second pass — keep only roots (parent is not another candidate)
+    # Keep only roots (parent is not itself a candidate) to avoid double-counting
     return [pid for pid, ppid in candidates.items() if ppid not in candidates]
 
 
@@ -945,6 +1028,7 @@ def _ensure_single_instance(_depth: int = 0) -> None:
     # 4. Bind socket as graceful-quit channel for the NEXT launch
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(('127.0.0.1', _SINGLETON_PORT))
         s.listen(5)
         _singleton_sock = s
