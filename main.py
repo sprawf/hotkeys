@@ -754,8 +754,25 @@ class App:
         self._tray = pystray.Icon(
             'Hotkeys', self._make_icon(), self._tooltip(), self._make_menu(),
         )
-        threading.Thread(target=self._tray.run, daemon=True).start()
+        t = threading.Thread(target=self._run_tray, daemon=True)
+        t.start()
         logger.info('Tray started.')
+
+    def _run_tray(self) -> None:
+        """Run the pystray event loop. On macOS, AppKit must be invoked carefully
+        from a background thread — log any failure clearly instead of crashing silently."""
+        try:
+            self._tray.run()
+        except Exception as e:
+            logger.error(f'Tray crashed: {e}')
+            # On macOS pystray may fail if AppKit isn't available on this thread.
+            # The app continues working (hotkeys, transcription) — only the tray icon is lost.
+            if sys.platform == 'darwin':
+                logger.error(
+                    'macOS tray error — this usually means pystray could not access AppKit. '
+                    'The app will keep running but the menu bar icon will be missing. '
+                    'Check that pyobjc-framework-Cocoa is installed: pip install pyobjc-framework-Cocoa'
+                )
 
     def _make_menu(self) -> pystray.Menu:
         def prov_item(key: str, label: str) -> pystray.MenuItem:

@@ -56,7 +56,18 @@ success "Python ready: $($BREW_PYTHON --version)"
 
 # ── 3. Download app ───────────────────────────────────────────────────────────
 info "Downloading Hotkeys..."
-rm -rf "$APP_DIR" 2>/dev/null || true
+# Preserve user data (config, history, prompts) stored in Library/Application Support
+USER_DATA="$HOME/Library/Application Support/Hotkeys"
+if [ -d "$USER_DATA" ]; then
+    info "Preserving your settings and history..."
+fi
+# Only wipe code files, never the venv (speeds up reinstall) or user data
+# Remove known code dirs/files, leave venv and models intact if present
+for item in main.py storage.py engine.py overlay.py library.py settings.py \
+            history_ui.py dialogs.py theme.py single_instance.py \
+            core requirements_mac.txt prompts.json assets; do
+    rm -rf "$APP_DIR/$item" 2>/dev/null || true
+done
 mkdir -p "$APP_DIR"
 TMP_ZIP="$(mktemp /tmp/hotkeys_XXXX.zip)"
 curl -L --progress-bar "$REPO_URL" -o "$TMP_ZIP" || fail "Download failed. Check your internet connection."

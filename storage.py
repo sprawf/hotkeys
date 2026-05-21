@@ -14,7 +14,12 @@ VERSION  = '1.0.0'
 # ── Path helpers ──────────────────────────────────────────────────────────────
 
 def appdata_dir() -> str:
-    base = os.environ.get('APPDATA', os.path.expanduser('~'))
+    if sys.platform == 'win32':
+        base = os.environ.get('APPDATA', os.path.expanduser('~'))
+    elif sys.platform == 'darwin':
+        base = os.path.join(os.path.expanduser('~'), 'Library', 'Application Support')
+    else:
+        base = os.environ.get('XDG_CONFIG_HOME', os.path.join(os.path.expanduser('~'), '.config'))
     path = os.path.join(base, APP_NAME)
     os.makedirs(path, exist_ok=True)
     return path
