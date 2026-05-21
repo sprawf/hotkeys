@@ -6,7 +6,7 @@ from typing import Callable
 import customtkinter as ctk
 
 from dialogs import alert
-from engine  import PROVIDER_KEYS, GROQ_MODELS, CEREBRAS_MODELS
+from engine  import PROVIDER_KEYS, GROQ_MODELS, CEREBRAS_MODELS, local_provider_available
 from storage import set_autostart, appdata_dir
 from theme   import (
     BG, SURFACE, SURF2, SURF3, BORDER, BORDER2,
@@ -206,7 +206,8 @@ class SettingsWindow:
         self._prov_cards: dict[str, ctk.CTkFrame] = {}
 
         short_desc = {'local': 'Free · Offline', 'groq': 'Free tier', 'cerebras': 'Free tier · Fast'}
-        for i, key in enumerate(PROVIDER_KEYS):
+        visible_keys = [k for k in PROVIDER_KEYS if k != 'local' or local_provider_available()]
+        for i, key in enumerate(visible_keys):
             card = ctk.CTkFrame(prov_grid, fg_color=SURF2, corner_radius=RADIUS,
                                 border_width=2, border_color=BG, cursor='hand2')
             card.grid(row=0, column=i, padx=4, sticky='nsew')

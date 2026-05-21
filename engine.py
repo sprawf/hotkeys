@@ -29,6 +29,15 @@ except ImportError:
 _SSL_ERRS = ('SSL', 'CERTIFICATE', 'ConnectError', 'Connection error', 'certificate')
 
 
+def local_provider_available() -> bool:
+    """True only when llama_cpp is importable (not excluded from dist build)."""
+    try:
+        import llama_cpp  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _clean(text: str) -> str:
@@ -269,11 +278,17 @@ def build_provider(config: dict) -> Provider:
     if active == 'cerebras':
         if cerebras.ready and groq.ready:
             return FallbackProvider(cerebras, groq)
-        return cerebras if cerebras.ready else LocalProvider()
+        return cerebras if cerebras.ready else (LocalProvider() if local_provider_available() else cerebras)
 
     if active == 'groq':
         if groq.ready and cerebras.ready:
             return FallbackProvider(groq, cerebras)
-        return groq if groq.ready else LocalProvider()
+        return groq if groq.ready else (LocalProvider() if local_provider_available() else groq)
 
-    return LocalProvider()
+    # 'local' selected
+    if local_provider_available():
+        return LocalProvider()
+    # llama_cpp not in this build — fall back to cloud providers
+    if cerebras.ready and groq.ready:
+        return FallbackProvider(cerebras, groq)
+    return cerebras if cerebras.ready else groq

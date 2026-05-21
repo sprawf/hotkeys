@@ -27,7 +27,7 @@ from storage  import (
     appdata_dir, log_path, models_dir, assets_dir, history_path,
     save_history, load_history, make_whisper_cfg, _HISTORY_MAX_ENTRIES,
 )
-from engine      import build_provider, LocalProvider, Provider
+from engine      import build_provider, LocalProvider, Provider, local_provider_available
 from overlay     import OverlayWindow
 from library     import LibraryWindow
 from settings    import SettingsWindow
@@ -790,7 +790,7 @@ class App:
             pystray.MenuItem(f'Hotkeys  v{VERSION}', None, enabled=False),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem('Provider', pystray.Menu(
-                prov_item('local',    'Qwen 2.5 1.5B (Local · Free)'),
+                *([prov_item('local', 'Qwen 2.5 1.5B (Local · Free)')] if local_provider_available() else []),
                 prov_item('groq',     'Groq'),
                 prov_item('cerebras', 'Cerebras'),
             )),
