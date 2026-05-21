@@ -145,9 +145,11 @@ class Transcriber:
 
             # Graceful fallback: if requested model not bundled, use base
             if not model_path.exists():
+                logger.warning(f'Requested model {model_name!r} not found — falling back to base')
                 model_path = self._models_dir / 'base'
                 device, compute_type = 'cpu', 'int8'
 
+            logger.info(f'Loading Whisper model: {model_path.name}  device={device}  compute={compute_type}')
             cpu_threads = os.cpu_count() or 4
             self._model = WhisperModel(
                 str(model_path),
@@ -157,8 +159,10 @@ class Transcriber:
                 cpu_threads=cpu_threads if device == 'cpu' else 0,
             )
             self._model_ready.set()
+            logger.info(f'Whisper model ready ✓  ({model_path.name})')
             self._on_status('ready')
         except Exception:
+            logger.exception('Whisper model failed to load')
             self._on_status('error')
             self._dump_traceback()
 
