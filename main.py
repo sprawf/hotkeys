@@ -581,7 +581,12 @@ class App:
                 timer.cancel()
                 logger.error(f'Inference error: {e}')
                 if gen == self._refine_gen:
-                    self._q.put(('refine:error', str(e)[:60]))
+                    msg = str(e)
+                    if '429' in msg or 'rate' in msg.lower() or 'quota' in msg.lower():
+                        msg = 'Daily limit reached — try again later or add your own API key in Settings'
+                    elif 'api key' in msg.lower() or 'api_key' in msg.lower() or 'unauthorized' in msg.lower() or '401' in msg:
+                        msg = 'Invalid API key — check Settings'
+                    self._q.put(('refine:error', msg[:80]))
             finally:
                 self._q.put(('refine:unlock', gen))
 

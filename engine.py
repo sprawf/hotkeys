@@ -259,7 +259,16 @@ class FallbackProvider(Provider):
                     raise RuntimeError('Local fallback model not loaded yet — try again shortly.')
             elif not self._fallback.ready:
                 self._fallback.load()
-            return self._fallback.refine(text, system_prompt)
+            try:
+                return self._fallback.refine(text, system_prompt)
+            except Exception as e2:
+                # Both providers failed — give a clean user-facing message
+                if '429' in str(e2) or 'rate' in str(e2).lower() or 'quota' in str(e2).lower():
+                    raise RuntimeError(
+                        'Daily limit reached on both providers. '
+                        'Try again later or add your own API key in Settings.'
+                    )
+                raise
 
 
 # ── Factory ──────────────────────────────────────────────────────────────────
