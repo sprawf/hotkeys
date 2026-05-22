@@ -118,17 +118,19 @@ class SettingsWindow:
 
         section('HOTKEYS')
         HK_DEFAULTS = {
-            'refine':  'alt+shift+w',
-            'library': 'alt+shift+e',
-            'whisper': 'ctrl+shift+space',
+            'refine':      'alt+shift+w',
+            'library':     'alt+shift+e',
+            'whisper':     'ctrl+shift+space',
+            'undo_refine': 'alt+shift+z',
         }
         hk_cfg = self.config.get('hotkeys', {})
         self._hotkey_vars: dict[str, tk.StringVar] = {}
 
         hk_actions = [
-            ('refine',  'Refine selected text'),
-            ('library', 'Open Prompt Library'),
-            ('whisper', 'Toggle speech-to-text'),
+            ('refine',      'Refine selected text'),
+            ('library',     'Open Prompt Library'),
+            ('whisper',     'Toggle speech-to-text'),
+            ('undo_refine', 'Undo last refinement'),
         ]
         for action, label in hk_actions:
             row = ctk.CTkFrame(frame, fg_color='transparent')

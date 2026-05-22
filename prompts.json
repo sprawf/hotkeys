@@ -12,10 +12,10 @@
     "prompt": "Improve, Refine, Optimize, and Expand the User’s Prompt. Transform the original prompt into a more articulate, detailed, and intellectually rich version of itself. This refinement must: Clarify the user’s intent. Expand the scope where beneficial. Add precision, nuance, and contextual depth. Make the language more formal, expressive, and verbose. The result should read like a polished, high-level research or creative brief written by an expert. Return only the refined text, no commentary."
   },
   {
-    "title": "My prompt",
+    "title": "Translate",
     "color": "#FFF9C4",
     "hotkey": "f3",
-    "prompt": "Translate into arabic"
+    "prompt": "Translate the following text into Spanish. Return only the translated text — no explanation, no labels, no original text."
   },
   {
     "title": "System Prompt",
@@ -42,7 +42,7 @@
     "prompt": "Expand the input into a detailed, comprehensive version. Add relevant context, elaborate on implied details, and develop underdeveloped ideas — staying strictly within the scope of what the original implies. Do not introduce new topics or goals. Return only the expanded text."
   },
   {
-    "title": "Prof",
+    "title": "Professional",
     "color": "#DCEDC8",
     "hotkey": "f8",
     "prompt": "Rewrite the input in polished, professional language. Keep the same meaning and approximate length — do not expand, summarize, or add new content. Return only the rewritten text."

@@ -207,6 +207,10 @@ class App:
         self._sticky: 'PromptStickyNote | None' = None
         self._sticky_idx: int | None = None   # which prompt index is currently shown
 
+        # ── Undo last refinement ─────────────────────────────────────────────
+        self._undo_available: bool  = False
+        self._undo_t:         float = 0.0   # timestamp of last completed refinement
+
         # ── Hotkey re-registration guard ─────────────────────────────────────
         self._hk_reg_lock    = threading.Lock()
         self._hk_reg_pending = False   # set True when a save arrives mid-flight
@@ -285,6 +289,7 @@ class App:
         # ── Event dispatch ────────────────────────────────────────────────────
         self._dispatch = {
             'refine':           self._do_refine,
+            'undo_refine':      self._do_undo_refine,
             'library':          lambda _: self.library.show(),
             'settings':         lambda _: self.settings.show(),
             'history':          lambda _: self.history_win.show(self._history),
@@ -374,8 +379,9 @@ class App:
         ptt = self.config.get('push_to_talk', False)
 
         def _do_register():
-            keyboard.add_hotkey(hk.get('refine',  'alt+shift+w'), self._hk_refine,  suppress=True)
-            keyboard.add_hotkey(hk.get('library', 'alt+shift+e'), self._hk_library, suppress=True)
+            keyboard.add_hotkey(hk.get('refine',      'alt+shift+w'), self._hk_refine,      suppress=True)
+            keyboard.add_hotkey(hk.get('library',     'alt+shift+e'), self._hk_library,     suppress=True)
+            keyboard.add_hotkey(hk.get('undo_refine', 'alt+shift+z'), self._hk_undo_refine, suppress=True)
 
             if ptt:
                 whisper_hk = hk.get('whisper', 'ctrl+enter')
@@ -497,6 +503,9 @@ class App:
                 pass
         logger.info(f'Captured text ({len(captured)} chars): {captured[:80]!r}')
         self._q.put(('refine', captured))
+
+    def _hk_undo_refine(self) -> None:
+        self._q.put(('undo_refine', None))
 
     def _hk_library(self) -> None:
         self._q.put(('library', None))
@@ -740,6 +749,7 @@ class App:
             self.refine_overlay.show_error('API key required — open Settings')
             return
 
+        self._undo_available = False   # new refinement invalidates any prior undo
         self._refine_in_progress = True
         self._refine_gen += 1
         gen      = self._refine_gen
@@ -783,7 +793,23 @@ class App:
         self.refine_overlay.show_done(elapsed)
         pyperclip.copy(result)
         self.root.after(40, lambda: keyboard.send('ctrl+v'))   # was 60 ms
+        self._undo_available = True
+        self._undo_t         = time.time()
         logger.info(f'Refinement complete in {elapsed:.2f}s')
+
+    def _do_undo_refine(self, _) -> None:
+        """Undo the last AI refinement by sending Ctrl+Z to the active window."""
+        if not self._undo_available:
+            return
+        if time.time() - self._undo_t > 30.0:   # 30-second undo window
+            self._undo_available = False
+            return
+        self._undo_available = False
+        # Ctrl+Z in the focused app undoes our Ctrl+V paste, restoring the
+        # original selected text.  We delay 40 ms so the hotkey release clears
+        # before the synthetic key arrives.
+        self.root.after(40, lambda: keyboard.send('ctrl+z'))
+        logger.info('Undo last refinement')
 
     def _on_refine_timeout(self, gen: int) -> None:
         if gen != self._refine_gen:

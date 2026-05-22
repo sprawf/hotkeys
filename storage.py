@@ -86,9 +86,10 @@ DEFAULT_CONFIG: dict = {
     'autostart':       True,
     'push_to_talk':    False,
     'hotkeys': {
-        'refine':  'alt+shift+w',
-        'library': 'alt+shift+e',
-        'whisper': 'ctrl+enter',
+        'refine':       'alt+shift+w',
+        'library':      'alt+shift+e',
+        'whisper':      'ctrl+enter',
+        'undo_refine':  'alt+shift+z',
     },
     'providers': {
         'local':    {'model_id': 'Qwen/Qwen2.5-1.5B-Instruct-GGUF'},
