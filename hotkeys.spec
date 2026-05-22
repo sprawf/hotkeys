@@ -131,6 +131,7 @@ hiddenimports = [
     'theme',
     'spellcheck',
     'sticky_note',
+    '_bundled_keys',
     'core',
     'core.audio',
     'core.vad',
@@ -153,7 +154,6 @@ hiddenimports += collect_submodules('scipy.signal')
 # ── Excludes (heavy packages NOT used by this app) ────────────────────────────
 
 excludes = [
-    '_bundled_keys',   # no API keys in public builds — users enter their own
     'llama_cpp',
     'matplotlib',
     'contourpy',
