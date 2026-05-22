@@ -13,29 +13,65 @@ Works in Gmail, Notion, Slack, Word, VS Code, Discord — every app on your comp
 
 ---
 
-## What it does
+## What is this?
 
-Most AI writing tools require you to open a browser tab, paste your text, wait, copy the result, switch back, and paste again. **That's 7 steps.**
+Most AI writing tools make you open a browser tab, paste your text, wait, copy the result, switch back, and paste again. That's 7 steps — every single time.
 
-Hotkeys does it in **1 step** — without leaving whatever you're typing in.
+**Hotkeys does it in 1 step** — without ever leaving whatever you're writing in.
 
-It lives in your system tray and gives you three superpowers:
+It sits quietly in your system tray and gives you three superpowers:
 
-🖊️ **AI Text Refiner** — select any text, press a hotkey, it's rewritten and pasted back in under a second  
-⌨️ **Per-Prompt Hotkeys** — assign F1–F12 to any prompt and fire it from any app, no library needed  
-🎙️ **Voice to Text** — press a hotkey, speak, your words appear wherever your cursor is — fully offline
-
----
-
-## Demo
-
-> *Demo GIF coming soon — select text → press hotkey → text rewritten in place*
+| | |
+|---|---|
+| ✍️ **AI Text Refiner** | Select any text, press a hotkey — it's rewritten and pasted back in under a second |
+| ⌨️ **Custom Prompt Hotkeys** | Write any instruction, assign it F1–F12, fire it from any app instantly |
+| 🎙️ **Voice to Text** | Hold a hotkey, speak, your words appear wherever your cursor is — fully offline |
 
 ---
 
-## The Prompt Library
+## See it in action
 
-Build a personal library of reusable AI instructions. 16 prompts ship ready to use, each pre-assigned to a function key:
+### AI Text Refinement — one hotkey, done
+
+Select text anywhere, press `Alt+Shift+W`, watch it get fixed instantly:
+
+![AI text refinement demo](https://raw.githubusercontent.com/sprawf/hotkeys/main/docs/gif_refine_text.gif)
+
+---
+
+### Add your own prompt in seconds
+
+This is where Hotkeys becomes yours. Write any instruction, give it a name, and it's available from every app on your computer — instantly.
+
+Here's how to add a **"Translate to Spanish"** prompt in real time:
+
+![Adding a custom Translate to Spanish prompt](https://raw.githubusercontent.com/sprawf/hotkeys/main/docs/gif_add_prompt.gif)
+
+That's it. Once added, select any English text and press the hotkey — it translates in under a second:
+
+![Using the Translate to Spanish prompt](https://raw.githubusercontent.com/sprawf/hotkeys/main/docs/gif_translate.gif)
+
+---
+
+### The Prompt Library
+
+All your prompts in one place. Click any card to activate it, drag to reorder, right-click for options:
+
+![Prompt Library](https://raw.githubusercontent.com/sprawf/hotkeys/main/docs/screenshot_library.png)
+
+---
+
+### Press F1–F12: see the prompt before it fires
+
+Press any function key and a sticky note pops up showing the prompt. Edit it on the fly if you want, then press the key again to fire it:
+
+![Sticky note popup](https://raw.githubusercontent.com/sprawf/hotkeys/main/docs/screenshot_sticky.png)
+
+---
+
+## The Prompt Library — make it yours
+
+The library ships with 16 ready-to-use prompts. Each one is a single instruction that gets applied to whatever text you've selected.
 
 | Hotkey | Prompt | What it does |
 |---|---|---|
@@ -56,54 +92,26 @@ Build a personal library of reusable AI instructions. 16 prompts ship ready to u
 | — | Devil's Advocate | Argues the exact opposite with equal conviction |
 | — | Haiku | Distils the core idea into a 5-7-5 haiku |
 
-Press the hotkey → a floating sticky note opens showing the prompt → press again to apply. Edit the prompt on the fly before it fires. Build as many custom prompts as you want.
+These are just the starting point. Hit **+ Add** to write your own.
+
+**The only limit is your imagination.** Want a prompt that rewrites emails in your exact voice? Converts meeting notes into action items? Translates to your language? Summarises legal contracts in plain English? Turns rough ideas into job postings?
+
+**Add it in 10 seconds and it works everywhere, instantly.**
+
+> **Tip:** Press any hotkey to see a floating sticky note preview. Edit the prompt on the fly before it fires, then press the key again to apply.
 
 ---
 
-## Features
-
-| | Feature | Notes |
-|---|---|---|
-| ✍️ | **AI text refiner** | Works in any app, any text field |
-| 📚 | **Prompt library** | 16 built-in prompts, unlimited custom ones |
-| ⌨️ | **Per-prompt hotkeys** | Assign F1–F12 to any prompt; fires from any app |
-| 🗒️ | **Sticky note popup** | Preview and edit a prompt before it fires; press again to apply |
-| 🔤 | **Live spell check** | Misspellings underlined in red as you type in the editor |
-| 🔍 | **Prompt search** | Find prompts instantly as you type |
-| 🔄 | **Drag to reorder** | Organise prompts by drag and drop |
-| 🎙️ | **Voice to text** | Fully offline, no data sent anywhere |
-| 🔇 | **Noise reduction** | Works in noisy environments |
-| 🚀 | **Push-to-talk** | Hold to record, release to transcribe |
-| 📋 | **Transcription history** | Browse and copy past recordings |
-| ⚡ | **Instant paste** | Output types directly where your cursor is |
-| 🖥️ | **System tray** | Zero UI clutter, always available |
-
----
-
-## Hotkeys
-
-| Action | Default shortcut |
-|---|---|
-| Refine selected text with AI | `Alt + Shift + W` |
-| Open prompt library | `Alt + Shift + E` |
-| Fire prompt 1–12 | `F1` – `F12` |
-| Start / stop voice recording | `Ctrl + Enter` |
-| Cancel recording | `Escape` |
-
-All hotkeys are customisable in Settings. Per-prompt hotkeys are assigned per-prompt via right-click → **Assign hotkey**.
-
----
-
-## Installation
+## How to install
 
 ### ⊞ Windows — one click, no setup
 
 1. **[Download Hotkeys-v2.0-win64.zip](https://github.com/sprawf/hotkeys/releases/download/v2.0.0/Hotkeys-v2.0-win64.zip)**
-2. Extract the zip anywhere
-3. Double-click `Hotkeys.exe`
+2. Extract the zip — you'll get a `Hotkeys` folder
+3. Open the folder and double-click `Hotkeys.exe`
 4. The ⚡ icon appears in your taskbar tray — you're done
 
-No Python. No pip. No dependencies. It just works.
+No Python. No pip. No installing anything. It just works.
 
 > **[Download v1.0 (legacy)](https://github.com/sprawf/hotkeys/releases/download/v1.0.0/Hotkeys-v1.0-win64.zip)**
 
@@ -112,23 +120,84 @@ No Python. No pip. No dependencies. It just works.
 ### 🍎 Mac — automated installer
 
 1. **[Download install_mac.command](https://github.com/sprawf/hotkeys/raw/main/install_mac.command)**
-2. Right-click it → **Open** → click **Open** again (Mac security prompt)
+2. Right-click → **Open** → click **Open** again (Mac security prompt)
 3. A terminal window installs everything automatically (~10 min, 600 MB models)
 4. Grant keyboard permission when prompted (one-time, 30 seconds)
 5. Double-click **Hotkeys.command** on your Desktop — done
 
 ---
 
+## How to use it
+
+### Refine any text (AI rewrite)
+
+1. Select text in any app
+2. Press `Alt + Shift + W`
+3. Wait ~0.5 seconds — the text is rewritten and pasted back
+
+### Use a prompt from the library
+
+1. Select text in any app
+2. Press the prompt's hotkey (e.g. `F5` for Simplify)
+3. A sticky note appears — read the prompt, edit it if you want
+4. Press the same key again to fire it
+
+### Add your own prompt
+
+1. Press `Alt + Shift + E` to open the Prompt Library
+2. Click **+ Add**
+3. Give it a name and write your instruction
+4. *(Optional)* Assign a hotkey via right-click → **Assign hotkey**
+5. Click **Save** — available everywhere immediately
+
+### Dictate text (voice to text)
+
+1. Place your cursor where you want the text
+2. Press `Ctrl + Enter` to start recording
+3. Speak naturally
+4. Press `Ctrl + Enter` again to stop — your words appear instantly
+
+---
+
+## Settings
+
+Everything is configurable. Open the library (`Alt+Shift+E`) and click the gear icon, or right-click the tray icon.
+
+![Settings panel](https://raw.githubusercontent.com/sprawf/hotkeys/main/docs/screenshot_settings.png)
+
+- **AI Provider** — switch between Cerebras and Groq, enter your API key
+- **Hotkeys** — change any global shortcut
+- **Voice model** — choose small (fast) or large (accurate), pick your microphone
+- **Transcription** — language, beam size, custom vocabulary
+- **Autostart** — launch automatically with Windows
+- **Push-to-talk** — hold to record, release to transcribe
+
+---
+
+## All default hotkeys
+
+| Action | Shortcut |
+|---|---|
+| Refine selected text with AI | `Alt + Shift + W` |
+| Open Prompt Library | `Alt + Shift + E` |
+| Fire prompt 1–12 | `F1` – `F12` |
+| Start / stop voice recording | `Ctrl + Enter` |
+| Cancel recording | `Escape` |
+
+All hotkeys are customisable in Settings. Per-prompt hotkeys are assigned per prompt via right-click → **Assign hotkey**.
+
+---
+
 ## AI Providers — both free
 
-Hotkeys uses Cerebras or Groq for text refinement. Both are free and take 2 minutes to set up.
+Hotkeys uses **Cerebras** or **Groq** to rewrite your text. Both are completely free and take 2 minutes to set up.
 
 | Provider | Speed | Free tier | Sign up |
 |---|---|---|---|
-| **Cerebras** | ~0.3s | ✅ Yes | [cerebras.ai](https://cerebras.ai) |
-| **Groq** | ~0.5s | ✅ Yes | [console.groq.com](https://console.groq.com) |
+| **Cerebras** | ~0.3 s | ✅ Yes | [cerebras.ai](https://cerebras.ai) |
+| **Groq** | ~0.5 s | ✅ Yes | [console.groq.com](https://console.groq.com) |
 
-Sign up → copy your API key → paste it into Hotkeys Settings. Done.
+Sign up → copy your API key → paste it into Settings → done.
 
 Voice-to-text works without any API key — it runs fully offline on your device.
 
@@ -139,6 +208,26 @@ Voice-to-text works without any API key — it runs fully offline on your device
 - 🔒 **Voice is transcribed locally** — the Whisper model runs on your computer, nothing is sent anywhere
 - 🌐 **Text refinement** goes to Cerebras or Groq — same as any AI assistant you already use
 - 🚫 No analytics, no telemetry, no account required
+
+---
+
+## Feature list
+
+| | Feature | Notes |
+|---|---|---|
+| ✍️ | **AI text refiner** | Works in any app, any text field |
+| 📚 | **Prompt library** | 16 built-in prompts, unlimited custom ones |
+| ⌨️ | **Per-prompt hotkeys** | Assign F1–F12 to any prompt; fires from any app |
+| 🗒️ | **Sticky note popup** | Preview and edit a prompt before it fires |
+| 🔤 | **Live spell check** | Misspellings underlined in red as you type |
+| 🔍 | **Prompt search** | Find prompts instantly as you type |
+| 🔄 | **Drag to reorder** | Organise prompts by drag and drop |
+| 🎙️ | **Voice to text** | Fully offline, no data sent anywhere |
+| 🔇 | **Noise reduction** | Works in noisy environments |
+| 🚀 | **Push-to-talk** | Hold to record, release to transcribe |
+| 📋 | **Transcription history** | Browse and copy past recordings |
+| ⚡ | **Instant paste** | Output types directly where your cursor is |
+| 🖥️ | **System tray** | Zero UI clutter, always available |
 
 ---
 
