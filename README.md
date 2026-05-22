@@ -29,43 +29,11 @@ It sits quietly in your system tray and gives you three superpowers:
 
 ---
 
-## See it in action
-
-### AI Text Refinement — one hotkey, done
-
-Select text anywhere, press `Alt+Shift+W`, watch it get fixed instantly:
-
-![AI text refinement demo](https://raw.githubusercontent.com/sprawf/hotkeys/main/docs/gif_refine_text.gif)
-
----
-
-### Add your own prompt in seconds
-
-This is where Hotkeys becomes yours. Write any instruction, give it a name, and it's available from every app on your computer — instantly.
-
-Here's how to add a **"Translate to Spanish"** prompt in real time:
-
-![Adding a custom Translate to Spanish prompt](https://raw.githubusercontent.com/sprawf/hotkeys/main/docs/gif_add_prompt.gif)
-
-That's it. Once added, select any English text and press the hotkey — it translates in under a second:
-
-![Using the Translate to Spanish prompt](https://raw.githubusercontent.com/sprawf/hotkeys/main/docs/gif_translate.gif)
-
----
-
-### The Prompt Library
+## The Prompt Library
 
 All your prompts in one place. Click any card to activate it, drag to reorder, right-click for options:
 
 ![Prompt Library](https://raw.githubusercontent.com/sprawf/hotkeys/main/docs/screenshot_library.png)
-
----
-
-### Press F1–F12: see the prompt before it fires
-
-Press any function key and a sticky note pops up showing the prompt. Edit it on the fly if you want, then press the key again to fire it:
-
-![Sticky note popup](https://raw.githubusercontent.com/sprawf/hotkeys/main/docs/screenshot_sticky.png)
 
 ---
 
@@ -162,8 +130,6 @@ No Python. No pip. No installing anything. It just works.
 ## Settings
 
 Everything is configurable. Open the library (`Alt+Shift+E`) and click the gear icon, or right-click the tray icon.
-
-![Settings panel](https://raw.githubusercontent.com/sprawf/hotkeys/main/docs/screenshot_settings.png)
 
 - **AI Provider** — switch between Cerebras and Groq, enter your API key
 - **Hotkeys** — change any global shortcut
