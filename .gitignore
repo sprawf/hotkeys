@@ -33,7 +33,9 @@ models/base/model.bin
 models/small/model.bin
 models/large-v3-turbo/
 
-# Logs and runtime data
+# Logs and runtime data — kept locally in logs/, never committed
+logs/*
+!logs/.gitkeep
 *.log
 build_log.txt
 crash.txt

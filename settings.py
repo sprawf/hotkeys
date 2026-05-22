@@ -6,7 +6,9 @@ from typing import Callable
 import customtkinter as ctk
 
 from dialogs import alert
-from engine  import PROVIDER_KEYS, GROQ_MODELS, CEREBRAS_MODELS, local_provider_available
+from engine  import (PROVIDER_KEYS, GROQ_MODELS, CEREBRAS_MODELS,
+                     OPENAI_MODELS, ANTHROPIC_MODELS, GEMINI_MODELS,
+                     local_provider_available)
 from storage import set_autostart, appdata_dir
 from theme   import (
     BG, SURFACE, SURF2, SURF3, BORDER, BORDER2,
@@ -205,16 +207,30 @@ class SettingsWindow:
         prov_grid.pack(fill='x', padx=PAD, pady=(0, PAD_SM))
         self._prov_cards: dict[str, ctk.CTkFrame] = {}
 
-        short_desc = {'local': 'Free · Offline', 'groq': 'Free tier', 'cerebras': 'Free tier · Fast'}
+        short_desc = {
+            'local':     'Free · Offline',
+            'groq':      'Free tier',
+            'cerebras':  'Free tier · Fast',
+            'openai':    'Paid · GPT-4o',
+            'anthropic': 'Paid · Claude',
+            'gemini':    'Free tier',
+            'custom':    'Any endpoint',
+        }
         visible_keys = [k for k in PROVIDER_KEYS if k != 'local' or local_provider_available()]
+
+        N_COLS = 3
+        for col_i in range(N_COLS):
+            prov_grid.columnconfigure(col_i, weight=1)
+
         for i, key in enumerate(visible_keys):
-            card = ctk.CTkFrame(prov_grid, fg_color=SURF2, corner_radius=RADIUS,
-                                border_width=2, border_color=BG, cursor='hand2')
-            card.grid(row=0, column=i, padx=4, sticky='nsew')
-            prov_grid.columnconfigure(i, weight=1)
+            row_i = i // N_COLS
+            col_i = i % N_COLS
+            card  = ctk.CTkFrame(prov_grid, fg_color=SURF2, corner_radius=RADIUS,
+                                 border_width=2, border_color=BG, cursor='hand2')
+            card.grid(row=row_i, column=col_i, padx=4, pady=4, sticky='nsew')
             ctk.CTkLabel(card, text=key.upper(), font=(FONT_FAMILY, 8, 'bold'),
                          text_color=ACCENT).pack(padx=PAD_SM, pady=(8, 0))
-            ctk.CTkLabel(card, text=short_desc[key], font=(FONT_FAMILY, 8),
+            ctk.CTkLabel(card, text=short_desc.get(key, ''), font=(FONT_FAMILY, 8),
                          text_color=TEXT_S).pack(padx=PAD_SM, pady=(0, 8))
             card.bind('<Button-1>', lambda e, k=key: self._pick_provider(k))
             for child in card.winfo_children():
@@ -232,10 +248,16 @@ class SettingsWindow:
         self._cred_host = ctk.CTkFrame(frame, fg_color='transparent')
         self._cred_host.pack(fill='x', padx=PAD)
 
-        models_map = {'groq': GROQ_MODELS, 'cerebras': CEREBRAS_MODELS}
-        for key in ['groq', 'cerebras']:
+        # ── Standard providers: API key + model ───────────────────────────────────
+        _std_models: dict[str, list[str]] = {
+            'groq':      GROQ_MODELS,
+            'cerebras':  CEREBRAS_MODELS,
+            'openai':    OPENAI_MODELS,
+            'anthropic': ANTHROPIC_MODELS,
+            'gemini':    GEMINI_MODELS,
+        }
+        for key, models in _std_models.items():
             p      = pcfg.get(key, {})
-            models = models_map[key]
             cframe = ctk.CTkFrame(self._cred_host, fg_color='transparent')
             self._api_widgets[key] = {'frame': cframe}
 
@@ -245,10 +267,10 @@ class SettingsWindow:
             key_row.pack(fill='x', pady=(0, 4))
 
             key_var = tk.StringVar(value=p.get('api_key', ''))
-            entry = ctk.CTkEntry(key_row, textvariable=key_var, width=280, show='•',
-                                 fg_color=SURF2, border_color=BORDER2, border_width=1,
-                                 text_color=TEXT_P, font=(FONT_FAMILY, 10),
-                                 corner_radius=RADIUS_SM)
+            entry   = ctk.CTkEntry(key_row, textvariable=key_var, show='•',
+                                   fg_color=SURF2, border_color=BORDER2, border_width=1,
+                                   text_color=TEXT_P, font=(FONT_FAMILY, 10),
+                                   corner_radius=RADIUS_SM)
             entry.pack(side='left', fill='x', expand=True)
             ctk.CTkButton(
                 key_row, text='Show', width=54, height=32,
@@ -270,12 +292,67 @@ class SettingsWindow:
             ctk.CTkLabel(cframe, text='Model', font=FONT_SM_BOLD,
                          text_color=TEXT_S).pack(anchor='w', pady=(0, 2))
             model_var = tk.StringVar(value=p.get('model', models[0]))
-            ctk.CTkComboBox(cframe, values=models, variable=model_var, width=260,
+            # groq/cerebras: readonly (curated list); others: editable (user may type newer IDs)
+            cb_state  = 'readonly' if key in ('groq', 'cerebras') else 'normal'
+            ctk.CTkComboBox(cframe, values=models, variable=model_var, width=320,
                             fg_color=SURF2, border_color=BORDER2, border_width=1,
                             text_color=TEXT_P, button_color=SURF3,
                             dropdown_fg_color=SURFACE, font=(FONT_FAMILY, 10),
-                            state='readonly', corner_radius=RADIUS_SM).pack(anchor='w', pady=(0, PAD))
+                            state=cb_state, corner_radius=RADIUS_SM).pack(anchor='w', pady=(0, PAD))
             self._api_widgets[key]['model'] = model_var
+
+        # ── Custom provider: base URL + optional key + model name ─────────────────
+        cpfg   = pcfg.get('custom', {})
+        cframe = ctk.CTkFrame(self._cred_host, fg_color='transparent')
+        self._api_widgets['custom'] = {'frame': cframe}
+
+        ctk.CTkLabel(cframe, text='Base URL',
+                     font=FONT_SM_BOLD, text_color=TEXT_S).pack(anchor='w', pady=(0, 2))
+        url_var = tk.StringVar(value=cpfg.get('base_url', ''))
+        ctk.CTkEntry(cframe, textvariable=url_var,
+                     placeholder_text='http://localhost:11434/v1',
+                     fg_color=SURF2, border_color=BORDER2, border_width=1,
+                     text_color=TEXT_P, font=(FONT_FAMILY, 10),
+                     corner_radius=RADIUS_SM).pack(fill='x', pady=(0, PAD_SM))
+        self._api_widgets['custom']['base_url'] = url_var
+
+        ctk.CTkLabel(cframe, text='API Key  (optional — leave blank for local servers)',
+                     font=FONT_SM_BOLD, text_color=TEXT_S).pack(anchor='w', pady=(0, 2))
+        ckey_row = ctk.CTkFrame(cframe, fg_color='transparent')
+        ckey_row.pack(fill='x', pady=(0, PAD_SM))
+        ckey_var = tk.StringVar(value=cpfg.get('api_key', ''))
+        centry   = ctk.CTkEntry(ckey_row, textvariable=ckey_var, show='•',
+                                fg_color=SURF2, border_color=BORDER2, border_width=1,
+                                text_color=TEXT_P, font=(FONT_FAMILY, 10),
+                                corner_radius=RADIUS_SM)
+        centry.pack(side='left', fill='x', expand=True)
+        ctk.CTkButton(
+            ckey_row, text='Show', width=54, height=32,
+            fg_color=SURF3, hover_color=SURF2, text_color=TEXT_S,
+            font=(FONT_FAMILY, 9), corner_radius=RADIUS_SM,
+            command=lambda e=centry: e.configure(show='' if e.cget('show') == '•' else '•'),
+        ).pack(side='left', padx=(4, 0))
+        ctest_btn = ctk.CTkButton(
+            ckey_row, text='Test', width=54, height=32,
+            fg_color=SURF3, hover_color=SURF2, text_color=TEXT_S,
+            font=(FONT_FAMILY, 9), corner_radius=RADIUS_SM,
+        )
+        ctest_btn.pack(side='left', padx=(4, 0))
+        ctest_btn.configure(
+            command=lambda v=ckey_var, u=url_var, b=ctest_btn: self._test_api_key(
+                'custom', v, b, extra={'base_url': u.get()})
+        )
+        self._api_widgets['custom']['api_key'] = ckey_var
+
+        ctk.CTkLabel(cframe, text='Model Name',
+                     font=FONT_SM_BOLD, text_color=TEXT_S).pack(anchor='w', pady=(0, 2))
+        cmodel_var = tk.StringVar(value=cpfg.get('model', ''))
+        ctk.CTkEntry(cframe, textvariable=cmodel_var,
+                     placeholder_text='e.g. llama3.2, mistral, qwen2.5, gpt-4o…',
+                     fg_color=SURF2, border_color=BORDER2, border_width=1,
+                     text_color=TEXT_P, font=(FONT_FAMILY, 10),
+                     corner_radius=RADIUS_SM).pack(fill='x', pady=(0, PAD))
+        self._api_widgets['custom']['model'] = cmodel_var
 
         self._refresh_cred_panel()
         return frame
@@ -430,13 +507,27 @@ class SettingsWindow:
     # ── API key test ──────────────────────────────────────────────────────────
 
     def _test_api_key(self, provider: str, key_var: tk.StringVar,
-                      btn: ctk.CTkButton) -> None:
-        api_key = key_var.get().strip()
-        if not api_key:
+                      btn: ctk.CTkButton, extra: dict | None = None) -> None:
+        api_key  = key_var.get().strip()
+        extra    = extra or {}
+        base_url = extra.get('base_url', '')
+
+        if provider != 'custom' and not api_key:
             alert(self.win, 'No API Key', 'Enter an API key before testing.')
+            return
+        if provider == 'custom' and not base_url:
+            alert(self.win, 'No Base URL', 'Enter a base URL before testing.')
             return
 
         btn.configure(state='disabled', text='Testing…')
+
+        # Snapshot the custom model name on the main thread before spawning
+        custom_model = ''
+        if provider == 'custom':
+            try:
+                custom_model = self._api_widgets['custom']['model'].get().strip()
+            except Exception:
+                pass
 
         def _run() -> None:
             success = False
@@ -457,6 +548,44 @@ class SettingsWindow:
                         max_tokens=1,
                     )
                     success = True
+                elif provider == 'openai':
+                    from openai import OpenAI
+                    OpenAI(api_key=api_key).chat.completions.create(
+                        model='gpt-4o-mini',
+                        messages=[{'role': 'user', 'content': 'hi'}],
+                        max_tokens=1,
+                    )
+                    success = True
+                elif provider == 'anthropic':
+                    import anthropic
+                    anthropic.Anthropic(api_key=api_key).messages.create(
+                        model='claude-3-5-haiku-20241022',
+                        max_tokens=1,
+                        messages=[{'role': 'user', 'content': 'hi'}],
+                    )
+                    success = True
+                elif provider == 'gemini':
+                    from openai import OpenAI
+                    OpenAI(
+                        api_key=api_key,
+                        base_url='https://generativelanguage.googleapis.com/v1beta/openai/',
+                    ).chat.completions.create(
+                        model='gemini-2.0-flash',
+                        messages=[{'role': 'user', 'content': 'hi'}],
+                        max_tokens=1,
+                    )
+                    success = True
+                elif provider == 'custom':
+                    from openai import OpenAI
+                    OpenAI(
+                        api_key=api_key or 'none',
+                        base_url=base_url,
+                    ).chat.completions.create(
+                        model=custom_model or 'test',
+                        messages=[{'role': 'user', 'content': 'hi'}],
+                        max_tokens=1,
+                    )
+                    success = True
             except Exception:
                 success = False
 
@@ -467,11 +596,8 @@ class SettingsWindow:
                 else:
                     btn.configure(text='✗ Failed', fg_color=ERR, hover_color=ERR,
                                   text_color='#ffffff', state='normal')
-
-                def _reset() -> None:
-                    btn.configure(text='Test', fg_color=SURF3, hover_color=SURF2,
-                                  text_color=TEXT_S)
-                self.win.after(3000, _reset)
+                self.win.after(3000, lambda: btn.configure(
+                    text='Test', fg_color=SURF3, hover_color=SURF2, text_color=TEXT_S))
 
             self.win.after(0, _update)
 
@@ -481,6 +607,15 @@ class SettingsWindow:
 
     def _save(self) -> None:
         cfg = dict(self.config)
+
+        # Reject fields still showing the capture-in-progress placeholder
+        _PLACEHOLDER = '… press keys …'
+        for action, var in self._hotkey_vars.items():
+            if var.get().strip() == _PLACEHOLDER:
+                alert(self.win, 'Hotkey Not Set',
+                      'A hotkey field is still in recording mode.\n'
+                      'Press a key combination, or click Record again to cancel.')
+                return
 
         # Check for duplicate hotkeys
         hk_values = [v.get().strip().lower() for v in self._hotkey_vars.values() if v.get().strip()]
@@ -494,13 +629,23 @@ class SettingsWindow:
         cfg['autostart']       = self._autostart_var.get()
         cfg['hotkeys']         = {k: v.get().strip() for k, v in self._hotkey_vars.items()}
 
-        # Providers
+        # Providers — standard (API key + model)
         cfg.setdefault('providers', {})
-        for key in ['groq', 'cerebras']:
+        for key in ['groq', 'cerebras', 'openai', 'anthropic', 'gemini']:
+            if key not in self._api_widgets:
+                continue
             w = self._api_widgets[key]
             cfg['providers'].setdefault(key, {})
             cfg['providers'][key]['api_key'] = w['api_key'].get().strip()
-            cfg['providers'][key]['model']   = w['model'].get()
+            cfg['providers'][key]['model']   = w['model'].get().strip()
+
+        # Custom provider
+        if 'custom' in self._api_widgets:
+            w = self._api_widgets['custom']
+            cfg['providers'].setdefault('custom', {})
+            cfg['providers']['custom']['api_key']  = w['api_key'].get().strip()
+            cfg['providers']['custom']['base_url'] = w['base_url'].get().strip()
+            cfg['providers']['custom']['model']    = w['model'].get().strip()
 
         # Whisper
         cfg.setdefault('whisper', {})

@@ -236,11 +236,13 @@ def load_prompts() -> list:
 
 
 def save_prompts(prompts: list) -> None:
-    try:
-        with open(prompts_path(), 'w', encoding='utf-8') as f:
-            json.dump(prompts, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        logger.error(f'Prompts save error: {e}')
+    data = json.dumps(prompts, indent=2, ensure_ascii=False)
+    for path in (prompts_path(), resource_path('prompts.json')):
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(data)
+        except Exception as e:
+            logger.error(f'Prompts save error ({path}): {e}')
 
 
 # ── History ───────────────────────────────────────────────────────────────────

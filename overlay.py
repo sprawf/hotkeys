@@ -47,8 +47,9 @@ class OverlayWindow:
         self._bar_id   = None
         self._tick     = False
         self._t0       = 0.0
-        self._fnt      = TkFont(family=FONT_FAMILY, size=11)
-        self._fnt_mono = TkFont(family='Consolas', size=11)
+        self._fnt             = TkFont(family=FONT_FAMILY, size=11)
+        self._fnt_mono        = TkFont(family='Consolas', size=11)
+        self._safety_timer_id = None   # after() ID for the 30 s transcribe safety close
 
     # ── Refine pill states ────────────────────────────────────────────────────
 
@@ -111,9 +112,13 @@ class OverlayWindow:
             self._set_bar(ACCENT)
         else:
             self._build('⏳  Transcribing...', _TEXT_CLR, ACCENT)
-        # Safety: auto-dismiss after 30s in case transcriber never reports back
+        # Safety: auto-dismiss after 30 s in case transcriber never reports back.
+        # Cancel any previous timer first — if show_transcribing is called again
+        # before the old 30 s fires, we must not let the stale callback destroy
+        # the new window.
+        self._cancel_safety_timer()
         if self._win:
-            self._win.after(30_000, self._close)
+            self._safety_timer_id = self.root.after(30_000, self._close)
 
     def show_whisper_done(self, elapsed: float) -> None:
         self._tick = False
@@ -248,8 +253,17 @@ class OverlayWindow:
         self._set_text(f'🎙  Recording...  {elapsed:.1f}s')
         self._win.after(80, self._update_recording)
 
+    def _cancel_safety_timer(self) -> None:
+        if self._safety_timer_id is not None:
+            try:
+                self.root.after_cancel(self._safety_timer_id)
+            except Exception:
+                pass
+            self._safety_timer_id = None
+
     def _close(self) -> None:
         self._tick = False
+        self._cancel_safety_timer()
         if self._win:
             try:
                 self._win.destroy()

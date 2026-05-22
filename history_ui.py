@@ -117,10 +117,13 @@ class HistoryWindow:
         if query:
             entries = [e for e in entries if query in e.get('text', '').lower()]
 
-        n = len(self._history)
-        self._count_lbl.configure(
-            text=f'{n} {"entry" if n == 1 else "entries"}'
-        )
+        total = len(self._history)
+        shown = len(entries)
+        if query and shown != total:
+            count_text = f'{shown} of {total} {"entry" if total == 1 else "entries"}'
+        else:
+            count_text = f'{total} {"entry" if total == 1 else "entries"}'
+        self._count_lbl.configure(text=count_text)
 
         if not entries:
             msg = 'No transcriptions yet.' if not self._history else 'No entries match your search.'

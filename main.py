@@ -17,6 +17,7 @@ import datetime
 
 import customtkinter as ctk
 import keyboard
+import mouse
 import pyperclip
 import pystray
 from pathlib import Path
@@ -30,6 +31,7 @@ from storage  import (
 from engine      import build_provider, LocalProvider, Provider, local_provider_available
 from overlay     import OverlayWindow
 from library     import LibraryWindow
+from sticky_note import PromptStickyNote
 from settings    import SettingsWindow
 from history_ui  import HistoryWindow
 from core.audio       import AudioCapture
@@ -201,9 +203,19 @@ class App:
         self._whisper_ready     = False
         self._history: list     = load_history()
 
+        # ── Sticky note (per-prompt hotkey popup) ────────────────────────────
+        self._sticky: 'PromptStickyNote | None' = None
+        self._sticky_idx: int | None = None   # which prompt index is currently shown
+
+        # ── Hotkey re-registration guard ─────────────────────────────────────
+        self._hk_reg_lock    = threading.Lock()
+        self._hk_reg_pending = False   # set True when a save arrives mid-flight
+
         # ── Config & prompts ─────────────────────────────────────────────────
         self.config  = load_config()
         self.prompts = load_prompts()
+        self.folders: list[str]       = self.config.get('folders', [])
+        self.folder_colors: dict[str, str] = self.config.get('folder_colors', {})
         self.active_prompt: dict = self.prompts[0] if self.prompts else {
             'title': 'Refine', 'prompt': 'Improve the following text and return only the result.'
         }
@@ -234,7 +246,12 @@ class App:
         self.library  = LibraryWindow(self.root, self.prompts,
                                       on_select=self._on_prompt_selected,
                                       on_save=self._on_prompts_saved,
-                                      hotkey_cfg=self._hotkey_cfg())
+                                      hotkey_cfg=self._hotkey_cfg(),
+                                      on_hotkey_suspend=self._suspend_hotkeys,
+                                      on_hotkey_resume=self._resume_hotkeys,
+                                      folders=self.folders,
+                                      folder_colors=self.folder_colors,
+                                      on_folders_changed=self._on_folders_changed)
         self.settings = SettingsWindow(self.root, self.config,
                                        on_save=self._on_settings_saved)
         self.history_win = HistoryWindow(self.root,
@@ -283,6 +300,7 @@ class App:
             'whisper:stop':     lambda _: self._whisper_stop_recording(),
             'whisper:cancel':   lambda _: self._whisper_cancel_recording(),
             'reload_hotkeys':   lambda _: self._reload_hotkeys_manual(),
+            'prompt_hotkey':    self._on_prompt_hotkey,
             'whisper:status':   self._on_transcriber_status_event,
             'whisper:result':   self._on_whisper_result,
             'whisper:error':    self._on_whisper_error,
@@ -310,11 +328,31 @@ class App:
             'whisper': 'ctrl+enter',
         })
 
+    def _suspend_hotkeys(self) -> None:
+        """Unhook all keyboard and mouse bindings — called while HotkeyCapture dialog
+        is open so nothing fires during capture."""
+        try:
+            keyboard.unhook_all()
+        except Exception:
+            pass
+        try:
+            mouse.unhook_all()
+        except Exception:
+            pass
+
+    def _resume_hotkeys(self) -> None:
+        """Re-register hotkeys after HotkeyCapture closes."""
+        threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
+
     def _register_hotkeys(self) -> None:
         """Register all global hotkeys, forcefully resetting the keyboard listener first."""
         # ── Step 1: full teardown ─────────────────────────────────────────────
         try:
             keyboard.unhook_all()
+        except Exception:
+            pass
+        try:
+            mouse.unhook_all()
         except Exception:
             pass
 
@@ -358,6 +396,38 @@ class App:
 
             keyboard.add_hotkey('escape', self._hk_escape, suppress=False)
 
+            # Ctrl+scroll-up → refine (same action as Alt+Shift+W).
+            # A 500 ms debounce prevents a single scroll gesture from firing
+            # multiple times — _refine_in_progress would stop them anyway, but
+            # debouncing avoids spawning redundant capture threads.
+            _scroll_last = [0.0]
+            def _on_ctrl_scroll(event):
+                if not (hasattr(event, 'delta') and event.delta > 0):
+                    return
+                if not keyboard.is_pressed('ctrl'):
+                    return
+                now = time.time()
+                if now - _scroll_last[0] < 0.5:
+                    return
+                _scroll_last[0] = now
+                self._hk_refine()
+            mouse.hook(_on_ctrl_scroll)
+
+            # Per-prompt hotkeys (assigned via right-click → Assign hotkey…)
+            for _idx, _p in enumerate(self.prompts):
+                _hk = _p.get('hotkey', '').strip()
+                if not _hk:
+                    continue
+                def _make_ph_handler(idx=_idx):
+                    def _handler():
+                        self._q.put(('prompt_hotkey', idx))
+                    return _handler
+                try:
+                    keyboard.add_hotkey(_hk, _make_ph_handler(), suppress=True)
+                    logger.info(f'Per-prompt hotkey: {_hk!r} → [{_idx}] {_p["title"]!r}')
+                except Exception as _e:
+                    logger.warning(f'Per-prompt hotkey {_hk!r} failed: {_e}')
+
         try:
             _do_register()
             logger.info(f'Hotkeys registered: {hk}  PTT={ptt}')
@@ -366,6 +436,7 @@ class App:
             time.sleep(0.5)
             try:
                 keyboard.unhook_all()
+                mouse.unhook_all()
                 _do_register()
                 logger.info(f'Hotkeys registered (retry ok): {hk}')
             except Exception as e2:
@@ -440,6 +511,88 @@ class App:
         if self._whisper_recording:
             self._q.put(('whisper:cancel', None))
 
+    # ── Per-prompt hotkey handler ─────────────────────────────────────────────
+
+    def _on_prompt_hotkey(self, idx: int) -> None:
+        """Called on main thread when a per-prompt hotkey fires.
+
+        Activates the prompt and opens (or replaces) the floating sticky note.
+        """
+        if idx >= len(self.prompts):
+            return
+        prompt = self.prompts[idx]
+
+        # 1. Activate via library._select — updates active_idx, highlight, header
+        #    label, and fires on_select (which sets self.active_prompt) all at once.
+        try:
+            self.library._select(idx)
+        except Exception:
+            self._on_prompt_selected(prompt)   # fallback if library isn't built yet
+
+        # Guard: if the tracked sticky window no longer exists (destroyed externally,
+        # or mid-close flash), clear the stale reference so we don't get stuck.
+        if self._sticky is not None:
+            try:
+                alive = self._sticky.win.winfo_exists()
+            except Exception:
+                alive = False
+            if not alive:
+                self._sticky     = None
+                self._sticky_idx = None
+
+        # 2. If the SAME prompt's note is already open — apply & close it (toggle).
+        #    Pressing F1 → F1 is the quick "confirm and continue" flow.
+        if self._sticky is not None and self._sticky_idx == idx:
+            try:
+                self._sticky.close()
+            except Exception:
+                self._sticky.destroy()
+            return
+
+        # 2b. Different prompt's note is open — replace it silently.
+        if self._sticky is not None:
+            try:
+                self._sticky.destroy()
+            except Exception:
+                pass
+            self._sticky = None
+            self._sticky_idx = None
+
+        # 3. Save callback: write changes back to prompts list + disk
+        def _on_note_save(updated: dict) -> None:
+            # Guard: prompt may have been deleted while the note was open
+            if idx >= len(self.prompts):
+                logger.warning(f'Sticky note save: prompt[{idx}] no longer exists — discarding')
+                return
+            updated['hotkey'] = self.prompts[idx].get('hotkey', '')
+            self.prompts[idx] = updated
+            self.active_prompt = updated
+            # File I/O off the main thread
+            threading.Thread(
+                target=save_prompts, args=(list(self.prompts),), daemon=True,
+            ).start()
+            # Always sync the library's prompt list so it's current next open
+            try:
+                self.library.prompts = self.prompts
+                if self.library.win.winfo_ismapped():
+                    self.library._render_cards()
+            except Exception:
+                pass
+            logger.info(f'Sticky note saved changes to prompt[{idx}] {updated["title"]!r}')
+
+        # 4. on_close: clear self._sticky / _sticky_idx so future hotkey presses
+        #    don't try to destroy an already-gone window.
+        def _on_note_close() -> None:
+            self._sticky     = None
+            self._sticky_idx = None
+
+        # 5. Open sticky note
+        self._sticky_idx = idx
+        self._sticky = PromptStickyNote(
+            self.root, prompt, on_save=_on_note_save, on_close=_on_note_close,
+        )
+        logger.info(f'Prompt hotkey fired → [{idx}] {prompt["title"]!r}')
+
     # ── History callbacks ─────────────────────────────────────────────────────
 
     def _on_history_cleared(self) -> None:
@@ -452,9 +605,40 @@ class App:
 
     def _on_prompts_saved(self, prompts: list) -> None:
         self.prompts = prompts
-        save_prompts(prompts)
+        # Save to disk in background — no need to block the UI thread for file I/O
+        threading.Thread(target=save_prompts, args=(prompts,), daemon=True).start()
         if prompts and self.active_prompt not in prompts:
             self.active_prompt = prompts[0]
+        # Re-register hotkeys in background: _register_hotkeys() has a 150 ms
+        # sleep inside it (OS hook flush) — running it here would freeze the UI.
+        threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
+
+    def _on_folders_changed(self, folders: list, folder_colors: dict | None = None) -> None:
+        self.folders = folders
+        self.config['folders'] = folders
+        if folder_colors is not None:
+            self.folder_colors = folder_colors
+            self.config['folder_colors'] = folder_colors
+        threading.Thread(target=save_config, args=(self.config,), daemon=True).start()
+
+    def _register_hotkeys_bg(self) -> None:
+        """Thread-safe wrapper — guarantees the latest prompt list is always applied.
+
+        Uses a pending flag so rapid saves (e.g. drag-reorder + edit in quick
+        succession) never silently lose a registration: if the lock is busy the
+        flag is set, and the in-flight run loops once more after finishing.
+        """
+        if not self._hk_reg_lock.acquire(blocking=False):
+            self._hk_reg_pending = True   # in-flight run will re-register after
+            return
+        try:
+            while True:
+                self._hk_reg_pending = False
+                self._register_hotkeys()
+                if not self._hk_reg_pending:
+                    break   # nothing changed while we were registering
+        finally:
+            self._hk_reg_lock.release()
 
     def _on_settings_saved(self, new_config: dict) -> None:
         if self._whisper_recording:
@@ -466,7 +650,9 @@ class App:
             threading.Thread(target=self._load_model, daemon=True).start()
         # Rebuild whisper pipeline with new config
         self._rebuild_whisper_pipeline(new_config)
-        self._register_hotkeys()
+        # Re-register hotkeys off the main thread — _register_hotkeys() has a
+        # 150 ms sleep inside it (OS hook flush) that would freeze the UI here.
+        threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
         self._update_tray()
 
     def _rebuild_whisper_pipeline(self, config: dict) -> None:
@@ -729,31 +915,49 @@ class App:
     # ── System tray ───────────────────────────────────────────────────────────
 
     def _make_icon(self) -> Image.Image:
-        img = Image.new('RGBA', (64, 64), (0, 0, 0, 0))
-        d   = ImageDraw.Draw(img)
-        d.rounded_rectangle([2, 2, 62, 62], radius=14, fill='#1a1a2e')
-        # Try platform fonts in order; fall back to default PIL font
-        _font_candidates = [
-            'C:/Windows/Fonts/segoeui.ttf',          # Windows
-            '/System/Library/Fonts/Helvetica.ttc',   # macOS
-            '/System/Library/Fonts/Arial.ttf',       # macOS alt
-            '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',  # Linux
-        ]
-        fnt = None
-        for _fc in _font_candidates:
-            try:
-                fnt = ImageFont.truetype(_fc, 22)
-                break
-            except Exception:
-                continue
-        try:
-            if fnt:
-                d.text((8, 14), 'HK', fill='#a0a0ff', font=fnt)
-            else:
-                d.text((10, 20), 'HK', fill='#a0a0ff')
-        except Exception:
-            d.text((10, 20), 'HK', fill='#a0a0ff')
-        return img
+        # Render at 8× then downsample to 64×64 for clean anti-aliased edges.
+        S = 8
+        B = 64 * S   # 512 px working canvas
+
+        def _hex(h):
+            h = h.lstrip('#')
+            return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+
+        def _grad_mask(mask, c1, c2):
+            """Apply a top→bottom gradient through a white-on-black mask."""
+            r1,g1,b1 = _hex(c1); r2,g2,b2 = _hex(c2)
+            grad = Image.new('RGBA', (B, B))
+            dg   = ImageDraw.Draw(grad)
+            for y in range(B):
+                t = y / (B - 1)
+                dg.line([(0,y),(B,y)], fill=(
+                    int(r1+(r2-r1)*t), int(g1+(g2-g1)*t), int(b1+(b2-b1)*t), 255))
+            out = Image.new('RGBA', (B, B), (0,0,0,0))
+            out.paste(grad, mask=mask.split()[0])
+            return out
+
+        # ── Background: purple border + dark fill ─────────────────────────────
+        base = Image.new('RGBA', (B, B), (0,0,0,0))
+        d    = ImageDraw.Draw(base)
+        d.rounded_rectangle([0, 0, B-1, B-1], radius=13*S, fill='#7c3aed')   # ACCENT border
+        d.rounded_rectangle([3*S, 3*S, B-1-3*S, B-1-3*S], radius=11*S, fill='#080f1a')
+
+        # ── Lightning bolt polygon ────────────────────────────────────────────
+        BOLT = [(x*S, y*S) for x,y in [(42,4),(10,34),(28,34),(22,60),(52,26),(36,26)]]
+
+        bolt_mask = Image.new('RGBA', (B, B), (0,0,0,0))
+        ImageDraw.Draw(bolt_mask).polygon(BOLT, fill='white')
+
+        # Glow layer
+        from PIL import ImageFilter as _IF
+        glow = _grad_mask(bolt_mask.filter(_IF.GaussianBlur(12)), '#7dd3fc', '#1e40af')
+        base = Image.alpha_composite(base, glow)
+
+        # Sharp bolt — sky blue top → deep navy bottom
+        base = Image.alpha_composite(base, _grad_mask(bolt_mask, '#bae6fd', '#0f2a6e'))
+
+        # Downsample to final 64×64
+        return base.resize((64, 64), Image.LANCZOS)
 
     def _start_tray(self) -> None:
         self._tray = pystray.Icon(
@@ -993,6 +1197,46 @@ def _find_other_hotkeys_pids() -> list[int]:
     return [pid for pid, ppid in candidates.items() if ppid not in candidates]
 
 
+def _sweep_ghost_tray_icons() -> None:
+    """Simulate mouse movement across the Windows notification-area toolbars.
+
+    When Windows receives WM_MOUSEMOVE over a tray slot whose owner process is
+    dead, it removes that icon automatically — no user hover needed.
+    Covers both the visible tray and the overflow (hidden icons) area.
+    """
+    if sys.platform != 'win32':
+        return
+    try:
+        import struct
+        u32 = ctypes.windll.user32
+        WM_MOUSEMOVE = 0x0200
+
+        def _child(parent: int, cls: str) -> int:
+            return u32.FindWindowExW(parent, None, cls, None)
+
+        def _sweep(toolbar: int) -> None:
+            if not toolbar:
+                return
+            buf = ctypes.create_string_buffer(16)
+            u32.GetClientRect(toolbar, buf)
+            _, _, w, h = struct.unpack('iiii', buf.raw)
+            mid_y = (h // 2) & 0xFFFF
+            for x in range(0, max(w, 1), 4):
+                u32.SendMessageW(toolbar, WM_MOUSEMOVE, 0, (x & 0xFFFF) | (mid_y << 16))
+
+        # Primary notification area
+        tray    = u32.FindWindowW('Shell_TrayWnd', None)
+        notify  = _child(tray,   'TrayNotifyWnd')
+        pager   = _child(notify, 'SysPager')
+        _sweep(_child(pager, 'ToolbarWindow32'))
+
+        # Overflow (hidden icons) area
+        overflow = u32.FindWindowW('NotifyIconOverflowWindow', None)
+        _sweep(_child(overflow, 'ToolbarWindow32'))
+    except Exception:
+        pass
+
+
 def _ensure_single_instance(_depth: int = 0) -> None:
     """Guarantee exactly one running copy.
 
@@ -1044,8 +1288,10 @@ def _ensure_single_instance(_depth: int = 0) -> None:
         except Exception:
             pass
 
-    # 3. Brief pause for the OS to clear ghost tray icons
-    time.sleep(1.5)
+    # 3. Actively sweep the notification area to evict ghost icons from dead
+    #    processes (no hovering required), then give the OS a moment to settle.
+    _sweep_ghost_tray_icons()
+    time.sleep(0.8)
 
     # 4. Bind socket as graceful-quit channel for the NEXT launch
     try:

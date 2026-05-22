@@ -56,6 +56,15 @@ FONT_LG_BOLD = (FONT_FAMILY, 14, 'bold')
 FONT_MONO_MD = (FONT_MONO, 13)
 FONT_MONO_LG = (FONT_MONO, 14)
 
+# ── Color helpers ────────────────────────────────────────────────────────────
+
+def _darken(hex_color: str, factor: float = 0.72) -> str:
+    """Return a darker shade of *hex_color* by multiplying each channel by factor."""
+    h = hex_color.lstrip('#')
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f'#{int(r * factor):02x}{int(g * factor):02x}{int(b * factor):02x}'
+
+
 # ── Geometry ──────────────────────────────────────────────────────────────────
 RADIUS       = 10    # card corner radius (CTk)
 RADIUS_SM    = 6

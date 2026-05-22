@@ -86,18 +86,21 @@ class ThemedDialog(ctk.CTkToplevel):
         self.destroy()
 
     def _center(self, parent) -> None:
-        self.update_idletasks()
-        try:
-            px = parent.winfo_rootx()
-            py = parent.winfo_rooty()
-            w  = self.winfo_reqwidth()
-            h  = self.winfo_reqheight()
-            self.geometry(
-                f'+{px + (parent.winfo_width()  - w) // 2}'
-                f'+{py + (parent.winfo_height() - h) // 2}'
-            )
-        except Exception:
-            pass
+        center_over_parent(self, parent)
+
+
+# ── Shared geometry helper ────────────────────────────────────────────────────
+
+def center_over_parent(dialog, parent) -> None:
+    """Position *dialog* centered over *parent* widget."""
+    dialog.update_idletasks()
+    try:
+        px, py = parent.winfo_rootx(), parent.winfo_rooty()
+        pw, ph = parent.winfo_width(),  parent.winfo_height()
+        w,  h  = dialog.winfo_reqwidth(), dialog.winfo_reqheight()
+        dialog.geometry(f'+{px + (pw - w) // 2}+{py + (ph - h) // 2}')
+    except Exception:
+        pass
 
 
 # ── Convenience wrappers ──────────────────────────────────────────────────────

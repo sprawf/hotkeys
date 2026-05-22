@@ -23,6 +23,9 @@ numpy>=1.24.0
 onnxruntime>=1.16.0
 noisereduce>=3.0.0
 
+# ── Spell check ──────────────────────────────────────────────────────────────
+pyspellchecker>=0.7.0
+
 # ── Optional: local Qwen GGUF (heavy — skip for cloud-only builds) ────────────
 # llama-cpp-python>=0.2.0
 # huggingface-hub>=0.20.0

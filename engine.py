@@ -3,19 +3,32 @@ import threading
 import logging
 from abc import ABC, abstractmethod
 
+try:
+    import httpx as _httpx
+except ImportError:
+    _httpx = None  # type: ignore
+
 logger = logging.getLogger(__name__)
 
 # ── Provider metadata ────────────────────────────────────────────────────────
 
-PROVIDER_KEYS   = ['local', 'groq', 'cerebras']
-PROVIDER_LABELS = {
-    'local':    'Qwen 2.5 1.5B  (Local · Free · GPU accelerated)',
-    'groq':     'Groq  (Free tier · 70B · sub-1s · falls back to Cerebras)',
-    'cerebras': 'Cerebras  (Free tier · ultra-fast · falls back to Groq)',
+PROVIDER_KEYS    = ['local', 'groq', 'cerebras', 'openai', 'anthropic', 'gemini', 'custom']
+PROVIDER_LABELS  = {
+    'local':     'Qwen 2.5 1.5B  (Local · Free · GPU accelerated)',
+    'groq':      'Groq  (Free tier · 70B · sub-1s · falls back to Cerebras)',
+    'cerebras':  'Cerebras  (Free tier · ultra-fast · falls back to Groq)',
+    'openai':    'OpenAI  (GPT-4o · paid · bring your own key)',
+    'anthropic': 'Anthropic Claude  (Claude 3.5 · paid · bring your own key)',
+    'gemini':    'Google Gemini  (free tier available · bring your own key)',
+    'custom':    'Custom  (any OpenAI-compatible endpoint)',
 }
-GROQ_MODELS     = ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant',
-                   'meta-llama/llama-4-scout-17b-16e-instruct', 'openai/gpt-oss-120b']
-CEREBRAS_MODELS = ['llama3.1-8b', 'gpt-oss-120b']
+GROQ_MODELS      = ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant',
+                    'meta-llama/llama-4-scout-17b-16e-instruct', 'openai/gpt-oss-120b']
+CEREBRAS_MODELS  = ['llama3.1-8b', 'gpt-oss-120b']
+OPENAI_MODELS    = ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-3.5-turbo', 'o1', 'o1-mini']
+ANTHROPIC_MODELS = ['claude-3-5-sonnet-20241022', 'claude-3-5-haiku-20241022',
+                    'claude-3-opus-20240229', 'claude-3-haiku-20240307']
+GEMINI_MODELS    = ['gemini-2.0-flash', 'gemini-1.5-pro', 'gemini-1.5-flash', 'gemini-1.0-pro']
 
 # ── Bundled API keys ─────────────────────────────────────────────────────────
 # Loaded from _bundled_keys.py (gitignored, baked into installer builds).
@@ -164,12 +177,17 @@ class LocalProvider(Provider):
             )
         self._loading = True
         logger.info('Loading local GGUF model…')
-        model_path = self._find_model()
-        from llama_cpp import Llama
-        self._llm     = Llama(model_path=model_path, n_gpu_layers=-1, n_ctx=2048, verbose=False)
-        self._ready   = True
-        self._loading = False
-        logger.info('Local model ready.')
+        try:
+            model_path = self._find_model()
+            from llama_cpp import Llama
+            self._llm   = Llama(model_path=model_path, n_gpu_layers=-1, n_ctx=2048, verbose=False)
+            self._ready = True
+            logger.info('Local model ready.')
+        except Exception:
+            self._loading = False   # allow retry after a failed load
+            raise
+        else:
+            self._loading = False
 
     def refine(self, text: str, system_prompt: str) -> str:
         with self._lock:
@@ -194,10 +212,9 @@ class GroqProvider(Provider):
     def ready(self) -> bool: return bool(self.api_key)
 
     def refine(self, text: str, system_prompt: str) -> str:
-        import httpx
         from groq import Groq
         def _call(verify: bool = True) -> str:
-            kw = {} if verify else {'http_client': httpx.Client(verify=False)}
+            kw = {} if verify else ({'http_client': _httpx.Client(verify=False)} if _httpx else {})
             resp = Groq(api_key=self.api_key, **kw).chat.completions.create(
                 model=self.model,
                 messages=[{'role': 'system', 'content': system_prompt},
@@ -219,10 +236,9 @@ class CerebrasProvider(Provider):
     def ready(self) -> bool: return bool(self.api_key)
 
     def refine(self, text: str, system_prompt: str) -> str:
-        import httpx
         from cerebras.cloud.sdk import Cerebras
         def _call(verify: bool = True) -> str:
-            kw = {} if verify else {'http_client': httpx.Client(verify=False)}
+            kw = {} if verify else ({'http_client': _httpx.Client(verify=False)} if _httpx else {})
             resp = Cerebras(api_key=self.api_key, **kw).chat.completions.create(
                 model=self.model,
                 messages=[{'role': 'system', 'content': system_prompt},
@@ -230,6 +246,135 @@ class CerebrasProvider(Provider):
                 max_tokens=1024,
             )
             return _clean(resp.choices[0].message.content)
+        return _ssl_retry(_call)
+
+
+class _OpenAICompatProvider(Provider):
+    """Shared base for providers that speak the OpenAI chat-completions API.
+
+    Subclasses implement _client_kwargs(verify) to supply the OpenAI() constructor
+    arguments; refine() and SSL-retry logic live here once.
+    """
+
+    model: str  # defined by each subclass __init__
+
+    def _client_kwargs(self, verify: bool) -> dict:
+        raise NotImplementedError
+
+    def refine(self, text: str, system_prompt: str) -> str:
+        try:
+            from openai import OpenAI
+        except ImportError:
+            raise RuntimeError('openai package not installed — run: pip install openai')
+
+        def _call(verify: bool = True) -> str:
+            kw = self._client_kwargs(verify)
+            resp = OpenAI(**kw).chat.completions.create(
+                model=self.model,
+                messages=[{'role': 'system', 'content': system_prompt},
+                          {'role': 'user',   'content': text}],
+                max_tokens=1024,
+            )
+            return _clean(resp.choices[0].message.content)
+
+        return _ssl_retry(_call)
+
+    @staticmethod
+    def _no_verify_kw() -> dict:
+        """Extra kwargs to disable SSL verification (antivirus workaround)."""
+        return {'http_client': _httpx.Client(verify=False)} if _httpx else {}
+
+
+class OpenAIProvider(_OpenAICompatProvider):
+    def __init__(self, api_key: str, model: str = 'gpt-4o-mini') -> None:
+        self.api_key = api_key
+        self.model   = model
+
+    @property
+    def name(self)  -> str:  return f'OpenAI ({self.model})'
+    @property
+    def ready(self) -> bool: return bool(self.api_key)
+
+    def _client_kwargs(self, verify: bool) -> dict:
+        kw: dict = {'api_key': self.api_key}
+        if not verify:
+            kw.update(self._no_verify_kw())
+        return kw
+
+
+class GeminiProvider(_OpenAICompatProvider):
+    """Google Gemini via its OpenAI-compatible REST endpoint — no extra SDK needed."""
+    _BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/openai/'
+
+    def __init__(self, api_key: str, model: str = 'gemini-2.0-flash') -> None:
+        self.api_key = api_key
+        self.model   = model
+
+    @property
+    def name(self)  -> str:  return f'Gemini ({self.model})'
+    @property
+    def ready(self) -> bool: return bool(self.api_key)
+
+    def _client_kwargs(self, verify: bool) -> dict:
+        kw: dict = {'api_key': self.api_key, 'base_url': self._BASE_URL}
+        if not verify:
+            kw.update(self._no_verify_kw())
+        return kw
+
+
+class CustomProvider(_OpenAICompatProvider):
+    """Any OpenAI-compatible endpoint: Ollama, LM Studio, OpenRouter, etc."""
+
+    def __init__(self, api_key: str, base_url: str, model: str) -> None:
+        self.api_key  = api_key
+        self.base_url = base_url.rstrip('/')
+        self.model    = model
+
+    @property
+    def name(self)  -> str:  return f'Custom ({self.model or self.base_url})'
+    @property
+    def ready(self) -> bool: return bool(self.base_url and self.model)
+
+    def _client_kwargs(self, verify: bool) -> dict:
+        kw: dict = {
+            'base_url': self.base_url,
+            'api_key':  self.api_key or 'none',  # SDK requires a non-empty value
+        }
+        if not verify:
+            kw.update(self._no_verify_kw())
+        return kw
+
+
+class AnthropicProvider(Provider):
+    """Anthropic Claude — uses the anthropic SDK (different API shape from OpenAI)."""
+
+    def __init__(self, api_key: str, model: str = 'claude-3-5-haiku-20241022') -> None:
+        self.api_key = api_key
+        self.model   = model
+
+    @property
+    def name(self)  -> str:  return f'Anthropic ({self.model})'
+    @property
+    def ready(self) -> bool: return bool(self.api_key)
+
+    def refine(self, text: str, system_prompt: str) -> str:
+        try:
+            import anthropic
+        except ImportError:
+            raise RuntimeError('anthropic package not installed — run: pip install anthropic')
+
+        def _call(verify: bool = True) -> str:
+            kw: dict = {'api_key': self.api_key}
+            if not verify and _httpx:
+                kw['http_client'] = _httpx.Client(verify=False)
+            resp = anthropic.Anthropic(**kw).messages.create(
+                model=self.model,
+                max_tokens=1024,
+                system=system_prompt,
+                messages=[{'role': 'user', 'content': text}],
+            )
+            return _clean(resp.content[0].text)
+
         return _ssl_retry(_call)
 
 
@@ -275,14 +420,37 @@ class FallbackProvider(Provider):
 
 def build_provider(config: dict) -> Provider:
     active = config.get('active_provider', 'cerebras')
+    pcfg   = config.get('providers', {})
 
     cerebras_key = _resolve_key(config, 'cerebras')
     groq_key     = _resolve_key(config, 'groq')
-    groq_model   = config.get('providers', {}).get('groq',     {}).get('model', GROQ_MODELS[0])
-    cb_model     = config.get('providers', {}).get('cerebras', {}).get('model', CEREBRAS_MODELS[0])
+    groq_model   = pcfg.get('groq',     {}).get('model', GROQ_MODELS[0])
+    cb_model     = pcfg.get('cerebras', {}).get('model', CEREBRAS_MODELS[0])
 
     cerebras = CerebrasProvider(api_key=cerebras_key, model=cb_model)
     groq     = GroqProvider(api_key=groq_key,         model=groq_model)
+
+    if active == 'openai':
+        key   = _resolve_key(config, 'openai')
+        model = pcfg.get('openai', {}).get('model', OPENAI_MODELS[0])
+        return OpenAIProvider(api_key=key, model=model)
+
+    if active == 'anthropic':
+        key   = _resolve_key(config, 'anthropic')
+        model = pcfg.get('anthropic', {}).get('model', ANTHROPIC_MODELS[0])
+        return AnthropicProvider(api_key=key, model=model)
+
+    if active == 'gemini':
+        key   = _resolve_key(config, 'gemini')
+        model = pcfg.get('gemini', {}).get('model', GEMINI_MODELS[0])
+        return GeminiProvider(api_key=key, model=model)
+
+    if active == 'custom':
+        cpfg     = pcfg.get('custom', {})
+        key      = cpfg.get('api_key', '')
+        base_url = cpfg.get('base_url', '')
+        model    = cpfg.get('model', '')
+        return CustomProvider(api_key=key, base_url=base_url, model=model)
 
     if active == 'cerebras':
         if cerebras.ready and groq.ready:
@@ -297,7 +465,6 @@ def build_provider(config: dict) -> Provider:
     # 'local' selected
     if local_provider_available():
         return LocalProvider()
-    # llama_cpp not in this build — fall back to cloud providers
     if cerebras.ready and groq.ready:
         return FallbackProvider(cerebras, groq)
     return cerebras if cerebras.ready else groq
