@@ -5,7 +5,8 @@
 Select text anywhere → press `Alt+Shift+W` → AI rewrites it and pastes it back. Done.  
 Works in Gmail, Notion, Slack, Word, VS Code, Discord — every app on your computer.
 
-[![Windows](https://img.shields.io/badge/Windows-Download_v1.0-0078D6?style=for-the-badge&logo=windows)](https://github.com/sprawf/hotkeys/releases/download/v1.0.0/Hotkeys-v1.0-win64.zip)
+[![Windows](https://img.shields.io/badge/Windows-Download_v2.0-0078D6?style=for-the-badge&logo=windows)](https://github.com/sprawf/hotkeys/releases/download/v2.0.0/Hotkeys-v2.0-win64.zip)
+[![Windows v1](https://img.shields.io/badge/Windows-v1.0_(legacy)-555555?style=for-the-badge&logo=windows)](https://github.com/sprawf/hotkeys/releases/download/v1.0.0/Hotkeys-v1.0-win64.zip)
 [![Mac](https://img.shields.io/badge/Mac-Installer-999999?style=for-the-badge&logo=apple)](https://github.com/sprawf/hotkeys/raw/main/install_mac.command)
 [![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10+-blue?style=for-the-badge&logo=python)](https://python.org)
@@ -54,6 +55,9 @@ One click on any prompt → applied → pasted back. Build as many as you want.
 |---|---|---|
 | ✍️ | **AI text refiner** | Works in any app, any text field |
 | 📚 | **Prompt library** | Save unlimited reusable AI prompts |
+| ⌨️ | **Per-prompt hotkeys** | Assign F1–F12 to any prompt; fires from any app |
+| 🗒️ | **Sticky note popup** | Press a prompt hotkey to preview and edit before applying |
+| 🔤 | **Live spell check** | Misspellings underlined in red as you type |
 | 🔍 | **Prompt search** | Find prompts instantly as you type |
 | 🔄 | **Drag to reorder** | Organise prompts by drag and drop |
 | 🎙️ | **Voice to text** | Fully offline, no data sent anywhere |
@@ -82,12 +86,14 @@ All hotkeys are customisable in Settings.
 
 ### ⊞ Windows — one click, no setup
 
-1. **[Download Hotkeys-v1.0-win64.zip](https://github.com/sprawf/hotkeys/releases/download/v1.0.0/Hotkeys-v1.0-win64.zip)**
+1. **[Download Hotkeys-v2.0-win64.zip](https://github.com/sprawf/hotkeys/releases/download/v2.0.0/Hotkeys-v2.0-win64.zip)**
 2. Extract the zip anywhere
 3. Double-click `Hotkeys.exe`
 4. The ⚡HK icon appears in your taskbar tray — you're done
 
 No Python. No pip. No dependencies. It just works.
+
+> **[Download v1.0 (legacy)](https://github.com/sprawf/hotkeys/releases/download/v1.0.0/Hotkeys-v1.0-win64.zip)**
 
 ---
 
