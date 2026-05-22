@@ -195,15 +195,19 @@ class SettingsWindow:
     # ── Providers panel ───────────────────────────────────────────────────────
 
     def _build_providers(self, parent) -> ctk.CTkFrame:
-        frame = ctk.CTkFrame(parent, fg_color=BG, corner_radius=0)
+        frame  = ctk.CTkFrame(parent, fg_color=BG, corner_radius=0)
+        scroll = ctk.CTkScrollableFrame(frame, fg_color=BG,
+                                        scrollbar_button_color=SURF2,
+                                        scrollbar_button_hover_color=SURF3)
+        scroll.pack(fill='both', expand=True)
         pcfg  = self.config.get('providers', {})
 
-        ctk.CTkLabel(frame, text='ACTIVE PROVIDER', font=(FONT_FAMILY, 9, 'bold'),
+        ctk.CTkLabel(scroll, text='ACTIVE PROVIDER', font=(FONT_FAMILY, 9, 'bold'),
                      text_color=TEXT_S).pack(anchor='w', padx=PAD, pady=(PAD, 4))
 
         self._provider_var = tk.StringVar(value=self.config.get('active_provider', 'cerebras'))
 
-        prov_grid = ctk.CTkFrame(frame, fg_color='transparent')
+        prov_grid = ctk.CTkFrame(scroll, fg_color='transparent')
         prov_grid.pack(fill='x', padx=PAD, pady=(0, PAD_SM))
         self._prov_cards: dict[str, ctk.CTkFrame] = {}
 
@@ -239,13 +243,13 @@ class SettingsWindow:
 
         self._refresh_provider_cards()
 
-        ctk.CTkFrame(frame, fg_color=BORDER, height=1,
+        ctk.CTkFrame(scroll, fg_color=BORDER, height=1,
                      corner_radius=0).pack(fill='x', padx=PAD, pady=PAD_SM)
 
-        ctk.CTkLabel(frame, text='CREDENTIALS', font=(FONT_FAMILY, 9, 'bold'),
+        ctk.CTkLabel(scroll, text='CREDENTIALS', font=(FONT_FAMILY, 9, 'bold'),
                      text_color=TEXT_S).pack(anchor='w', padx=PAD, pady=(0, 4))
 
-        self._cred_host = ctk.CTkFrame(frame, fg_color='transparent')
+        self._cred_host = ctk.CTkFrame(scroll, fg_color='transparent')
         self._cred_host.pack(fill='x', padx=PAD)
 
         # ── Standard providers: API key + model ───────────────────────────────────
