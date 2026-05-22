@@ -103,6 +103,7 @@ class PromptStickyNote:
             relief='flat', font=(FONT_FAMILY, 12),
             bd=0, highlightthickness=0,
             padx=10, pady=8,
+            undo=True,
         )
         self._text.insert('1.0', self._prompt.get('prompt', ''))
         self._text.pack(fill='both', expand=True)

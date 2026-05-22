@@ -109,6 +109,7 @@ class EditDialog(ctk.CTkToplevel):
             body, width=420, height=160, wrap='word',
             fg_color=SURFACE, border_color=BORDER2, border_width=1,
             text_color=TEXT_P, font=(FONT_FAMILY, 13), corner_radius=RADIUS_SM,
+            undo=True,
         )
         self._text.insert('1.0', data.get('prompt', ''))
         self._text.pack(fill='x', pady=(4, 0))
