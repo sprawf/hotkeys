@@ -238,12 +238,11 @@ def load_prompts() -> list:
 
 def save_prompts(prompts: list) -> None:
     data = json.dumps(prompts, indent=2, ensure_ascii=False)
-    # Always write the user's copy (exe-adjacent data\ for dist, AppData for source)
-    paths = [prompts_path()]
-    if not getattr(sys, 'frozen', False):
-        # Dev: also update the source prompts.json so the next dist build is current
-        paths.append(resource_path('prompts.json'))
-    for path in paths:
+    # Write only to the user's AppData copy.
+    # The source prompts.json is the shipped defaults and must never be
+    # overwritten by user edits — otherwise Restore Default Prompts would
+    # restore whatever the user last saved, not the real defaults.
+    for path in [prompts_path()]:
         try:
             with open(path, 'w', encoding='utf-8') as f:
                 f.write(data)

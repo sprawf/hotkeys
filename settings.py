@@ -120,7 +120,7 @@ class SettingsWindow:
         HK_DEFAULTS = {
             'refine':      'alt+shift+w',
             'library':     'alt+shift+e',
-            'whisper':     'ctrl+shift+space',
+            'whisper':     'ctrl+enter',
             'undo_refine': 'alt+shift+z',
         }
         hk_cfg = self.config.get('hotkeys', {})

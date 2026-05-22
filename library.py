@@ -513,12 +513,8 @@ class LibraryWindow:
 
         right = ctk.CTkFrame(hdr, fg_color='transparent')
         right.pack(side='right', fill='y', padx=PAD)
-        btn_row = ctk.CTkFrame(right, fg_color='transparent')
-        btn_row.pack(anchor='e', pady=20)
-        _btn(btn_row, '↩ Defaults', self._restore_defaults, width=110,
-             fg_color=SURF2, hover=SURF3).pack(side='left', padx=(0, 8))
-        _btn(btn_row, '＋ Add', self._add, width=88,
-             fg_color=ACCENT, hover=ACCENTL).pack(side='left')
+        _btn(right, '＋ Add', self._add, width=88,
+             fg_color=ACCENT, hover=ACCENTL).pack(anchor='e', pady=20)
 
         hint = ctk.CTkFrame(self.win, fg_color=SURF2, height=36, corner_radius=0)
         hint.pack(fill='x')
@@ -931,24 +927,6 @@ class LibraryWindow:
             self.on_save(self.prompts)
             self._render_cards()
             self._select(orig_i)
-
-    def _restore_defaults(self) -> None:
-        if not confirm(self.win,
-                       'Restore all 16 default prompts?\n\nThis will replace your current library.',
-                       title='Restore Defaults'):
-            return
-        from storage import resource_path, load_prompts
-        import json, os
-        bundled = resource_path('prompts.json')
-        try:
-            with open(bundled, encoding='utf-8') as f:
-                defaults = json.load(f)
-        except Exception:
-            defaults = load_prompts()
-        self.prompts = defaults
-        self.on_save(self.prompts)
-        self._render_cards()
-        self._select(0)
 
     def _add(self) -> None:
         reserved = {v.strip().lower() for v in self.hotkey_cfg.values() if v}

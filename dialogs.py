@@ -92,13 +92,19 @@ class ThemedDialog(ctk.CTkToplevel):
 # ── Shared geometry helper ────────────────────────────────────────────────────
 
 def center_over_parent(dialog, parent) -> None:
-    """Position *dialog* centered over *parent* widget."""
+    """Position *dialog* centered over *parent* widget, or screen if parent is hidden."""
     dialog.update_idletasks()
     try:
-        px, py = parent.winfo_rootx(), parent.winfo_rooty()
-        pw, ph = parent.winfo_width(),  parent.winfo_height()
-        w,  h  = dialog.winfo_reqwidth(), dialog.winfo_reqheight()
-        dialog.geometry(f'+{px + (pw - w) // 2}+{py + (ph - h) // 2}')
+        w, h = dialog.winfo_reqwidth(), dialog.winfo_reqheight()
+        # If parent is withdrawn/iconified its dimensions are 1x1 at 0,0 — fall back to screen centre
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+        if pw <= 1 or ph <= 1:
+            sw = dialog.winfo_screenwidth()
+            sh = dialog.winfo_screenheight()
+            dialog.geometry(f'+{(sw - w) // 2}+{(sh - h) // 2}')
+        else:
+            px, py = parent.winfo_rootx(), parent.winfo_rooty()
+            dialog.geometry(f'+{px + (pw - w) // 2}+{py + (ph - h) // 2}')
     except Exception:
         pass
 

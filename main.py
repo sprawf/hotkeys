@@ -218,6 +218,18 @@ class App:
         # ── Config & prompts ─────────────────────────────────────────────────
         self.config  = load_config()
         self.prompts = load_prompts()
+
+        # ── Restore-defaults state ────────────────────────────────────────────
+        # Cache the bundled defaults NOW before any edit can overwrite prompts.json
+        # in dev mode (save_prompts writes to the source file in non-frozen builds).
+        import json as _json
+        try:
+            from storage import resource_path as _rp
+            with open(_rp('prompts.json'), encoding='utf-8') as _f:
+                self._bundled_defaults: list = _json.load(_f)
+        except Exception:
+            self._bundled_defaults = []
+        self._at_default_prompts: bool = self._prompts_are_default(self.prompts)
         self.folders: list[str]       = self.config.get('folders', [])
         self.folder_colors: dict[str, str] = self.config.get('folder_colors', {})
         self.active_prompt: dict = self.prompts[0] if self.prompts else {
@@ -304,6 +316,7 @@ class App:
             'whisper:start':    lambda _: self._whisper_start_recording(),
             'whisper:stop':     lambda _: self._whisper_stop_recording(),
             'whisper:cancel':   lambda _: self._whisper_cancel_recording(),
+            'restore_defaults':  lambda _: self._do_restore_defaults(),
             'reload_hotkeys':   lambda _: self._reload_hotkeys_manual(),
             'prompt_hotkey':    self._on_prompt_hotkey,
             'whisper:status':   self._on_transcriber_status_event,
@@ -614,6 +627,13 @@ class App:
 
     def _on_prompts_saved(self, prompts: list) -> None:
         self.prompts = prompts
+        self._at_default_prompts = self._prompts_are_default(prompts)
+        tray = getattr(self, '_tray', None)
+        if tray:
+            try:
+                tray.update_menu()
+            except Exception:
+                pass
         # Save to disk in background — no need to block the UI thread for file I/O
         threading.Thread(target=save_prompts, args=(prompts,), daemon=True).start()
         if prompts and self.active_prompt not in prompts:
@@ -810,6 +830,53 @@ class App:
         # before the synthetic key arrives.
         self.root.after(40, lambda: keyboard.send('ctrl+z'))
         logger.info('Undo last refinement')
+
+    def _prompts_are_default(self, prompts: list | None = None) -> bool:
+        """Return True if the given prompts match the cached bundled defaults.
+
+        Uses self._bundled_defaults (loaded once at startup) so that dev-mode
+        saves — which overwrite prompts.json — don't corrupt the comparison.
+        """
+        defaults = getattr(self, '_bundled_defaults', [])
+        if not defaults:
+            return False
+        current = prompts if prompts is not None else (
+            self.library.prompts if getattr(self, 'library', None) else []
+        )
+        if not current or len(current) != len(defaults):
+            return False
+        return all(
+            c.get('title') == d.get('title') and c.get('prompt') == d.get('prompt')
+            for c, d in zip(current, defaults)
+        )
+
+    def _do_restore_defaults(self) -> None:
+        """Restore the 16 bundled default prompts (called from tray menu)."""
+        from dialogs import confirm
+        if not confirm(self.root,
+                       'Restore Default Prompts',
+                       'This will permanently delete all your existing prompts\n'
+                       'and restore the 16 default prompts.\n\n'
+                       'This cannot be undone.'):
+            return
+        defaults = getattr(self, '_bundled_defaults', [])
+        if not defaults:
+            logger.error('Restore defaults: bundled defaults not cached')
+            return
+        # Route through the canonical save path: updates self.prompts, self.active_prompt,
+        # self._at_default_prompts, saves to disk, and re-registers hotkeys.
+        self._on_prompts_saved(defaults)
+        self.library.prompts = defaults
+        self.library._render_cards()
+        self.library._select(0)
+        self._at_default_prompts = True   # force True regardless of comparison edge cases
+        tray = getattr(self, '_tray', None)
+        if tray:
+            try:
+                tray.update_menu()
+            except Exception:
+                pass
+        logger.info('Default prompts restored.')
 
     def _on_refine_timeout(self, gen: int) -> None:
         if gen != self._refine_gen:
@@ -1044,6 +1111,9 @@ class App:
                 checked=lambda item: self.config.get('push_to_talk', False),
             ),
             pystray.Menu.SEPARATOR,
+            pystray.MenuItem('Restore Default Prompts',
+                             lambda: self._q.put(('restore_defaults', None)),
+                             enabled=lambda _: not self._at_default_prompts),
             pystray.MenuItem('↺  Reload hotkeys', lambda: self._q.put(('reload_hotkeys', None))),
             pystray.MenuItem('Quit', self._quit),
         )
