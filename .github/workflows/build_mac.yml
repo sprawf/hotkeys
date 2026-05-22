@@ -102,7 +102,15 @@ jobs:
       - name: Build Mac .app
         run: pyinstaller hotkeys_mac.spec --noconfirm --clean
 
-      # ── 8. Package as DMG ────────────────────────────────────────────────────
+      # ── 8. Assemble DMG source folder ────────────────────────────────────────
+      - name: Prepare DMG contents
+        run: |
+          mkdir -p dmg_src
+          cp -r dist/Hotkeys.app dmg_src/
+          cp open_hotkeys.command dmg_src/"Open Hotkeys.command"
+          chmod +x "dmg_src/Open Hotkeys.command"
+
+      # ── 9. Package as DMG ────────────────────────────────────────────────────
       - name: Create DMG
         run: |
           brew install create-dmg
@@ -110,13 +118,14 @@ jobs:
             --volname "Hotkeys" \
             --volicon "icon.icns" \
             --window-pos 200 120 \
-            --window-size 560 380 \
+            --window-size 620 400 \
             --icon-size 100 \
-            --icon "Hotkeys.app" 140 190 \
+            --icon "Hotkeys.app" 130 200 \
+            --icon "Open Hotkeys.command" 340 200 \
             --hide-extension "Hotkeys.app" \
-            --app-drop-link 420 190 \
+            --app-drop-link 530 200 \
             "Hotkeys-mac.dmg" \
-            "dist/Hotkeys.app"
+            "dmg_src/"
 
       # ── 9. Upload DMG as workflow artifact ───────────────────────────────────
       - name: Upload DMG

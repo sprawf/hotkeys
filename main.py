@@ -1308,6 +1308,87 @@ def _ensure_single_instance(_depth: int = 0) -> None:
         kernel32.CloseHandle(mutex)
 
 
+# ── macOS accessibility permission ────────────────────────────────────────────
+
+def _mac_ensure_accessibility() -> None:
+    """macOS only: block startup until Accessibility permission is granted.
+
+    Global hotkeys (keyboard library) require the Accessibility entitlement.
+    If not yet granted, open System Settings to the right pane and show a
+    clear CTk dialog that waits until the user has toggled the switch.
+    Silently returns on Windows/Linux or if already trusted.
+    """
+    if sys.platform != 'darwin':
+        return
+
+    try:
+        from ctypes import cdll
+        _libax = cdll.LoadLibrary(
+            '/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices'
+        )
+        _is_trusted = lambda: bool(_libax.AXIsProcessTrusted())
+    except Exception:
+        return   # Can't check — proceed; keyboard will fail naturally if needed
+
+    if _is_trusted():
+        return
+
+    import subprocess as _sp
+
+    # Open the Accessibility pane in System Settings automatically
+    _sp.Popen(['open',
+               'x-apple.systempreferences:'
+               'com.apple.preference.security?Privacy_Accessibility'])
+
+    # Build a blocking CTk dialog that waits for the toggle
+    _setup_root = ctk.CTk()
+    _setup_root.withdraw()
+
+    _win = ctk.CTkToplevel(_setup_root)
+    _win.title('Hotkeys — One-time Setup')
+    _win.resizable(False, False)
+    _win.attributes('-topmost', True)
+    _win.geometry('460x370')
+    _win.protocol('WM_DELETE_WINDOW', lambda: None)   # prevent close
+
+    ctk.CTkLabel(_win, text='⚡  One-time Setup',
+                 font=ctk.CTkFont(size=22, weight='bold')).pack(pady=(30, 6))
+    ctk.CTkLabel(_win,
+                 text=(
+                     'Hotkeys needs Accessibility permission\n'
+                     'to capture keyboard shortcuts in any app.\n\n'
+                     'System Settings has opened for you.\n\n'
+                     '  1.  Find  Hotkeys  in the Accessibility list\n'
+                     '       (click  +  and select Hotkeys.app if not there)\n'
+                     '  2.  Toggle the switch  ON\n\n'
+                     'Then click  Continue  below.'
+                 ),
+                 justify='left',
+                 font=ctk.CTkFont(size=14)).pack(padx=36, pady=0)
+
+    _status = ctk.CTkLabel(_win, text='', text_color='#f87171',
+                           font=ctk.CTkFont(size=12))
+    _status.pack(pady=6)
+
+    def _on_continue():
+        if _is_trusted():
+            _setup_root.quit()
+        else:
+            _status.configure(
+                text='Permission not detected yet — toggle ON in Settings, then try again.')
+
+    ctk.CTkButton(_win, text='Continue  →', command=_on_continue,
+                  fg_color='#7c3aed', hover_color='#6d28d9',
+                  font=ctk.CTkFont(size=15, weight='bold'),
+                  height=42, corner_radius=10).pack(pady=14)
+
+    _setup_root.mainloop()
+    try:
+        _setup_root.destroy()
+    except Exception:
+        pass
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
@@ -1319,6 +1400,7 @@ if __name__ == '__main__':
     # user-launched process; spawned workers get names like 'Process-1'.
     import multiprocessing as _mp
     if _mp.current_process().name == 'MainProcess':
+        _mac_ensure_accessibility()   # no-op on Windows; blocks until permission granted on Mac
         _ensure_single_instance()
         app = App()
         import signal
