@@ -1340,7 +1340,7 @@ def _mac_ensure_accessibility() -> None:
                'x-apple.systempreferences:'
                'com.apple.preference.security?Privacy_Accessibility'])
 
-    # Build a blocking CTk dialog that waits for the toggle
+    # Build a blocking CTk dialog — auto-closes the moment permission is granted
     _setup_root = ctk.CTk()
     _setup_root.withdraw()
 
@@ -1348,40 +1348,45 @@ def _mac_ensure_accessibility() -> None:
     _win.title('Hotkeys — One-time Setup')
     _win.resizable(False, False)
     _win.attributes('-topmost', True)
-    _win.geometry('460x370')
-    _win.protocol('WM_DELETE_WINDOW', lambda: None)   # prevent close
+    _win.geometry('460x340')
+    _win.protocol('WM_DELETE_WINDOW', lambda: None)   # prevent accidental close
 
-    ctk.CTkLabel(_win, text='⚡  One-time Setup',
-                 font=ctk.CTkFont(size=22, weight='bold')).pack(pady=(30, 6))
+    ctk.CTkLabel(_win, text='⚡  Almost ready!',
+                 font=ctk.CTkFont(size=22, weight='bold')).pack(pady=(30, 8))
+
     ctk.CTkLabel(_win,
                  text=(
-                     'Hotkeys needs Accessibility permission\n'
-                     'to capture keyboard shortcuts in any app.\n\n'
-                     'System Settings has opened for you.\n\n'
-                     '  1.  Find  Hotkeys  in the Accessibility list\n'
-                     '       (click  +  and select Hotkeys.app if not there)\n'
-                     '  2.  Toggle the switch  ON\n\n'
-                     'Then click  Continue  below.'
+                     'Hotkeys needs one permission to work.\n'
+                     'System Settings has opened for you — just:\n'
                  ),
-                 justify='left',
-                 font=ctk.CTkFont(size=14)).pack(padx=36, pady=0)
+                 font=ctk.CTkFont(size=14)).pack()
 
-    _status = ctk.CTkLabel(_win, text='', text_color='#f87171',
-                           font=ctk.CTkFont(size=12))
-    _status.pack(pady=6)
+    ctk.CTkLabel(_win,
+                 text='1.  Find Hotkeys in the list\n2.  Flip the switch  ON',
+                 font=ctk.CTkFont(size=16, weight='bold'),
+                 justify='left').pack(pady=8)
 
-    def _on_continue():
+    ctk.CTkLabel(_win,
+                 text="That's it. Hotkeys will start automatically.",
+                 font=ctk.CTkFont(size=13),
+                 text_color='#94a3b8').pack()
+
+    # Animated waiting indicator
+    _dots = ['', '.', '..', '...']
+    _dot_idx = [0]
+    _wait_lbl = ctk.CTkLabel(_win, text='Waiting for permission...',
+                             font=ctk.CTkFont(size=12), text_color='#7c3aed')
+    _wait_lbl.pack(pady=(16, 0))
+
+    def _poll():
         if _is_trusted():
             _setup_root.quit()
-        else:
-            _status.configure(
-                text='Permission not detected yet — toggle ON in Settings, then try again.')
+            return
+        _dot_idx[0] = (_dot_idx[0] + 1) % len(_dots)
+        _wait_lbl.configure(text=f'Waiting for permission{_dots[_dot_idx[0]]}')
+        _setup_root.after(500, _poll)
 
-    ctk.CTkButton(_win, text='Continue  →', command=_on_continue,
-                  fg_color='#7c3aed', hover_color='#6d28d9',
-                  font=ctk.CTkFont(size=15, weight='bold'),
-                  height=42, corner_radius=10).pack(pady=14)
-
+    _setup_root.after(500, _poll)
     _setup_root.mainloop()
     try:
         _setup_root.destroy()
