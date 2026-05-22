@@ -194,28 +194,13 @@ def load_prompts() -> list:
     bundled   = resource_path('prompts.json')
 
     if not os.path.exists(user_path):
+        # Fresh install — copy the bundled default set to AppData
         try:
             shutil.copy2(bundled, user_path)
             logger.info('Default prompts copied to AppData.')
         except Exception as e:
             logger.error(f'Failed to copy default prompts: {e}')
             return []
-    else:
-        # Upgrade guard: append missing bundled prompts without overwriting user edits
-        try:
-            with open(bundled, encoding='utf-8-sig') as f:
-                bundled_prompts = json.load(f)
-            with open(user_path, encoding='utf-8-sig') as f:
-                user_prompts = json.load(f)
-            user_titles = {p['title'] for p in user_prompts}
-            missing = [p for p in bundled_prompts if p['title'] not in user_titles]
-            if missing:
-                user_prompts.extend(missing)
-                with open(user_path, 'w', encoding='utf-8') as f:
-                    json.dump(user_prompts, f, indent=2, ensure_ascii=False)
-                logger.info(f'Added {len(missing)} new default prompt(s) to library.')
-        except Exception:
-            pass
 
     try:
         with open(user_path, encoding='utf-8-sig') as f:
