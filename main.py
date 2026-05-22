@@ -628,12 +628,7 @@ class App:
     def _on_prompts_saved(self, prompts: list) -> None:
         self.prompts = prompts
         self._at_default_prompts = self._prompts_are_default(prompts)
-        tray = getattr(self, '_tray', None)
-        if tray:
-            try:
-                tray.update_menu()
-            except Exception:
-                pass
+        self._update_tray()
         # Save to disk in background — no need to block the UI thread for file I/O
         threading.Thread(target=save_prompts, args=(prompts,), daemon=True).start()
         if prompts and self.active_prompt not in prompts:
@@ -863,19 +858,20 @@ class App:
         if not defaults:
             logger.error('Restore defaults: bundled defaults not cached')
             return
-        # Route through the canonical save path: updates self.prompts, self.active_prompt,
-        # self._at_default_prompts, saves to disk, and re-registers hotkeys.
-        self._on_prompts_saved(defaults)
-        self.library.prompts = defaults
+        # Update app state
+        self.prompts = list(defaults)
+        self.active_prompt = self.prompts[0]
+        self._at_default_prompts = True
+        # Update library UI
+        self.library.prompts = list(defaults)
         self.library._render_cards()
         self.library._select(0)
-        self._at_default_prompts = True   # force True regardless of comparison edge cases
-        tray = getattr(self, '_tray', None)
-        if tray:
-            try:
-                tray.update_menu()
-            except Exception:
-                pass
+        # Save to disk and re-register hotkeys
+        threading.Thread(target=save_prompts, args=(self.prompts,), daemon=True).start()
+        threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
+        # Rebuild tray menu so Restore item becomes greyed again
+        self._update_tray()
+        self._notify('Hotkeys', 'Default prompts restored.')
         logger.info('Default prompts restored.')
 
     def _on_refine_timeout(self, gen: int) -> None:

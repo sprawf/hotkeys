@@ -33,10 +33,10 @@ class ThemedDialog(ctk.CTkToplevel):
                  action_color: str = ACCENT,
                  action_hover: str = ACCENTL) -> None:
         super().__init__(parent)
+        self.withdraw()          # hide until positioned — avoids top-left flash
         self.title(title)
         self.configure(fg_color=BG)
         self.resizable(False, False)
-        self.grab_set()
         self.result = False
 
         # ── Header ────────────────────────────────────────────────────────────
@@ -79,14 +79,16 @@ class ThemedDialog(ctk.CTkToplevel):
         self.bind('<Return>',
                   lambda e: (self._confirm() if mode == 'confirm' else self.destroy()))
 
-        self._center(parent)
+        self.after(50, lambda: self._show(parent))
 
     def _confirm(self) -> None:
         self.result = True
         self.destroy()
 
-    def _center(self, parent) -> None:
+    def _show(self, parent) -> None:
         center_over_parent(self, parent)
+        self.deiconify()
+        self.grab_set()
 
 
 # ── Shared geometry helper ────────────────────────────────────────────────────
@@ -95,16 +97,29 @@ def center_over_parent(dialog, parent) -> None:
     """Position *dialog* centered over *parent* widget, or screen if parent is hidden."""
     dialog.update_idletasks()
     try:
-        w, h = dialog.winfo_reqwidth(), dialog.winfo_reqheight()
-        # If parent is withdrawn/iconified its dimensions are 1x1 at 0,0 — fall back to screen centre
+        # winfo_width/height gives actual rendered size after update_idletasks;
+        # fall back to reqwidth/reqheight if the window hasn't been mapped yet.
+        w = dialog.winfo_width()
+        h = dialog.winfo_height()
+        if w <= 1:
+            w = dialog.winfo_reqwidth()
+            h = dialog.winfo_reqheight()
+        sw = dialog.winfo_screenwidth()
+        sh = dialog.winfo_screenheight()
+        # If parent is withdrawn/iconified fall back to screen centre.
+        # A withdrawn CTkToplevel still reports width=200 so check ismapped() too.
         pw, ph = parent.winfo_width(), parent.winfo_height()
-        if pw <= 1 or ph <= 1:
-            sw = dialog.winfo_screenwidth()
-            sh = dialog.winfo_screenheight()
-            dialog.geometry(f'+{(sw - w) // 2}+{(sh - h) // 2}')
+        if pw <= 1 or ph <= 1 or not parent.winfo_ismapped():
+            x = (sw - w) // 2
+            y = (sh - h) // 2
         else:
             px, py = parent.winfo_rootx(), parent.winfo_rooty()
-            dialog.geometry(f'+{px + (pw - w) // 2}+{py + (ph - h) // 2}')
+            x = px + (pw - w) // 2
+            y = py + (ph - h) // 2
+        # Clamp to screen bounds
+        x = max(0, min(x, sw - w))
+        y = max(0, min(y, sh - h))
+        dialog.geometry(f'+{x}+{y}')
     except Exception:
         pass
 
