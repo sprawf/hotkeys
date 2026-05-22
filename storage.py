@@ -22,9 +22,13 @@ def appdata_dir() -> str:
                            developer's working copy is isolated from dist builds.
     """
     if getattr(sys, 'frozen', False):
-        # Exe-adjacent: <extract-folder>/Hotkeys/data/
-        exe_dir = os.path.dirname(sys.executable)
-        path = os.path.join(exe_dir, 'data')
+        if sys.platform == 'darwin':
+            # Mac .app: store data in ~/Library/Application Support/Hotkeys
+            path = os.path.join(os.path.expanduser('~'), 'Library', 'Application Support', APP_NAME)
+        else:
+            # Windows portable zip: data folder next to the exe
+            exe_dir = os.path.dirname(sys.executable)
+            path = os.path.join(exe_dir, 'data')
     elif sys.platform == 'win32':
         path = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), APP_NAME)
     elif sys.platform == 'darwin':

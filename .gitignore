@@ -15,6 +15,7 @@ env/
 build/
 dist/
 *.spec
+!hotkeys_mac.spec
 
 # Private keys — NEVER commit
 _bundled_keys.py
