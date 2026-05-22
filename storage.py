@@ -14,13 +14,24 @@ VERSION  = '1.0.0'
 # ── Path helpers ──────────────────────────────────────────────────────────────
 
 def appdata_dir() -> str:
-    if sys.platform == 'win32':
-        base = os.environ.get('APPDATA', os.path.expanduser('~'))
+    """Return the directory used for all user data (config, prompts, logs, history).
+
+    Frozen (dist) build  — stores data in a `data` folder next to Hotkeys.exe
+                           so the install is fully self-contained and portable.
+    Source (dev) build   — stores data in the OS roaming AppData folder so the
+                           developer's working copy is isolated from dist builds.
+    """
+    if getattr(sys, 'frozen', False):
+        # Exe-adjacent: <extract-folder>/Hotkeys/data/
+        exe_dir = os.path.dirname(sys.executable)
+        path = os.path.join(exe_dir, 'data')
+    elif sys.platform == 'win32':
+        path = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), APP_NAME)
     elif sys.platform == 'darwin':
-        base = os.path.join(os.path.expanduser('~'), 'Library', 'Application Support')
+        path = os.path.join(os.path.expanduser('~'), 'Library', 'Application Support', APP_NAME)
     else:
-        base = os.environ.get('XDG_CONFIG_HOME', os.path.join(os.path.expanduser('~'), '.config'))
-    path = os.path.join(base, APP_NAME)
+        path = os.path.join(os.environ.get('XDG_CONFIG_HOME',
+                            os.path.join(os.path.expanduser('~'), '.config')), APP_NAME)
     os.makedirs(path, exist_ok=True)
     return path
 
@@ -222,7 +233,12 @@ def load_prompts() -> list:
 
 def save_prompts(prompts: list) -> None:
     data = json.dumps(prompts, indent=2, ensure_ascii=False)
-    for path in (prompts_path(), resource_path('prompts.json')):
+    # Always write the user's copy (exe-adjacent data\ for dist, AppData for source)
+    paths = [prompts_path()]
+    if not getattr(sys, 'frozen', False):
+        # Dev: also update the source prompts.json so the next dist build is current
+        paths.append(resource_path('prompts.json'))
+    for path in paths:
         try:
             with open(path, 'w', encoding='utf-8') as f:
                 f.write(data)
