@@ -912,7 +912,7 @@ class LibraryWindow:
         self._active_lbl.configure(text=f'Active: {self.prompts[orig_i]["title"]}')
 
     def _edit(self, orig_i: int) -> None:
-        reserved = {v.strip().lower() for v in self.hotkey_cfg.values() if v}
+        reserved = {v.strip().lower() for v in self.hotkey_cfg.values() if v} | {'ctrl+z'}
         dlg = EditDialog(self.win, self.prompts[orig_i],
                          on_hotkey_suspend=self._on_hotkey_suspend,
                          on_hotkey_resume=self._on_hotkey_resume,
@@ -930,7 +930,7 @@ class LibraryWindow:
             self._select(orig_i)
 
     def _add(self) -> None:
-        reserved = {v.strip().lower() for v in self.hotkey_cfg.values() if v}
+        reserved = {v.strip().lower() for v in self.hotkey_cfg.values() if v} | {'ctrl+z'}
         dlg = EditDialog(self.win,
                          on_hotkey_suspend=self._on_hotkey_suspend,
                          on_hotkey_resume=self._on_hotkey_resume,
