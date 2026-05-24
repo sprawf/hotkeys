@@ -16,12 +16,17 @@ build/
 dist/
 *.spec
 !hotkeys_mac.spec
+!hotkeys.spec
+!build_dist.py
 
 # Private keys — NEVER commit
 _bundled_keys.py
 
 # Release / installer output
 release/
+
+# Portable dist user data (contains API keys, prompts — never commit)
+dist/
 
 # IDE
 .vscode/

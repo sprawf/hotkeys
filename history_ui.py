@@ -199,7 +199,7 @@ class HistoryWindow:
             action_hover='#c0392b',
         ):
             self._history = []
-            save_history([])
+            threading.Thread(target=lambda: save_history([]), daemon=True).start()
             if self.on_history_cleared:
                 self.on_history_cleared()
             self._render_entries()

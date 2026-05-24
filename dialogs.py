@@ -10,6 +10,7 @@ Usage:
                action_label='Delete', action_color='#b03030'):
         ...
 """
+import tkinter as tk
 import customtkinter as ctk
 
 from theme import (
@@ -143,3 +144,206 @@ def confirm(parent, title: str, message: str,
                        action_hover=action_hover)
     parent.wait_window(dlg)
     return dlg.result
+
+
+# ── PopupMenu ────────────────────────────────────────────────────────────────
+
+class PopupMenu:
+    """Lightweight custom popup menu styled to match the app's dark theme.
+
+    Usage:
+        m = PopupMenu(parent_window)
+        m.add('Cut',          cmd_cut,   enabled=has_sel)
+        m.add('Copy',         cmd_copy,  enabled=has_sel)
+        m.add('Paste',        cmd_paste)
+        m.separator()
+        m.add('Paste Image',  cmd_ocr)
+        m.show(event.x_root, event.y_root)
+    """
+
+    _BG       = '#1c1c1c'
+    _BORDER   = '#333333'
+    _TEXT     = '#e8e8e8'
+    _DIM      = '#484848'
+    _HOVER_BG = ACCENT        # purple highlight — same as rest of app
+    _HOVER_FG = '#ffffff'
+    _SEP      = '#2a2a2a'
+    _FONT     = (FONT_FAMILY, 11)
+    _PAD_X    = 14
+    _ITEM_PY  = 5
+    _MIN_W    = 140
+
+    def __init__(self, parent) -> None:
+        self._parent = parent
+        self._items: list = []
+        self._win: tk.Toplevel | None = None
+        self._alive = [False]
+
+    def add(self, label: str, command, enabled: bool = True) -> 'PopupMenu':
+        self._items.append(('item', label, command, enabled))
+        return self
+
+    def separator(self) -> 'PopupMenu':
+        self._items.append(('sep',))
+        return self
+
+    def show(self, x: int, y: int) -> None:
+        win = tk.Toplevel(self._parent)
+        win.overrideredirect(True)
+        win.attributes('-topmost', True)
+        win.configure(bg=self._BORDER)   # 1 px border via outer bg colour
+
+        inner = tk.Frame(win, bg=self._BG, bd=0)
+        inner.pack(padx=1, pady=1)
+
+        self._win   = win
+        self._alive = [True]
+
+        for item in self._items:
+            if item[0] == 'sep':
+                tk.Frame(inner, bg=self._SEP, height=1).pack(
+                    fill='x', padx=6, pady=3)
+            else:
+                _, label, cmd, enabled = item
+                fg  = self._TEXT if enabled else self._DIM
+                lbl = tk.Label(
+                    inner,
+                    text=f'  {label}',
+                    bg=self._BG, fg=fg,
+                    font=self._FONT,
+                    anchor='w',
+                    padx=self._PAD_X,
+                    pady=self._ITEM_PY,
+                    cursor='arrow',
+                )
+                lbl.pack(fill='x')
+
+                if enabled:
+                    lbl.bind('<Enter>',
+                             lambda e, w=lbl: w.configure(
+                                 bg=self._HOVER_BG, fg=self._HOVER_FG))
+                    lbl.bind('<Leave>',
+                             lambda e, w=lbl: w.configure(
+                                 bg=self._BG, fg=self._TEXT))
+                    # return 'break' stops the event propagating to win's
+                    # <ButtonRelease-1> handler so only the item fires
+                    def _on_item_click(e, c=cmd):
+                        self._dismiss()
+                        c()
+                        return 'break'
+                    lbl.bind('<ButtonRelease-1>', _on_item_click)
+
+        # Keep menu within screen bounds
+        win.update_idletasks()
+        mw = win.winfo_reqwidth()
+        mh = win.winfo_reqheight()
+        sw = win.winfo_screenwidth()
+        sh = win.winfo_screenheight()
+        win.geometry(f'+{min(x, sw - mw - 4)}+{min(y, sh - mh - 4)}')
+
+        # grab_set() routes all in-app mouse events to this window so any
+        # click outside the menu (on another widget) is redirected here and
+        # triggers dismissal via the <ButtonRelease-1> binding on win.
+        # This is far more reliable than <FocusOut> which fires immediately
+        # on overrideredirect windows and kills the menu before it's seen.
+        try:
+            win.grab_set()
+        except Exception:
+            pass
+        # Click on win background or redirected outside click → dismiss.
+        # <ButtonRelease-3> is intentionally NOT bound here: grab_set routes
+        # the release of the right-click that opened this menu to win, which
+        # would immediately kill it before the user sees anything.
+        win.bind('<ButtonRelease-1>', lambda e: self._dismiss())
+        win.bind('<Escape>',          lambda e: self._dismiss())
+        # Fallback: clicking outside the whole app (another application's
+        # window) doesn't trigger grab_set, but does cause FocusOut.
+        win.bind('<FocusOut>', lambda e: win.after(150, self._dismiss))
+        win.focus_force()
+
+    def _dismiss(self) -> None:
+        if not self._alive[0]:
+            return
+        self._alive[0] = False
+        try:
+            self._win.grab_release()
+        except Exception:
+            pass
+        try:
+            self._win.destroy()
+        except Exception:
+            pass
+
+
+# ── Tooltip ───────────────────────────────────────────────────────────────────
+
+class Tooltip:
+    """Hover tooltip for any tkinter or CustomTkinter widget.
+
+    Usage:
+        Tooltip(widget, 'Explain what the widget does')
+    """
+
+    def __init__(self, widget, text: str, delay: int = 450) -> None:
+        self._widget = widget
+        self._text   = text
+        self._delay  = delay
+        self._job    = None
+        self._win    = None
+        widget.bind('<Enter>',  self._on_enter, add='+')
+        widget.bind('<Leave>',  self._on_leave, add='+')
+        widget.bind('<Button>', self._on_leave, add='+')
+
+    def _on_enter(self, event=None) -> None:
+        self._cancel()
+        self._job = self._widget.after(self._delay, self._show)
+
+    def _on_leave(self, event=None) -> None:
+        self._cancel()
+        self._hide()
+
+    def _cancel(self) -> None:
+        if self._job:
+            try:
+                self._widget.after_cancel(self._job)
+            except Exception:
+                pass
+            self._job = None
+
+    def _show(self) -> None:
+        if self._win:
+            return
+        try:
+            wx = self._widget.winfo_rootx()
+            wy = self._widget.winfo_rooty()
+            wh = self._widget.winfo_height()
+        except Exception:
+            return
+        self._win = tk.Toplevel(self._widget)
+        self._win.overrideredirect(True)
+        self._win.attributes('-topmost', True)
+        lbl = tk.Label(
+            self._win,
+            text=self._text,
+            bg=SURF2, fg=TEXT_P,
+            font=(FONT_FAMILY, 11),
+            padx=10, pady=6,
+            justify='left',
+            relief='flat',
+        )
+        lbl.pack()
+        # Position below the widget, horizontally centred on it
+        self._win.update_idletasks()
+        tw = self._win.winfo_reqwidth()
+        ww = self._widget.winfo_width()
+        x  = wx + max(0, (ww - tw) // 2)
+        y  = wy + wh + 4
+        self._win.geometry(f'+{x}+{y}')
+
+    def _hide(self) -> None:
+        if self._win:
+            try:
+                self._win.destroy()
+            except Exception:
+                pass
+            self._win = None

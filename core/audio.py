@@ -84,7 +84,12 @@ class AudioCapture:
             self._interim_last_n = 0
             self._recording      = True
         if self._stream is None or not self._stream.active:
-            self._open_stream()
+            try:
+                self._open_stream()
+            except Exception:
+                with self._lock:
+                    self._recording = False
+                raise
 
     def stop_recording(self):
         with self._lock:

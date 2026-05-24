@@ -13,7 +13,9 @@ if sys.platform == 'win32':
     INPUT_KEYBOARD    = 1
 
     VK_CONTROL = 0x11
+    VK_C       = 0x43
     VK_V       = 0x56
+    VK_Z       = 0x5A
 
     class KEYBDINPUT(ctypes.Structure):
         _fields_ = [
@@ -67,6 +69,17 @@ if sys.platform == 'win32':
             except Exception:
                 pass
 
+    def copy_selection():
+        """Simulate Ctrl+C to copy the current selection into the clipboard."""
+        inputs = [
+            _make_key_input(VK_CONTROL, 0, 0),
+            _make_key_input(VK_C,       0, 0),
+            _make_key_input(VK_C,       0, KEYEVENTF_KEYUP),
+            _make_key_input(VK_CONTROL, 0, KEYEVENTF_KEYUP),
+        ]
+        arr = (INPUT * len(inputs))(*inputs)
+        user32.SendInput(len(inputs), arr, ctypes.sizeof(INPUT))
+
     def paste_from_clipboard():
         """Simulate Ctrl+V to paste the current clipboard into the focused window."""
         inputs = [
@@ -75,8 +88,18 @@ if sys.platform == 'win32':
             _make_key_input(VK_V,       0, KEYEVENTF_KEYUP),
             _make_key_input(VK_CONTROL, 0, KEYEVENTF_KEYUP),
         ]
-        arr = (INPUT * len(inputs))(*inputs)
-        user32.SendInput(len(inputs), arr, ctypes.sizeof(INPUT))
+        _send_inputs(inputs)
+
+    def undo_last():
+        """Simulate Ctrl+Z via Win32 SendInput — avoids routing through the
+        keyboard library's hook, which prevents modifier-state corruption."""
+        inputs = [
+            _make_key_input(VK_CONTROL, 0, 0),
+            _make_key_input(VK_Z,       0, 0),
+            _make_key_input(VK_Z,       0, KEYEVENTF_KEYUP),
+            _make_key_input(VK_CONTROL, 0, KEYEVENTF_KEYUP),
+        ]
+        _send_inputs(inputs)
 
 # ── macOS / Linux ─────────────────────────────────────────────────────────────
 
@@ -94,6 +117,21 @@ else:
             except Exception:
                 pass
 
+    def copy_selection():
+        """Simulate Cmd+C on macOS via osascript."""
+        try:
+            subprocess.run(
+                ['osascript', '-e',
+                 'tell application "System Events" to keystroke "c" using command down'],
+                check=True,
+            )
+        except Exception:
+            try:
+                import keyboard
+                keyboard.send('command+c')
+            except Exception:
+                pass
+
     def paste_from_clipboard():
         """Simulate Cmd+V on macOS via osascript."""
         try:
@@ -106,5 +144,20 @@ else:
             try:
                 import keyboard
                 keyboard.send('command+v')
+            except Exception:
+                pass
+
+    def undo_last():
+        """Simulate Cmd+Z on macOS via osascript."""
+        try:
+            subprocess.run(
+                ['osascript', '-e',
+                 'tell application "System Events" to keystroke "z" using command down'],
+                check=True,
+            )
+        except Exception:
+            try:
+                import keyboard
+                keyboard.send('command+z')
             except Exception:
                 pass

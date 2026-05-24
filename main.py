@@ -37,8 +37,14 @@ from history_ui  import HistoryWindow
 from core.audio       import AudioCapture
 from core.vad         import SileroVAD
 from core.transcriber import Transcriber
-from core.typer       import copy_to_clipboard, paste_from_clipboard
+from core.typer       import copy_to_clipboard, paste_from_clipboard, copy_selection, undo_last
 from core.sounds      import play_start, play_stop
+from screenshot       import take_screenshot, start_prtsc_listener
+from macros.recorder      import MacroRecorder
+from macros.library       import MacroLibrary
+from macros.save_prompt   import MacroSavePrompt
+from screen_recorder      import Recorder as ScreenRecorder, RecorderSetupDialog, show_save_dialog
+from gif_recorder         import GifRecorder, GifSetupDialog, show_gif_save_dialog
 
 ctk.set_appearance_mode('dark')
 ctk.set_default_color_theme('dark-blue')
@@ -229,7 +235,12 @@ class App:
                 self._bundled_defaults: list = _json.load(_f)
         except Exception:
             self._bundled_defaults = []
-        self._at_default_prompts: bool = self._prompts_are_default(self.prompts)
+        # Start enabled — only grey out immediately after the user clicks
+        # "Restore Default Prompts", and re-enable as soon as any edit is saved.
+        # Checking against bundled defaults at startup was too aggressive: it
+        # permanently disabled the button whenever prompts happened to match
+        # defaults (e.g. fresh install), even if the user never used Restore.
+        self._at_default_prompts: bool = False
         self.folders: list[str]       = self.config.get('folders', [])
         self.folder_colors: dict[str, str] = self.config.get('folder_colors', {})
         self.active_prompt: dict = self.prompts[0] if self.prompts else {
@@ -257,8 +268,28 @@ class App:
         self.root.update()   # render splash before rest of __init__ runs
 
         # ── UI windows ───────────────────────────────────────────────────────
-        self.refine_overlay  = OverlayWindow(self.root, slot=0)
-        self.whisper_overlay = OverlayWindow(self.root, slot=1)
+        self.refine_overlay    = OverlayWindow(self.root, slot=0)
+        self.whisper_overlay   = OverlayWindow(self.root, slot=1)
+        self.macro_overlay     = OverlayWindow(self.root, slot=2)
+        self.recorder_overlay  = OverlayWindow(self.root, slot=3)
+        self.gif_overlay       = OverlayWindow(self.root, slot=4)
+
+        # ── Screen recorder ───────────────────────────────────────────────────
+        self._screen_recorder: ScreenRecorder | None = None
+        self._recorder_state  = 'idle'   # 'idle' | 'recording' | 'stopping'
+        self._recorder_t0     = 0.0
+
+        # ── GIF recorder ──────────────────────────────────────────────────────
+        self._gif_recorder: GifRecorder | None = None
+        self._gif_state       = 'idle'   # 'idle' | 'recording' | 'encoding'
+        self._gif_t0          = 0.0
+
+        # ── Macro recorder + library ─────────────────────────────────────────
+        self._macro          = MacroRecorder()
+        self._macro_state    = 'idle'   # 'idle' | 'recording' | 'ready' | 'playing'
+        self._macro_stop_hks: list = []
+        self._macro_library  = MacroLibrary(Path(appdata_dir()) / 'macros')
+        self._macro_saved_hks: list = []   # registered playback hotkeys for saved macros
         self.library  = LibraryWindow(self.root, self.prompts,
                                       on_select=self._on_prompt_selected,
                                       on_save=self._on_prompts_saved,
@@ -267,7 +298,19 @@ class App:
                                       on_hotkey_resume=self._resume_hotkeys,
                                       folders=self.folders,
                                       folder_colors=self.folder_colors,
-                                      on_folders_changed=self._on_folders_changed)
+                                      on_folders_changed=self._on_folders_changed,
+                                      vision_extractor=self._vision_extractor,
+                                      macro_library=self._macro_library,
+                                      on_macro_play=self._on_library_macro_play,
+                                      on_macro_hotkeys_changed=self._register_macro_saved_hotkeys)
+        # Wire the library's recorder tab toggle button → main.py handler
+        self.library._on_recorder_toggle = lambda: self._q.put(('recorder:toggle', None))
+        # Wire the library's macros tab right-click record → same queue event as Shift+F1
+        self.library._on_macro_toggle    = lambda: self._q.put(('macro:hotkey',    None))
+        # Wire the macros tab reset button → abort everything and return to idle
+        self.library._on_macro_reset     = lambda: self._q.put(('macro:reset',     None))
+        # Wire the library's GIF tab toggle button → main.py handler
+        self.library._on_gif_toggle      = lambda: self._q.put(('gif:toggle',      None))
         self.settings = SettingsWindow(self.root, self.config,
                                        on_save=self._on_settings_saved)
         self.history_win = HistoryWindow(self.root,
@@ -322,9 +365,24 @@ class App:
             'whisper:status':   self._on_transcriber_status_event,
             'whisper:result':   self._on_whisper_result,
             'whisper:error':    self._on_whisper_error,
+            'macro:hotkey':       self._on_macro_hotkey,
+            'macro:stop':         self._on_macro_emergency_stop,
+            'macro:reset':        lambda _: self._macro_reset(),
+            'macro:play_saved':   self._on_library_macro_play,
+            'screenshot:cancel':  lambda _: self._do_cancel_screenshot(),
+            'recorder:toggle':    lambda _: self._on_recorder_toggle(),
+            'recorder:cap':       lambda _: self._on_recorder_cap(),
+            'recorder:size':      lambda b: None,   # handled by _recorder_tick poll
+            'gif:toggle':         lambda _: self._on_gif_toggle(),
+            'gif:cap':            lambda _: self._on_gif_cap(),
+            'gif:done':           self._on_gif_done,
+            'gif:error':          self._on_gif_error,
         }
 
         self._register_hotkeys()
+        self._register_macro_saved_hotkeys()
+        self.root.after(2000, self._hotkey_watchdog)
+        start_prtsc_listener(self._hk_screenshot)
         self._start_tray()
 
         if isinstance(self.provider, LocalProvider):
@@ -385,16 +443,26 @@ class App:
         except Exception:
             pass
 
-        time.sleep(0.15)   # give the OS a moment to flush the hook chain
-
         # ── Step 2: register with one automatic retry ─────────────────────────
         hk  = self._hotkey_cfg()
         ptt = self.config.get('push_to_talk', False)
 
         def _do_register():
-            keyboard.add_hotkey(hk.get('refine',      'alt+shift+w'), self._hk_refine,      suppress=True)
-            keyboard.add_hotkey(hk.get('library',     'alt+shift+e'), self._hk_library,     suppress=True)
-            keyboard.add_hotkey(hk.get('undo_refine', 'alt+shift+z'), self._hk_undo_refine, suppress=True)
+            # suppress=False: the library observes keypresses but never consumes
+            # them.  suppress=True was causing the library's internal modifier-state
+            # machine to lock up permanently after each suppressed hotkey — Alt and
+            # Shift would appear "stuck" to the library even after the user released
+            # them, silently blocking all subsequent hotkeys with no recovery path
+            # (even unhook_all + re-registration couldn't fix a broken listener).
+            keyboard.add_hotkey(hk.get('refine',       'alt+shift+w'), self._hk_refine,      suppress=False)
+            keyboard.add_hotkey(hk.get('library',      'alt+shift+e'), self._hk_library,     suppress=False)
+            keyboard.add_hotkey(hk.get('undo_refine',  'alt+shift+z'), self._hk_undo_refine, suppress=False)
+            keyboard.add_hotkey(hk.get('macro_record', 'shift+f1'),
+                                lambda: self._q.put(('macro:hotkey', None)),     suppress=False)
+            keyboard.add_hotkey(hk.get('recorder',     'shift+f2'),
+                                lambda: self._q.put(('recorder:toggle', None)), suppress=False)
+            keyboard.add_hotkey(hk.get('gif_record',   'shift+f3'),
+                                lambda: self._q.put(('gif:toggle',      None)), suppress=False)
 
             if ptt:
                 whisper_hk = hk.get('whisper', 'ctrl+enter')
@@ -402,16 +470,16 @@ class App:
                 keyboard.on_press_key(
                     ptt_key,
                     lambda _: self._q.put(('whisper:start', None)),
-                    suppress=True,
+                    suppress=False,
                 )
                 keyboard.on_release_key(
                     ptt_key,
                     lambda _: self._q.put(('whisper:stop', None)),
-                    suppress=True,
+                    suppress=False,
                 )
                 logger.info(f'PTT mode: key={ptt_key!r}')
             else:
-                keyboard.add_hotkey(hk.get('whisper', 'ctrl+enter'), self._hk_whisper, suppress=True)
+                keyboard.add_hotkey(hk.get('whisper', 'ctrl+enter'), self._hk_whisper, suppress=False)
 
             keyboard.add_hotkey('escape', self._hk_escape, suppress=False)
 
@@ -442,7 +510,7 @@ class App:
                         self._q.put(('prompt_hotkey', idx))
                     return _handler
                 try:
-                    keyboard.add_hotkey(_hk, _make_ph_handler(), suppress=True)
+                    keyboard.add_hotkey(_hk, _make_ph_handler(), suppress=False)
                     logger.info(f'Per-prompt hotkey: {_hk!r} → [{_idx}] {_p["title"]!r}')
                 except Exception as _e:
                     logger.warning(f'Per-prompt hotkey {_hk!r} failed: {_e}')
@@ -460,6 +528,63 @@ class App:
                 logger.info(f'Hotkeys registered (retry ok): {hk}')
             except Exception as e2:
                 logger.error(f'Hotkey registration failed after retry: {e2}')
+
+    @property
+    def _vision_extractor(self):
+        """Return a callable (img) → str that extracts text from a PIL Image.
+
+        Uses the Groq vision API with the personal bundled key.  The callable is
+        safe to pass to LibraryWindow / PromptStickyNote and call from threads.
+        """
+        from vision import extract_text, DEFAULT_VISION_MODEL
+        from engine import _resolve_keys
+        import logging as _log
+        config = self.config
+
+        def _extract(img):
+            model = config.get('providers', {}).get('groq', {}).get(
+                'vision_model', DEFAULT_VISION_MODEL)
+            keys = _resolve_keys(config, 'groq')
+            last_err = None
+            for key in keys:
+                try:
+                    return extract_text(img, key, model)
+                except RuntimeError as e:
+                    msg = str(e)
+                    if 'rate limit' in msg.lower() or '429' in msg or 'quota' in msg.lower():
+                        _log.getLogger(__name__).warning(
+                            f'Vision: Groq key …{key[-6:]} rate-limited — trying next key')
+                        last_err = e
+                        continue
+                    raise
+            raise last_err or RuntimeError('All Groq vision keys exhausted')
+
+        return _extract
+
+    def _reregister_after_action(self) -> None:
+        """Re-register hotkeys after a paste action.
+
+        keyboard.send() and injected Ctrl+V/C events flow through the
+        keyboard library's own WH_KEYBOARD_LL hook.  With suppress=True
+        active on all hotkeys, the library's internal modifier-key state
+        can get stuck (it thinks Alt/Shift are still held), silently
+        preventing subsequent hotkeys from firing.  Re-registering clears
+        the hook, flushes all state, and reinstalls fresh hooks.
+        """
+        threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
+
+    def _hotkey_watchdog(self) -> None:
+        """Periodic safety net: re-register if the keyboard listener thread died."""
+        try:
+            listener = getattr(keyboard, '_listener', None)
+            if listener is not None:
+                t = getattr(listener, 'thread', None)
+                if t is not None and not t.is_alive():
+                    logger.warning('Hotkey listener thread dead — auto re-registering.')
+                    threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
+        except Exception:
+            pass
+        self.root.after(2000, self._hotkey_watchdog)
 
     def _reload_hotkeys_manual(self) -> None:
         """Full reset from tray menu — cancels anything stuck, re-registers hotkeys."""
@@ -484,12 +609,39 @@ class App:
         self._register_hotkeys()
         self._notify('Hotkeys reset ⚡', 'All hotkeys reloaded and ready.')
 
+    def _schedule_rereg(self, delay_ms: int = 80) -> None:
+        """Schedule a hotkey re-registration *delay_ms* after a hotkey fires.
+
+        Called from every hotkey handler (keyboard hook thread) so the
+        keyboard library always gets a clean state after each press.
+        The 80 ms default gives the OS time to see all key-up events before
+        we unhook; _register_hotkeys_bg is a no-op if already in-flight.
+        """
+        self.root.after(
+            delay_ms,
+            lambda: threading.Thread(
+                target=self._register_hotkeys_bg, daemon=True,
+            ).start(),
+        )
+
     def _hk_refine(self) -> None:
         logger.info('Refine hotkey fired.')
         threading.Thread(target=self._capture_and_queue, daemon=True).start()
 
     def _capture_and_queue(self) -> None:
-        time.sleep(0.05)                      # wait for key release (was 0.08)
+        # Wait until Alt and Shift are physically released before injecting
+        # Ctrl+C.  If they're still held, the target app sees Ctrl+Shift+Alt+C
+        # instead of plain Ctrl+C and silently ignores it (→ "select text first").
+        # GetAsyncKeyState is used directly so this works even while the
+        # keyboard hook is briefly suspended during re-registration.
+        _u32 = ctypes.windll.user32
+        _deadline = time.time() + 0.5          # give up after 500 ms
+        while time.time() < _deadline:
+            if not (_u32.GetAsyncKeyState(0x10) & 0x8000 or   # VK_SHIFT
+                    _u32.GetAsyncKeyState(0x12) & 0x8000):    # VK_MENU (Alt)
+                break
+            time.sleep(0.015)
+        time.sleep(0.04)                       # brief settle after release
         try:
             prev = pyperclip.paste()
         except Exception:
@@ -498,7 +650,7 @@ class App:
             pyperclip.copy('')
         except Exception:
             pass
-        keyboard.send('ctrl+c')
+        copy_selection()
         captured = ''
         for _ in range(25):                   # up to 0.75 s total
             time.sleep(0.03)                  # poll every 30 ms (was 50 ms)
@@ -529,7 +681,29 @@ class App:
         else:
             self._q.put(('whisper:stop', None))
 
+    def _hk_screenshot(self) -> None:
+        self.root.after(0, lambda: take_screenshot(self.root))
+
+    def _do_cancel_screenshot(self) -> None:
+        """Cancel the active screenshot overlay. Called on main thread via _poll."""
+        from screenshot import cancel_screenshot
+        cancel_screenshot()
+
     def _hk_escape(self) -> None:
+        # Screenshot overlay has top priority — Esc must always dismiss it,
+        # even if the grab is still in flight (main thread not yet blocked).
+        from screenshot import _overlay_active
+        if _overlay_active[0]:
+            self._q.put(('screenshot:cancel', None))
+            return
+        # Macro takes priority — stop recording/playback first.
+        if self._macro_state in ('recording', 'playing'):
+            self._q.put(('macro:stop', None))
+            return
+        # GIF recording — Esc aborts capture.
+        if self._gif_state == 'recording':
+            self._q.put(('gif:toggle', None))   # stop → encode → save dialog
+            return
         if self._whisper_recording:
             self._q.put(('whisper:cancel', None))
 
@@ -612,6 +786,7 @@ class App:
         self._sticky_idx = idx
         self._sticky = PromptStickyNote(
             self.root, prompt, on_save=_on_note_save, on_close=_on_note_close,
+            vision_extractor=self._vision_extractor,
         )
         logger.info(f'Prompt hotkey fired → [{idx}] {prompt["title"]!r}')
 
@@ -627,7 +802,7 @@ class App:
 
     def _on_prompts_saved(self, prompts: list) -> None:
         self.prompts = prompts
-        self._at_default_prompts = self._prompts_are_default(prompts)
+        self._at_default_prompts = False   # any edit re-enables Restore Default Prompts
         self._update_tray()
         # Save to disk in background — no need to block the UI thread for file I/O
         threading.Thread(target=save_prompts, args=(prompts,), daemon=True).start()
@@ -661,6 +836,9 @@ class App:
                 self._register_hotkeys()
                 if not self._hk_reg_pending:
                     break   # nothing changed while we were registering
+            # Always re-register saved-macro hotkeys after _register_hotkeys()
+            # because unhook_all() inside it wipes them out.
+            self._register_macro_saved_hotkeys()
         finally:
             self._hk_reg_lock.release()
 
@@ -742,7 +920,10 @@ class App:
                 event, data = self._q.get_nowait()
                 handler = self._dispatch.get(event)
                 if handler:
-                    handler(data)
+                    try:
+                        handler(data)
+                    except Exception:
+                        logger.exception(f'_poll: unhandled exception in handler for {event!r}')
         except queue.Empty:
             pass
         self.root.after(30, self._poll)
@@ -756,12 +937,18 @@ class App:
             return   # already running — ignore rapid double-press
         if not text or not text.strip():
             self.refine_overlay.show_no_selection()
+            # Re-register so the keyboard library resets after the suppressed
+            # hotkey — without this, the library's stuck modifier state blocks
+            # all subsequent hotkeys until the next successful paste re-reg.
+            threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
             return
         if isinstance(self.provider, LocalProvider) and not self.provider.ready:
             self.refine_overlay.show_loading_model()
+            threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
             return
         if not self.provider.ready:
             self.refine_overlay.show_error('API key required — open Settings')
+            threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
             return
 
         self._undo_available = False   # new refinement invalidates any prior undo
@@ -807,7 +994,13 @@ class App:
         elapsed = time.time() - self._refine_t0
         self.refine_overlay.show_done(elapsed)
         pyperclip.copy(result)
-        self.root.after(40, lambda: keyboard.send('ctrl+v'))   # was 60 ms
+        # Use direct Win32 SendInput (same path as whisper) — avoids routing
+        # through the keyboard library, which can leave its key-state machine
+        # stale (stuck modifier keys) and break subsequent hotkeys.
+        self.root.after(40, paste_from_clipboard)
+        # Re-register hotkeys after the paste lands — resets any library state
+        # corruption that injected Ctrl+V events may have caused.
+        self.root.after(150, self._reregister_after_action)
         self._undo_available = True
         self._undo_t         = time.time()
         logger.info(f'Refinement complete in {elapsed:.2f}s')
@@ -822,8 +1015,9 @@ class App:
         self._undo_available = False
         # Ctrl+Z in the focused app undoes our Ctrl+V paste, restoring the
         # original selected text.  We delay 40 ms so the hotkey release clears
-        # before the synthetic key arrives.
-        self.root.after(40, lambda: keyboard.send('ctrl+z'))
+        # before the synthetic key arrives.  Uses Win32 SendInput directly —
+        # not keyboard.send() — to avoid corrupting the library's modifier state.
+        self.root.after(40, undo_last)
         logger.info('Undo last refinement')
 
     def _prompts_are_default(self, prompts: list | None = None) -> bool:
@@ -878,6 +1072,7 @@ class App:
         if gen != self._refine_gen:
             return   # already handled by normal completion
         self._refine_in_progress = False
+        self._refine_gen += 1   # invalidate so any late result is discarded
         self.refine_overlay.show_error('Request timed out — try again')
         logger.warning('Refine request timed out after 30s')
 
@@ -981,6 +1176,9 @@ class App:
         copy_to_clipboard(out)
         if out_cfg.get('type_text', True):
             self.root.after(60, paste_from_clipboard)
+        # Re-register after paste for the same reason as refine — injected
+        # Ctrl+V can leave the keyboard library's state stale.
+        self.root.after(150, self._reregister_after_action)
 
         self.whisper_overlay.show_whisper_done(elapsed)
 
@@ -1000,6 +1198,454 @@ class App:
     def _on_whisper_error(self, msg: str) -> None:
         self.whisper_overlay.show_whisper_error(msg)
         logger.error(f'Whisper error: {msg}')
+
+    # ── Macro record & replay ─────────────────────────────────────────────────
+
+    def _on_macro_hotkey(self, _=None) -> None:
+        """Shift+F1 — cycles: idle→recording, recording→ready, ready→playing."""
+        state = self._macro_state
+        if state == 'idle':
+            self._macro_start_recording()
+        elif state == 'recording':
+            self._macro_stop_recording()
+        elif state == 'ready':
+            self._macro_start_playback()
+        elif state == 'playing':
+            self._on_macro_emergency_stop()
+
+    def _set_macro_state(self, state: str) -> None:
+        """Set macro state on both main.py and the library window (for right-click menu labels)."""
+        self._macro_state = state
+        self.library._macro_state = state
+
+    def _macro_reset(self) -> None:
+        """Abort any active recording/playback and return to idle — called from Library reset button."""
+        self._macro.force_stop()
+        self._macro.clear()
+        self._macro_unregister_stop_keys()
+        self._set_macro_state('idle')
+        self.macro_overlay._close()
+        self.library.refresh_macros()
+        logger.info('Macro session discarded — reset to idle')
+
+    def _macro_start_recording(self) -> None:
+        self._set_macro_state('recording')
+        self._macro.start_recording()
+        self._macro_register_stop_keys()
+        self.macro_overlay.show_macro_recording()
+        logger.info('Macro recording started')
+
+    def _macro_stop_recording(self) -> None:
+        self._macro.stop_recording()
+        n = self._macro.event_count
+        self._set_macro_state('ready' if n > 0 else 'idle')
+        self._macro_unregister_stop_keys()
+        if n > 0:
+            self.macro_overlay.show_macro_ready(n)
+            logger.info(f'Macro recording stopped — {n} events, {self._macro.duration:.2f}s')
+        else:
+            self.macro_overlay._close()
+            logger.info('Macro recording stopped — no events captured')
+
+    def _macro_start_playback(self) -> None:
+        if not self._macro.event_count:
+            return
+        self._set_macro_state('playing')
+        self._macro_register_stop_keys()
+        self.macro_overlay.show_macro_playing()
+        self._macro.start_playback(
+            on_done=lambda: self.root.after(0, self._macro_play_done),
+            on_stop=lambda: self.root.after(0, self._macro_play_stopped),
+        )
+        logger.info('Macro playback started')
+
+    def _macro_play_done(self) -> None:
+        self._set_macro_state('ready')
+        self._macro_unregister_stop_keys()
+        self.macro_overlay.show_macro_done()
+        logger.info('Macro playback complete')
+        # Show save prompt after a short delay (let pill appear first)
+        self.root.after(900, self._macro_show_save_prompt)
+
+    def _macro_show_save_prompt(self) -> None:
+        """Show 'Save this macro?' dialog near cursor."""
+        if self._macro_state != 'ready' or not self._macro.event_count:
+            return
+        default_name = self._macro_library.next_default_name()
+        default_hk   = self._macro_library.next_available_hotkey()
+        dlg = MacroSavePrompt(
+            self.root,
+            default_name=default_name,
+            default_hotkey=default_hk,
+            on_hotkey_suspend=self._suspend_hotkeys,
+            on_hotkey_resume=self._resume_hotkeys,
+        )
+        self.root.wait_window(dlg)
+        # Reset to idle regardless of save/discard so Shift+F1 starts fresh.
+        self._set_macro_state('idle')
+        if dlg.result:
+            name = dlg.result['name'].strip() or default_name
+            hk   = dlg.result['hotkey']
+            meta = self._macro_library.save(self._macro, name, hk)
+            logger.info(f'Macro saved: "{name}" ({meta["event_count"]} events) hotkey={hk!r}')
+            self._register_macro_saved_hotkeys()
+            self.library.refresh_macros()
+            # Confirmation pill — replaces the "done" pill
+            self.macro_overlay.show_macro_saved(name, hk)
+        # Clear after save (or discard) — not before, otherwise save gets empty events
+        self._macro.clear()
+
+    def _on_library_macro_play(self, meta: dict) -> None:
+        """Play a saved macro triggered from the Library UI."""
+        if self._macro_state in ('recording', 'playing'):
+            return
+        rec = self._macro_library.load_recorder(meta['id'])
+        # Replace the live recorder temporarily for playback
+        self._macro = rec
+        self._set_macro_state('playing')
+        self._macro_register_stop_keys()
+        self.macro_overlay.show_macro_playing()
+        self._macro.start_playback(
+            on_done=lambda: self.root.after(0, self._macro_saved_play_done),
+            on_stop=lambda: self.root.after(0, self._macro_play_stopped),
+        )
+        logger.info(f'Macro playback (saved): "{meta["name"]}"')
+
+    def _macro_saved_play_done(self) -> None:
+        """Playback of a saved macro finished — don't offer save again."""
+        self._set_macro_state('idle')
+        self._macro_unregister_stop_keys()
+        self.macro_overlay.show_macro_done()
+        logger.info('Saved macro playback complete')
+
+    def _register_macro_saved_hotkeys(self) -> None:
+        """Re-register all saved-macro playback hotkeys."""
+        for hk in self._macro_saved_hks:
+            try:
+                keyboard.remove_hotkey(hk)
+            except Exception:
+                pass
+        self._macro_saved_hks = []
+        for meta in self._macro_library.macros:
+            hk = meta.get('hotkey', '').strip()
+            if not hk:
+                continue
+            mid  = meta['id']
+            name = meta['name']
+            try:
+                handle = keyboard.add_hotkey(
+                    hk,
+                    lambda m=meta: self._q.put(('macro:play_saved', m)),
+                    suppress=False,
+                )
+                self._macro_saved_hks.append(handle)
+                logger.info(f'Macro hotkey registered: {hk!r} -> "{name}"')
+            except Exception as e:
+                logger.warning(f'Could not register macro hotkey {hk!r}: {e}')
+
+    def _macro_play_stopped(self) -> None:
+        # Guard: _on_macro_emergency_stop already ran if state is no longer 'playing'
+        if self._macro_state != 'playing':
+            return
+        self._set_macro_state('ready')
+        self._macro_unregister_stop_keys()
+        self.macro_overlay.show_macro_stopped()
+        logger.info('Macro playback force-stopped')
+
+    def _on_macro_emergency_stop(self, _=None) -> None:
+        """Esc or Del — abort recording or playback immediately."""
+        state = self._macro_state
+        if state not in ('recording', 'playing'):
+            return
+        self._macro.force_stop()
+        if state == 'recording':
+            n = self._macro.event_count
+            self._set_macro_state('ready' if n > 0 else 'idle')
+            self._macro_unregister_stop_keys()
+            if n > 0:
+                self.root.after(0, lambda: self.macro_overlay.show_macro_ready(n))
+            else:
+                self.root.after(0, self.macro_overlay._close)
+            logger.info(f'Macro recording aborted by stop key — {n} events kept')
+        else:   # playing
+            self._set_macro_state('ready')
+            self._macro_unregister_stop_keys()
+            self.root.after(0, self.macro_overlay.show_macro_stopped)
+            logger.info('Macro playback aborted by stop key')
+
+    def _macro_register_stop_keys(self) -> None:
+        # Esc is handled by the permanent _hk_escape (which checks macro state),
+        # so we only add Delete here to avoid a double-Esc handler.
+        self._macro_stop_hks = [
+            keyboard.add_hotkey('delete', lambda: self._q.put(('macro:stop', None)), suppress=False),
+        ]
+
+    def _macro_unregister_stop_keys(self) -> None:
+        for hk in self._macro_stop_hks:
+            try:
+                keyboard.remove_hotkey(hk)
+            except Exception:
+                pass
+        self._macro_stop_hks = []
+
+    # ── Screen recorder ───────────────────────────────────────────────────────
+
+    def _on_recorder_toggle(self) -> None:
+        """Shift+F2 or Library tab button — starts or stops screen recording."""
+        if self._recorder_state == 'idle':
+            self._recorder_start_setup()
+        elif self._recorder_state == 'recording':
+            self._recorder_stop()
+
+    def _recorder_start_setup(self) -> None:
+        """Show pre-recording options dialog then start recording."""
+        # Parent to library window if it's mapped, else root
+        try:
+            parent = self.library.win if self.library.win.winfo_ismapped() else self.root
+        except Exception:
+            parent = self.root
+        dlg = RecorderSetupDialog(parent)
+        parent.wait_window(dlg.win)
+        if dlg.result is None:
+            return   # user cancelled
+
+        cfg = dlg.result
+        self._screen_recorder = ScreenRecorder(
+            hwnd=cfg['hwnd'],
+            mon=cfg.get('mon'),
+            mic=cfg['mic'],
+            mic_device=cfg.get('mic_device'),
+            fps=cfg['fps'],
+            on_size_update=lambda b: self._q.put(('recorder:size', b)),
+            on_cap_reached=lambda: self._q.put(('recorder:cap', None)),
+        )
+        try:
+            self._screen_recorder.start()
+        except Exception as exc:
+            logger.error(f'Screen recorder failed to start: {exc}')
+            from dialogs import alert
+            alert(self.root, 'Recorder error', str(exc))
+            self._screen_recorder = None
+            return
+
+        self._recorder_state = 'recording'
+        self._recorder_t0    = time.time()
+        self.recorder_overlay.show_recorder_recording()
+        self._update_library_recorder_state()
+        self._recorder_tick()
+        logger.info('Screen recording started')
+
+    def _recorder_stop(self) -> None:
+        """Stop recording and show save dialog."""
+        if self._screen_recorder is None:
+            return
+        self._recorder_state = 'stopping'
+        self.recorder_overlay.show_recorder_stopping()
+        self._update_library_recorder_state()
+
+        rec = self._screen_recorder
+
+        def _finish():
+            rec.stop()
+            self.root.after(0, lambda: self._recorder_finish(rec))
+
+        threading.Thread(target=_finish, daemon=True, name='rec-stop').start()
+
+    def _recorder_finish(self, rec: ScreenRecorder) -> None:
+        """Called on main thread after encoding is complete."""
+        self._screen_recorder = None
+        self._recorder_state  = 'idle'
+        self.recorder_overlay._close()
+        self._update_library_recorder_state()
+        logger.info(f'Screen recording stopped — {rec.bytes_written/1024**2:.1f} MB')
+
+        if rec.error:
+            from dialogs import alert
+            alert(self.root, 'Recorder error', rec.error)
+            return
+        if not rec.output_path or not os.path.exists(rec.output_path):
+            return
+        if os.path.getsize(rec.output_path) == 0:
+            from dialogs import alert
+            try:
+                os.unlink(rec.output_path)
+            except Exception:
+                pass
+            alert(self.root, 'Recording failed',
+                  'The output file is empty — the encoder produced no data.\n\n'
+                  'This can happen if the recording was stopped too quickly\n'
+                  'or if the screen capture failed to initialise.')
+            return
+
+        dur     = int(rec.elapsed())
+        size_mb = os.path.getsize(rec.output_path) / (1024 ** 2)
+        try:
+            parent = self.library.win if self.library.win.winfo_ismapped() else self.root
+        except Exception:
+            parent = self.root
+        dest = show_save_dialog(parent, rec.output_path, dur, size_mb)
+        if dest:
+            logger.info(f'Recording saved: {dest}')
+            # Track path in index so it shows in the list regardless of save location
+            try:
+                from screen_recorder import add_to_recordings_index
+                add_to_recordings_index(dest)
+            except Exception:
+                pass
+            # Refresh the library recorder tab list
+            if hasattr(self, 'library'):
+                self.library.update_recorder_state('idle')
+
+    def _on_recorder_cap(self) -> None:
+        """1 GB cap hit — auto-stop."""
+        logger.info('Screen recording: 1 GB cap reached — stopping')
+        from dialogs import alert
+        self._recorder_stop()
+        self.root.after(500, lambda: alert(
+            self.root, '1 GB limit reached',
+            'The recording reached the 1 GB size cap\nand has been stopped automatically.'))
+
+    def _recorder_tick(self) -> None:
+        """Called every 500ms while recording to push live state to the library tab."""
+        if self._recorder_state != 'recording' or self._screen_recorder is None:
+            return
+        elapsed = time.time() - self._recorder_t0
+        size_mb = self._screen_recorder.bytes_written / (1024 ** 2)
+        self._update_library_recorder_state(elapsed=elapsed, size_mb=size_mb)
+        self.root.after(500, self._recorder_tick)
+
+    def _update_library_recorder_state(self, elapsed: float = 0.0, size_mb: float = 0.0) -> None:
+        try:
+            self.library.update_recorder_state(self._recorder_state, elapsed, size_mb)
+        except Exception:
+            pass
+
+    # ── GIF recorder ─────────────────────────────────────────────────────────
+
+    def _on_gif_toggle(self) -> None:
+        """Shift+F3 / button press — start or stop GIF recording."""
+        if self._gif_state == 'idle':
+            self._gif_start()
+        elif self._gif_state == 'recording':
+            self._gif_stop()
+        # 'encoding' — ignore, let it finish
+
+    def _gif_start(self) -> None:
+        """Show setup dialog, then begin capturing."""
+        try:
+            mapped = self.library.win.winfo_ismapped()
+            parent = self.library.win if mapped else self.root
+        except Exception:
+            mapped = False
+            parent = self.root
+        try:
+            dlg = GifSetupDialog(parent)
+        except Exception as exc:
+            logger.exception(f'GIF setup dialog creation failed: {exc}')
+            return
+        parent.wait_window(dlg.win)
+        if dlg.result is None:
+            return   # user cancelled
+
+        cfg = dlg.result
+        logger.info(f'GIF setup: {cfg}')
+        try:
+            self._gif_recorder = GifRecorder(
+                hwnd=cfg['hwnd'],
+                mon=cfg.get('mon'),
+                fps=cfg['fps'],
+                max_width=cfg['max_width'],
+                max_duration_s=cfg['max_duration_s'],
+            )
+            self._gif_recorder.start(
+                on_done=lambda path, dur: self._q.put(('gif:done', (path, dur))),
+                on_error=lambda msg: self._q.put(('gif:error', msg)),
+                on_cap_reached=lambda: self._q.put(('gif:cap', None)),
+            )
+        except Exception as exc:
+            logger.error(f'GIF recorder failed to start: {exc}')
+            from dialogs import alert
+            alert(self.root, 'GIF error', str(exc))
+            self._gif_recorder = None
+            return
+
+        self._gif_state = 'recording'
+        self._gif_t0    = time.time()
+        self.gif_overlay.show_gif_recording()
+        self._update_library_gif_state()
+        self._gif_tick()
+        logger.info('GIF recording started')
+
+    def _gif_stop(self) -> None:
+        """Signal capture to stop; encoding happens in background."""
+        if self._gif_recorder is None:
+            return
+        self._gif_state = 'encoding'
+        self.gif_overlay.show_gif_encoding()
+        self._update_library_gif_state()
+        self._gif_recorder.stop()
+
+    def _on_gif_done(self, data) -> None:
+        """Called on main thread when encoding finishes successfully."""
+        tmp_path, dur = data
+        self._gif_recorder = None
+        self._gif_state    = 'idle'
+        self.gif_overlay._close()
+        self._update_library_gif_state()
+        elapsed = int(dur)
+        logger.info(f'GIF recording complete — {elapsed}s, {tmp_path}')
+
+        if not tmp_path or not os.path.exists(tmp_path):
+            return
+
+        try:
+            parent = self.library.win if self.library.win.winfo_ismapped() else self.root
+        except Exception:
+            parent = self.root
+
+        dest = show_gif_save_dialog(parent, tmp_path, dur)
+        if dest:
+            logger.info(f'GIF saved: {dest}')
+            # Refresh library GIF tab
+            try:
+                self.library.update_gif_state('idle')
+            except Exception:
+                pass
+
+    def _on_gif_error(self, msg: str) -> None:
+        self._gif_recorder = None
+        self._gif_state    = 'idle'
+        self.gif_overlay._close()
+        self._update_library_gif_state()
+        logger.error(f'GIF recorder error: {msg}')
+        from dialogs import alert
+        alert(self.root, 'GIF error', msg)
+
+    def _on_gif_cap(self) -> None:
+        """Max duration cap reached — auto-stop."""
+        if self._gif_recorder is None:
+            return
+        logger.info('GIF recording: max duration reached — stopping')
+        dur_s = int(self._gif_recorder.max_duration_s)
+        self.gif_overlay.show_gif_capped(dur_s)
+        self._gif_state = 'encoding'
+        self._update_library_gif_state()
+        self._gif_recorder.stop()
+
+    def _gif_tick(self) -> None:
+        """Push live elapsed/frame count to the library tab every 500ms."""
+        if self._gif_state != 'recording' or self._gif_recorder is None:
+            return
+        elapsed = time.time() - self._gif_t0
+        frames  = self._gif_recorder.frame_count
+        self._update_library_gif_state(elapsed=elapsed, frames=frames)
+        self.root.after(500, self._gif_tick)
+
+    def _update_library_gif_state(self, elapsed: float = 0.0, frames: int = 0) -> None:
+        try:
+            self.library.update_gif_state(self._gif_state, elapsed, frames)
+        except Exception:
+            pass
 
     # ── System tray ───────────────────────────────────────────────────────────
 
@@ -1086,6 +1732,8 @@ class App:
 
         return pystray.Menu(
             pystray.MenuItem(f'Hotkeys  v{VERSION}', None, enabled=False),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem('Take a screenshot', lambda: self._hk_screenshot()),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem('Provider', pystray.Menu(
                 *([prov_item('local', 'Qwen 2.5 1.5B (Local · Free)')] if local_provider_available() else []),

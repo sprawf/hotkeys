@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" shape-rendering="geometricPrecision">
+  <defs>
+    <linearGradient id="grad" x1="0.5" y1="0" x2="0.5" y2="1">
+      <stop offset="0%"   stop-color="#bae6fd"/>
+      <stop offset="40%"  stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#0f2a6e"/>
+    </linearGradient>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="2.5" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <clipPath id="c"><rect width="64" height="64" rx="13"/></clipPath>
+  </defs>
+  <!-- Purple border -->
+  <rect width="64" height="64" rx="13" fill="#7c3aed"/>
+  <!-- Dark background inset -->
+  <rect x="3" y="3" width="58" height="58" rx="11" fill="#080f1a"/>
+  <g clip-path="url(#c)">
+    <polygon points="42,4 10,34 28,34 22,60 52,26 36,26"
+             fill="#38bdf8" filter="url(#glow)" opacity="0.6"/>
+    <polygon points="42,4 10,34 28,34 22,60 52,26 36,26"
+             fill="url(#grad)"/>
+  </g>
+</svg>

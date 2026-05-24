@@ -1,4 +1,5 @@
 """Settings window — General / Providers / Whisper tabs, sidebar layout."""
+import subprocess
 import threading
 import tkinter as tk
 from typing import Callable
@@ -9,6 +10,8 @@ from dialogs import alert
 from engine  import (PROVIDER_KEYS, GROQ_MODELS, CEREBRAS_MODELS,
                      OPENAI_MODELS, ANTHROPIC_MODELS, GEMINI_MODELS,
                      local_provider_available)
+import os
+from pathlib import Path
 from storage import set_autostart, appdata_dir
 from theme   import (
     BG, SURFACE, SURF2, SURF3, BORDER, BORDER2,
@@ -106,7 +109,15 @@ class SettingsWindow:
     # ── General panel ─────────────────────────────────────────────────────────
 
     def _build_general(self, parent) -> ctk.CTkFrame:
-        frame = ctk.CTkFrame(parent, fg_color=BG, corner_radius=0)
+        outer = ctk.CTkFrame(parent, fg_color=BG, corner_radius=0)
+        # Scrollable so content never gets clipped if window is short
+        scroll = ctk.CTkScrollableFrame(
+            outer, fg_color=BG,
+            scrollbar_button_color=SURF2,
+            scrollbar_button_hover_color=SURF3,
+        )
+        scroll.pack(fill='both', expand=True)
+        frame = scroll   # all children go into the scrollable area
 
         def section(title):
             ctk.CTkLabel(frame, text=title, font=(FONT_FAMILY, 9, 'bold'),
@@ -116,21 +127,28 @@ class SettingsWindow:
             ctk.CTkFrame(frame, fg_color=BORDER, height=1,
                          corner_radius=0).pack(fill='x', padx=PAD, pady=PAD_SM)
 
+        # ── HOTKEYS (configurable) ────────────────────────────────────────────
         section('HOTKEYS')
         HK_DEFAULTS = {
-            'refine':      'alt+shift+w',
-            'library':     'alt+shift+e',
-            'whisper':     'ctrl+enter',
-            'undo_refine': 'alt+shift+z',
+            'refine':        'alt+shift+w',
+            'library':       'alt+shift+e',
+            'whisper':       'ctrl+enter',
+            'undo_refine':   'alt+shift+z',
+            'macro_record':  'shift+f1',
+            'recorder':      'shift+f2',
+            'gif_record':    'shift+f3',
         }
         hk_cfg = self.config.get('hotkeys', {})
         self._hotkey_vars: dict[str, tk.StringVar] = {}
 
         hk_actions = [
-            ('refine',      'Refine selected text'),
-            ('library',     'Open Prompt Library'),
-            ('whisper',     'Toggle speech-to-text'),
-            ('undo_refine', 'Undo last refinement'),
+            ('refine',       'Refine selected text'),
+            ('library',      'Open Prompt Library'),
+            ('whisper',      'Toggle speech-to-text'),
+            ('undo_refine',  'Undo last refinement'),
+            ('macro_record', 'Record / stop / play macro'),
+            ('recorder',     'Toggle screen recording'),
+            ('gif_record',   'Start / stop GIF recording'),
         ]
         for action, label in hk_actions:
             row = ctk.CTkFrame(frame, fg_color='transparent')
@@ -144,12 +162,36 @@ class SettingsWindow:
                          padx=10, pady=3, width=130).pack(side='left', padx=(0, 6))
             ctk.CTkButton(
                 row, text='Record', width=64, height=26, font=(FONT_FAMILY, 9),
-                fg_color=SURF3, hover_color=SURF2, text_color=TEXT_S, corner_radius=RADIUS_SM,
+                fg_color=SURF3, hover_color=SURF2, text_color=TEXT_P, corner_radius=RADIUS_SM,
                 command=lambda a=action, v=var: self._record_hotkey(a, v),
             ).pack(side='left')
 
         divider()
 
+        # ── MACRO SHORTCUTS (fixed reference) ────────────────────────────────
+        section('FIXED SHORTCUTS')
+        ctk.CTkLabel(frame, text='These cannot be changed.',
+                     font=(FONT_FAMILY, 8), text_color=TEXT_S).pack(anchor='w', padx=PAD, pady=(0, 6))
+
+        macro_shortcuts = [
+            ('Esc  /  Del',     'Abort macro recording or playback immediately'),
+            ('Ctrl+F1 … F12',   'Play a saved macro (assign hotkey in Library → Macros)'),
+            ('Ctrl+Scroll ↑',   'Refine selected text (same as main hotkey)'),
+        ]
+        for keys, desc in macro_shortcuts:
+            row = ctk.CTkFrame(frame, fg_color='transparent')
+            row.pack(fill='x', padx=PAD, pady=2)
+            ctk.CTkLabel(row, text=keys,
+                         font=(FONT_FAMILY, 9, 'bold'), text_color=ACCENT,
+                         fg_color=SURF2, corner_radius=RADIUS_SM,
+                         padx=8, pady=3, width=138, anchor='w').pack(side='left', padx=(0, 10))
+            ctk.CTkLabel(row, text=desc,
+                         font=(FONT_FAMILY, 10), text_color=TEXT_P,
+                         anchor='w').pack(side='left', fill='x', expand=True)
+
+        divider()
+
+        # ── STARTUP ───────────────────────────────────────────────────────────
         section('STARTUP')
         row = ctk.CTkFrame(frame, fg_color='transparent')
         row.pack(fill='x', padx=PAD, pady=3)
@@ -161,15 +203,36 @@ class SettingsWindow:
 
         divider()
 
+        # ── DATA (file locations) ─────────────────────────────────────────────
         section('DATA')
-        path_frame = ctk.CTkFrame(frame, fg_color=SURF2, corner_radius=RADIUS_SM)
-        path_frame.pack(fill='x', padx=PAD, pady=(0, PAD_SM))
-        ctk.CTkLabel(path_frame, text=appdata_dir(), font=(FONT_FAMILY, 9),
-                     text_color=TEXT_S, anchor='w').pack(padx=PAD_SM, pady=6, anchor='w')
-        ctk.CTkLabel(frame, text='Config, prompts, history, and logs are stored here.',
-                     font=(FONT_FAMILY, 8), text_color=TEXT_S).pack(anchor='w', padx=PAD)
 
-        return frame
+        def _open_folder(path: str) -> None:
+            p = Path(path)
+            p.mkdir(parents=True, exist_ok=True)
+            subprocess.Popen(['explorer', os.path.normpath(str(p))])
+
+        def _path_row(label_text: str, path: str, note: str) -> None:
+            pf = ctk.CTkFrame(frame, fg_color=SURF2, corner_radius=RADIUS_SM)
+            pf.pack(fill='x', padx=PAD, pady=(0, 2))
+            ctk.CTkLabel(pf, text=label_text, font=(FONT_FAMILY, 8, 'bold'),
+                         text_color=TEXT_S, anchor='w').pack(side='left', padx=(PAD_SM, 4), pady=6)
+            ctk.CTkLabel(pf, text=path, font=(FONT_FAMILY, 9),
+                         text_color=TEXT_S, anchor='w').pack(side='left', padx=(0, 4), pady=6)
+            ctk.CTkButton(
+                pf, text='Open', width=52, height=22,
+                font=(FONT_FAMILY, 9), corner_radius=RADIUS_SM,
+                fg_color=SURF3, hover_color=BORDER2, text_color=TEXT_P,
+                command=lambda p=path: _open_folder(p),
+            ).pack(side='right', padx=PAD_SM, pady=4)
+            ctk.CTkLabel(frame, text=note,
+                         font=(FONT_FAMILY, 8), text_color=TEXT_S).pack(anchor='w', padx=PAD, pady=(0, 6))
+
+        _path_row('App data  ', appdata_dir(),
+                  'Config, prompts, history, and logs.')
+        _path_row('Macros    ', str(Path(appdata_dir()) / 'macros'),
+                  'Saved macro recordings (.json files).')
+
+        return outer
 
     # ── Hotkey capture ────────────────────────────────────────────────────────
 
@@ -182,15 +245,15 @@ class SettingsWindow:
             try:
                 combo = keyboard.read_hotkey(suppress=False)
                 if combo.lower() in ('escape', 'esc'):
-                    var.set(prev)
+                    self.win.after(0, lambda: var.set(prev))
                     return
                 parts = {p.lower() for p in combo.split('+')}
                 if not parts & {'ctrl', 'alt', 'shift', 'windows', 'win'}:
-                    var.set(prev)
+                    self.win.after(0, lambda: var.set(prev))
                     return
-                var.set(combo)
+                self.win.after(0, lambda v=combo: var.set(v))
             except Exception:
-                var.set(prev)
+                self.win.after(0, lambda: var.set(prev))
 
         threading.Thread(target=capture, daemon=True).start()
 
@@ -280,13 +343,13 @@ class SettingsWindow:
             entry.pack(side='left', fill='x', expand=True)
             ctk.CTkButton(
                 key_row, text='Show', width=54, height=32,
-                fg_color=SURF3, hover_color=SURF2, text_color=TEXT_S,
+                fg_color=SURF3, hover_color=SURF2, text_color=TEXT_P,
                 font=(FONT_FAMILY, 9), corner_radius=RADIUS_SM,
                 command=lambda e=entry: e.configure(show='' if e.cget('show') == '•' else '•'),
             ).pack(side='left', padx=(4, 0))
             test_btn = ctk.CTkButton(
                 key_row, text='Test', width=54, height=32,
-                fg_color=SURF3, hover_color=SURF2, text_color=TEXT_S,
+                fg_color=SURF3, hover_color=SURF2, text_color=TEXT_P,
                 font=(FONT_FAMILY, 9), corner_radius=RADIUS_SM,
             )
             test_btn.pack(side='left', padx=(4, 0))
@@ -334,13 +397,13 @@ class SettingsWindow:
         centry.pack(side='left', fill='x', expand=True)
         ctk.CTkButton(
             ckey_row, text='Show', width=54, height=32,
-            fg_color=SURF3, hover_color=SURF2, text_color=TEXT_S,
+            fg_color=SURF3, hover_color=SURF2, text_color=TEXT_P,
             font=(FONT_FAMILY, 9), corner_radius=RADIUS_SM,
             command=lambda e=centry: e.configure(show='' if e.cget('show') == '•' else '•'),
         ).pack(side='left', padx=(4, 0))
         ctest_btn = ctk.CTkButton(
             ckey_row, text='Test', width=54, height=32,
-            fg_color=SURF3, hover_color=SURF2, text_color=TEXT_S,
+            fg_color=SURF3, hover_color=SURF2, text_color=TEXT_P,
             font=(FONT_FAMILY, 9), corner_radius=RADIUS_SM,
         )
         ctest_btn.pack(side='left', padx=(4, 0))
@@ -603,7 +666,7 @@ class SettingsWindow:
                     btn.configure(text='✗ Failed', fg_color=ERR, hover_color=ERR,
                                   text_color='#ffffff', state='normal')
                 self.win.after(3000, lambda: btn.configure(
-                    text='Test', fg_color=SURF3, hover_color=SURF2, text_color=TEXT_S))
+                    text='Test', fg_color=SURF3, hover_color=SURF2, text_color=TEXT_P))
 
             self.win.after(0, _update)
 

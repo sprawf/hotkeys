@@ -5,7 +5,8 @@
 Select text anywhere → press `Alt+Shift+W` → AI rewrites it and pastes it back. Done.  
 Works in Gmail, Notion, Slack, Word, VS Code, Discord — every app on your computer.
 
-[![Windows](https://img.shields.io/badge/Windows-Download_v2.0-0078D6?style=for-the-badge&logo=windows)](https://github.com/sprawf/hotkeys/releases/download/v2.0.0/Hotkeys-v2.0-win64.zip)
+[![Windows](https://img.shields.io/badge/Windows-Download_v3.0-0078D6?style=for-the-badge&logo=windows)](https://github.com/sprawf/hotkeys/releases/download/v3.0.0/Hotkeys-v3.0-win64.zip)
+[![Windows v2](https://img.shields.io/badge/Windows-v2.0_(legacy)-555555?style=for-the-badge&logo=windows)](https://github.com/sprawf/hotkeys/releases/download/v2.0.0/Hotkeys-v2.0-win64.zip)
 [![Windows v1](https://img.shields.io/badge/Windows-v1.0_(legacy)-555555?style=for-the-badge&logo=windows)](https://github.com/sprawf/hotkeys/releases/download/v1.0.0/Hotkeys-v1.0-win64.zip)
 [![Mac](https://img.shields.io/badge/Mac-Installer-999999?style=for-the-badge&logo=apple)](https://github.com/sprawf/hotkeys/raw/main/install_mac.command)
 [![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)](LICENSE)
@@ -74,14 +75,14 @@ These are just the starting point. Hit **+ Add** to write your own.
 
 ### ⊞ Windows — one click, no setup
 
-1. **[Download Hotkeys-v2.0-win64.zip](https://github.com/sprawf/hotkeys/releases/download/v2.0.0/Hotkeys-v2.0-win64.zip)**
+1. **[Download Hotkeys-v3.0-win64.zip](https://github.com/sprawf/hotkeys/releases/download/v3.0.0/Hotkeys-v3.0-win64.zip)**
 2. Extract the zip — you'll get a `Hotkeys` folder
 3. Open the folder and double-click `Hotkeys.exe`
 4. The ⚡ icon appears in your taskbar tray — you're done
 
 No Python. No pip. No installing anything. It just works.
 
-> **[Download v1.0 (legacy)](https://github.com/sprawf/hotkeys/releases/download/v1.0.0/Hotkeys-v1.0-win64.zip)**
+> [Download v2.0 (legacy)](https://github.com/sprawf/hotkeys/releases/download/v2.0.0/Hotkeys-v2.0-win64.zip) · [Download v1.0 (legacy)](https://github.com/sprawf/hotkeys/releases/download/v1.0.0/Hotkeys-v1.0-win64.zip)
 
 ---
 
@@ -149,6 +150,9 @@ Everything is configurable. Open the library (`Alt+Shift+E`) and click the gear 
 | Fire prompt 1–12 | `F1` – `F12` |
 | Start / stop voice recording | `Ctrl + Enter` |
 | Cancel recording | `Escape` |
+| Record / stop / replay macro | `Shift + F1` |
+| Start / stop screen recorder | `Shift + F2` |
+| Start / stop GIF recorder | `Shift + F3` |
 
 All hotkeys are customisable in Settings. Per-prompt hotkeys are assigned per prompt via right-click → **Assign hotkey**.
 
@@ -194,6 +198,10 @@ Voice-to-text works without any API key — it runs fully offline on your device
 | 📋 | **Transcription history** | Browse and copy past recordings |
 | ⚡ | **Instant paste** | Output types directly where your cursor is |
 | 🖥️ | **System tray** | Zero UI clutter, always available |
+| 🔴 | **Macro recorder** | Record & replay any sequence of keystrokes and mouse clicks (`Shift+F1`) |
+| 🎬 | **Screen recorder** | Capture any window or region as MP4 (`Shift+F2`) |
+| 🎞️ | **GIF recorder** | Record any window or region as an animated GIF (`Shift+F3`) |
+| 📸 | **AI screenshot** | Capture screen and ask AI what's in it |
 
 ---
 

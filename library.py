@@ -1,17 +1,26 @@
 """Prompt Library — sticky-note grid with full CRUD."""
+import logging
 import math
+import os
+import subprocess
 import threading
 import tkinter as tk
+from pathlib import Path
 from typing import Callable
+
+_log = logging.getLogger('library')
 
 import customtkinter as ctk
 import keyboard
 
 import spellcheck
-from dialogs import alert, confirm, center_over_parent
+from dialogs import alert, confirm, center_over_parent, Tooltip, PopupMenu
+from macros.library import MacroLibrary
+from storage import appdata_dir
 from theme import (
     BG, SURFACE, SURF2, SURF3, BORDER, BORDER2,
     ACCENT, ACCENTL, TEXT_P, TEXT_S, TEXT_D,
+    OK,
     CARD_COLORS, CARD_TEXT, CARD_TEXT_S,
     FONT_FAMILY, FONT_SM_BOLD,
     PAD, PAD_SM, PAD_LG, RADIUS, RADIUS_SM,
@@ -39,7 +48,8 @@ class EditDialog(ctk.CTkToplevel):
     def __init__(self, parent, prompt: dict | None = None,
                  on_hotkey_suspend: Callable | None = None,
                  on_hotkey_resume:  Callable | None = None,
-                 reserved_hotkeys:  set | None = None) -> None:
+                 reserved_hotkeys:  set | None = None,
+                 vision_extractor:  Callable | None = None) -> None:
         super().__init__(parent)
         is_new = prompt is None
         self.title('New Prompt' if is_new else 'Edit Prompt')
@@ -52,6 +62,8 @@ class EditDialog(ctk.CTkToplevel):
         self._on_hotkey_resume  = on_hotkey_resume
         self._reserved_hotkeys  = reserved_hotkeys or set()
         self._hotkey            = (prompt or {}).get('hotkey', '')
+        self._vision_extractor  = vision_extractor
+        self._ocr_pending       = False
 
         data = prompt or {'title': '', 'prompt': '', 'color': CARD_COLORS[0]}
 
@@ -95,7 +107,7 @@ class EditDialog(ctk.CTkToplevel):
         self._hk_badge = ctk.CTkLabel(
             hk_row, text='', width=180, anchor='w',
             fg_color=SURF2, corner_radius=RADIUS_SM,
-            font=(FONT_FAMILY, 12), text_color=TEXT_D,
+            font=(FONT_FAMILY, 12), text_color=TEXT_S,
         )
         self._hk_badge.pack(side='left', ipady=4, ipadx=8)
         self._refresh_hk()
@@ -115,6 +127,44 @@ class EditDialog(ctk.CTkToplevel):
         self._text.pack(fill='x', pady=(4, 0))
         spellcheck.attach(self._text)
 
+        # ── OCR row (📷 Paste Image button + status + char count) ───────────────
+        ocr_row = ctk.CTkFrame(body, fg_color='transparent')
+        ocr_row.pack(fill='x', pady=(6, 0))
+
+        self._ocr_btn = _btn(
+            ocr_row, '📷  Paste Image', self._ocr_start,
+            width=140, fg_color=SURF2, hover=SURF3,
+        )
+        self._ocr_btn.pack(side='left')
+        Tooltip(self._ocr_btn,
+                'Copy an image to clipboard, then click to extract its text.\n'
+                'You can also press Ctrl+V in the text box above.')
+
+        # Char count — pinned to the right edge
+        self._char_lbl = ctk.CTkLabel(
+            ocr_row, text='', font=(FONT_FAMILY, 11), text_color=TEXT_S,
+        )
+        self._char_lbl.pack(side='right')
+        self._update_char_count()
+
+        # Inline status message — centre of the row, changes during OCR
+        self._ocr_status_lbl = ctk.CTkLabel(
+            ocr_row, text='', font=(FONT_FAMILY, 11), text_color=TEXT_S,
+        )
+        self._ocr_status_lbl.pack(side='left', padx=(10, 0))
+
+        # Update char count whenever text changes
+        try:
+            inner = self._text._textbox
+        except AttributeError:
+            inner = getattr(self._text, 'textbox', self._text)
+        inner.bind('<KeyRelease>', lambda e: self._update_char_count(), add='+')
+
+        # Ctrl+V on the inner tk.Text: intercept if clipboard contains an image
+        inner.bind('<Control-v>', self._on_ctrl_v, add='+')
+        # Right-click: standard Cut/Copy/Paste + Paste Image
+        inner.bind('<Button-3>', self._show_text_context_menu, add='+')
+
         foot = ctk.CTkFrame(self, fg_color=SURFACE, corner_radius=0)
         foot.pack(fill='x')
         _btn(foot, 'Save',   self._save,   width=100, fg_color=ACCENT, hover=ACCENTL).pack(side='right', padx=PAD, pady=PAD_SM)
@@ -131,7 +181,7 @@ class EditDialog(ctk.CTkToplevel):
                 text_color=ACCENTL, fg_color=SURF2,
             )
         else:
-            self._hk_badge.configure(text='  —  None assigned', text_color=TEXT_D, fg_color=SURFACE)
+            self._hk_badge.configure(text='  —  None assigned', text_color=TEXT_S, fg_color=SURFACE)
 
     def _assign_hk(self) -> None:
         if self._on_hotkey_suspend:
@@ -171,6 +221,139 @@ class EditDialog(ctk.CTkToplevel):
         self.result = {'title': title, 'prompt': prompt, 'color': self._color_var.get(),
                        'hotkey': self._hotkey}   # '' = cleared; str = assigned
         self.destroy()
+
+    # ── Char count ────────────────────────────────────────────────────────────
+
+    def _update_char_count(self) -> None:
+        try:
+            n = len(self._text.get('1.0', 'end-1c'))
+            self._char_lbl.configure(text=f'{n} chars')
+        except Exception:
+            pass
+
+    def _show_text_context_menu(self, event) -> None:
+        """Right-click context menu on the prompt text box."""
+        w       = event.widget
+        has_sel = bool(w.tag_ranges('sel'))
+        (PopupMenu(self)
+            .add('Cut',          lambda: w.event_generate('<<Cut>>'),   enabled=has_sel)
+            .add('Copy',         lambda: w.event_generate('<<Copy>>'),  enabled=has_sel)
+            .add('Paste',        lambda: w.event_generate('<<Paste>>'))
+            .separator()
+            .add('Paste Image',  self._ocr_start)
+            .show(event.x_root, event.y_root)
+        )
+
+    def _ocr_set_status(self, text: str, color: str) -> None:
+        try:
+            self._ocr_status_lbl.configure(text=text, text_color=color)
+        except Exception:
+            pass
+
+    def _ocr_clear_status(self) -> None:
+        self._ocr_set_status('', TEXT_D)
+
+    # ── OCR ───────────────────────────────────────────────────────────────────
+
+    def _on_ctrl_v(self, event) -> None:
+        """Intercept Ctrl+V: if the clipboard holds an image, run OCR instead."""
+        from vision import get_clipboard_image
+        img = get_clipboard_image()
+        if img is None:
+            return None   # fall through to normal paste
+        self._ocr_start(img=img)
+        return 'break'   # consumed — don't also paste raw clipboard data
+
+    def _ocr_start(self, img=None) -> None:
+        """Kick off OCR in a background thread.  img may be pre-supplied or read from clipboard."""
+        if self._ocr_pending:
+            return
+        if self._vision_extractor is None:
+            alert(self, 'OCR unavailable', 'No vision extractor configured.')
+            return
+
+        if img is None:
+            from vision import get_clipboard_image
+            img = get_clipboard_image()
+            if img is None:
+                alert(self, 'No image found',
+                      'Copy an image to the clipboard first,\nthen click Paste Image.')
+                return
+
+        self._ocr_pending = True
+        # Visual: button turns accent purple + spinner text; status label appears
+        self._ocr_btn.configure(
+            text='⏳  Extracting…',
+            fg_color=ACCENT, hover_color=ACCENTL,
+            state='disabled',
+        )
+        self._ocr_set_status('Extracting text from image…', ACCENTL)
+
+        _img       = img
+        _extractor = self._vision_extractor
+
+        def _worker():
+            try:
+                text = _extractor(_img)
+                self.after(0, lambda: self._ocr_done(text))
+            except Exception as exc:
+                self.after(0, lambda: self._ocr_error(str(exc)))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _ocr_done(self, text: str) -> None:
+        """Called on the UI thread when OCR completes successfully."""
+        self._ocr_pending = False
+        # Restore button to idle state
+        self._ocr_btn.configure(
+            text='📷  Paste Image',
+            fg_color=SURF2, hover_color=SURF3,
+            state='normal',
+        )
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:
+            return
+
+        from vision import LONG_TEXT_WARN
+        if len(text) > LONG_TEXT_WARN:
+            if not confirm(self, 'Long text extracted',
+                           f'Extracted {len(text)} characters.\nInsert into prompt?',
+                           action_label='Insert'):
+                self._ocr_clear_status()
+                return
+
+        # Insert at cursor position (or end)
+        try:
+            pos = self._text.index('insert')
+        except Exception:
+            pos = 'end'
+        self._text.insert(pos, text)
+        self._update_char_count()
+
+        # Brief success confirmation then clear
+        n = len(text)
+        self._ocr_set_status(f'✓  {n} char{"s" if n != 1 else ""} inserted', '#22c55e')
+        self.after(2500, self._ocr_clear_status)
+
+    def _ocr_error(self, message: str) -> None:
+        """Called on the UI thread when OCR fails."""
+        self._ocr_pending = False
+        self._ocr_btn.configure(
+            text='📷  Paste Image',
+            fg_color=SURF2, hover_color=SURF3,
+            state='normal',
+        )
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:
+            return
+        # Show error inline — no blocking dialog
+        short = message.split('\n')[0][:60]
+        self._ocr_set_status(f'✕  {short}', '#ef4444')
+        self.after(4000, self._ocr_clear_status)
 
     def _center(self, parent) -> None:
         center_over_parent(self, parent)
@@ -240,7 +423,7 @@ class HotkeyCapture(ctk.CTkToplevel):
 
         if current_hotkey:
             ctk.CTkLabel(body, text=f'Current:  {current_hotkey.upper()}',
-                         font=(FONT_FAMILY, 11), text_color=TEXT_D).pack(pady=(4, 0))
+                         font=(FONT_FAMILY, 11), text_color=TEXT_S).pack(pady=(4, 0))
 
         # Live preview chip — styled as a keyboard shortcut badge
         chip = ctk.CTkFrame(body, fg_color=SURF2, corner_radius=RADIUS_SM,
@@ -312,7 +495,7 @@ class HotkeyCapture(ctk.CTkToplevel):
     def _listen_thread(self) -> None:
         """Block until a full hotkey combo is released, then commit."""
         try:
-            hk = keyboard.read_hotkey(suppress=True)
+            hk = keyboard.read_hotkey(suppress=False)
             if not self._done:
                 self._done  = True
                 self.result = hk
@@ -449,7 +632,11 @@ class LibraryWindow:
                  on_hotkey_resume:  Callable | None = None,
                  folders: list | None = None,
                  folder_colors: dict | None = None,
-                 on_folders_changed: Callable | None = None) -> None:
+                 on_folders_changed: Callable | None = None,
+                 vision_extractor: Callable | None = None,
+                 macro_library: 'MacroLibrary | None' = None,
+                 on_macro_play: Callable | None = None,
+                 on_macro_hotkeys_changed: Callable | None = None) -> None:
         self.root               = root
         self.prompts            = list(prompts)
         self.on_select          = on_select
@@ -460,12 +647,35 @@ class LibraryWindow:
         self._folders: list[str]       = list(folders or [])
         self._folder_colors: dict[str, str] = dict(folder_colors or {})
         self._on_folders_changed = on_folders_changed
+        self._vision_extractor   = vision_extractor
+        self._macro_library           = macro_library
+        self._on_macro_play           = on_macro_play
+        self._on_macro_hotkeys_changed = on_macro_hotkeys_changed
+        # Recorder tab state (updated by main.py via update_recorder_state)
+        self._recorder_state    = 'idle'   # 'idle'|'recording'|'stopping'
+        self._recorder_elapsed  = 0.0
+        self._recorder_size_mb  = 0.0
+        self._on_recorder_toggle: Callable | None = None  # set by main.py
+        self._on_macro_toggle:   Callable | None = None  # set by main.py → fires macro:hotkey
+        self._on_macro_reset:    Callable | None = None  # set by main.py → abort + clear
+        self._macro_state = 'idle'   # 'idle'|'recording'|'ready'|'playing' — mirrors main.py
+        self._rec_tab_ticker    = None   # after() job id
+        # GIF tab state
+        self._gif_state   = 'idle'   # 'idle'|'recording'|'encoding'
+        self._gif_elapsed = 0.0
+        self._gif_frames  = 0
+        self._gif_tab_ticker: int | None = None
+        self._on_gif_toggle: Callable | None = None  # set by main.py → fires gif:toggle
+        self._active_tab         = 'prompts'   # 'prompts' | 'macros' | 'recorder' | 'gif'
         self.active_idx  = 0
         self._cards: list[ctk.CTkFrame] = []
+        self._macro_cards: list[ctk.CTkFrame] = []
         self._current_cols = 2
         self._collapsed_folders: set[str] = set()
         self._folder_headers: dict[str, ctk.CTkFrame] = {}
         self._drag_folder_tgt: str | None = None
+        self._tab_btns: dict[str, ctk.CTkButton] = {}
+        self._search_bar_frame: 'ctk.CTkFrame | None' = None
         self._build()
 
     def _build(self) -> None:
@@ -508,7 +718,7 @@ class LibraryWindow:
         self._active_lbl = ctk.CTkLabel(
             left,
             text=f'Active: {self.prompts[0]["title"] if self.prompts else "—"}',
-            font=(FONT_FAMILY, 12), text_color=TEXT_S,
+            font=(FONT_FAMILY, 12), text_color='#a0a0a0',
         )
         self._active_lbl.pack(anchor='w')
 
@@ -521,12 +731,67 @@ class LibraryWindow:
         hint.pack(fill='x')
         hint.pack_propagate(False)
         refine_hk = self.hotkey_cfg.get('refine', 'alt+shift+w').upper()
-        ctk.CTkLabel(
+        self._hint_lbl = ctk.CTkLabel(
             hint,
             text=f'Click to activate  ·  Double-click to edit  ·  Right-click for menu  ·  {refine_hk} to refine',
-            font=(FONT_FAMILY, 11), text_color=TEXT_S,
-        ).pack(side='left', padx=PAD)
+            font=(FONT_FAMILY, 11), text_color='#a0a0a0',
+        )
+        self._hint_lbl.pack(side='left', padx=PAD)
+        self._hint_prompts_text = (
+            f'Click to activate  ·  Double-click to edit  ·  Right-click for menu  ·  {refine_hk} to refine'
+        )
+        self._hint_macros_text = (
+            'Shift+F1 to record  ·  Shift+F1 again to stop  ·  Shift+F1 once more to play  ·  Esc / Del to abort'
+        )
+        self._hint_recorder_text = (
+            'Shift+F2 to start / stop recording  ·  1 GB cap auto-stops  ·  Esc to abort'
+        )
+        self._hint_gif_text = (
+            'Shift+F3 to start / stop GIF  ·  Auto-stops at max duration  ·  Esc to abort'
+        )
 
+        # ── Tab switcher row ──────────────────────────────────────────────────
+        tab_row = ctk.CTkFrame(self.win, fg_color=SURFACE, corner_radius=0, height=38)
+        tab_row.pack(fill='x')
+        tab_row.pack_propagate(False)
+
+        def _make_tab_btn(text, tab_name):
+            is_active = (self._active_tab == tab_name)
+            btn = ctk.CTkButton(
+                tab_row, text=text, width=100,
+                fg_color=ACCENT if is_active else SURF2,
+                hover_color=ACCENTL if is_active else SURF3,
+                text_color=TEXT_P,
+                corner_radius=RADIUS_SM,
+                font=(FONT_FAMILY, 13),
+                command=lambda t=tab_name: self._switch_tab(t),
+            )
+            btn.pack(side='left', padx=(PAD if tab_name == 'prompts' else 4, 0), pady=4)
+            self._tab_btns[tab_name] = btn
+
+        _make_tab_btn('Prompts', 'prompts')
+        _make_tab_btn('Macros', 'macros')
+        _make_tab_btn('Recorder', 'recorder')
+        _make_tab_btn('GIF', 'gif')
+
+        # "Open Folder" button — right side of tab row, shown on Macros tab only
+        def _open_macros_folder():
+            import ctypes, threading
+            p = Path(appdata_dir()) / 'macros'
+            p.mkdir(parents=True, exist_ok=True)
+            threading.Thread(
+                target=lambda: ctypes.windll.shell32.ShellExecuteW(
+                    0, 'explore', str(p), None, None, 1),
+                daemon=False).start()
+        self._open_folder_btn = ctk.CTkButton(
+            tab_row, text='📁  Open Folder', width=120, height=26,
+            fg_color=SURF2, hover_color=SURF3, text_color='#a0a0a0',
+            corner_radius=RADIUS_SM, font=(FONT_FAMILY, 11),
+            command=_open_macros_folder,
+        )
+        # Pack it to the right; visibility toggled in _switch_tab
+
+        # ── Search bar (Prompts tab only) ─────────────────────────────────────
         search_bar = ctk.CTkFrame(self.win, fg_color=BG, corner_radius=0, height=44)
         search_bar.pack(fill='x')
         search_bar.pack_propagate(False)
@@ -538,6 +803,7 @@ class LibraryWindow:
             text_color=TEXT_P, font=(FONT_FAMILY, 12),
             corner_radius=RADIUS_SM,
         ).pack(fill='x', padx=PAD, pady=8)
+        self._search_bar_frame = search_bar
 
     def _build_grid(self) -> None:
         self._scroll = ctk.CTkScrollableFrame(
@@ -586,6 +852,16 @@ class LibraryWindow:
             self._render_cards()
 
     def _render_cards(self) -> None:
+        if self._active_tab == 'macros':
+            self._render_macro_cards()
+            return
+        if self._active_tab == 'recorder':
+            self._render_recorder_tab()
+            return
+        if self._active_tab == 'gif':
+            self._render_gif_tab()
+            return
+
         for w in self._scroll.winfo_children():
             w.destroy()
         self._cards.clear()
@@ -603,6 +879,10 @@ class LibraryWindow:
             self._filtered_idxs = list(range(len(self.prompts)))
 
         cols = self._current_cols
+        # Reset any extra column weights from a previous tab render, then
+        # configure only the columns we actually use.
+        for _c in range(cols + 1):
+            self._scroll.columnconfigure(_c, weight=0)
         for c in range(cols):
             self._scroll.columnconfigure(c, weight=1)
 
@@ -916,7 +1196,8 @@ class LibraryWindow:
         dlg = EditDialog(self.win, self.prompts[orig_i],
                          on_hotkey_suspend=self._on_hotkey_suspend,
                          on_hotkey_resume=self._on_hotkey_resume,
-                         reserved_hotkeys=reserved)
+                         reserved_hotkeys=reserved,
+                         vision_extractor=self._vision_extractor)
         self.win.wait_window(dlg)
         if dlg.result:
             updated = dict(self.prompts[orig_i])
@@ -934,7 +1215,8 @@ class LibraryWindow:
         dlg = EditDialog(self.win,
                          on_hotkey_suspend=self._on_hotkey_suspend,
                          on_hotkey_resume=self._on_hotkey_resume,
-                         reserved_hotkeys=reserved)
+                         reserved_hotkeys=reserved,
+                         vision_extractor=self._vision_extractor)
         self.win.wait_window(dlg)
         if dlg.result:
             new_prompt = dict(dlg.result)
@@ -1482,20 +1764,877 @@ class LibraryWindow:
         self.on_save(self.prompts)
         self._render_cards()
 
+    # ── Tab switching ─────────────────────────────────────────────────────────
+
+    def _switch_tab(self, tab: str) -> None:
+        self._active_tab = tab
+        for name, btn in self._tab_btns.items():
+            is_active = (name == tab)
+            btn.configure(
+                fg_color=ACCENT if is_active else SURF2,
+                hover_color=ACCENTL if is_active else SURF3,
+            )
+        # Update hint bar text
+        if hasattr(self, '_hint_lbl'):
+            if tab == 'macros':
+                self._hint_lbl.configure(text=self._hint_macros_text)
+            elif tab == 'recorder':
+                self._hint_lbl.configure(text=self._hint_recorder_text)
+            elif tab == 'gif':
+                self._hint_lbl.configure(text=self._hint_gif_text)
+            else:
+                self._hint_lbl.configure(text=self._hint_prompts_text)
+        # Show/hide Open Folder button
+        if hasattr(self, '_open_folder_btn'):
+            if tab == 'macros':
+                self._open_folder_btn.pack(side='right', padx=PAD, pady=4)
+            else:
+                self._open_folder_btn.pack_forget()
+        # Show search bar only on Prompts tab — re-pack scroll to ensure order
+        if self._search_bar_frame:
+            if tab == 'prompts':
+                self._scroll.pack_forget()
+                self._search_bar_frame.pack(fill='x', padx=0, pady=0)
+                self._scroll.pack(fill='both', expand=True, padx=PAD, pady=PAD)
+            else:
+                self._search_bar_frame.pack_forget()
+        self._render_cards()
+        # Scroll to top AFTER rendering so the new content is visible.
+        # update_idletasks flushes pending <Configure> events so the canvas
+        # scrollregion reflects the new content before we reset the yview.
+        # (Doing this BEFORE render left the view anchored to the old position
+        # whenever the new content was shorter than the previous tab.)
+        try:
+            self._scroll.update_idletasks()
+            self._scroll._parent_canvas.yview_moveto(0)
+        except Exception:
+            pass
+
+    # ── Macro card rendering ──────────────────────────────────────────────────
+
+    def _render_macro_cards(self) -> None:
+        """Render macro cards into the scroll frame."""
+        for w in self._scroll.winfo_children():
+            w.destroy()
+        self._macro_cards.clear()
+        self._cards.clear()
+        self._folder_headers.clear()
+
+        if self._macro_library is None:
+            ctk.CTkLabel(
+                self._scroll,
+                text='Macro library not available.',
+                font=(FONT_FAMILY, 13), text_color=TEXT_S,
+            ).grid(row=0, column=0, pady=40)
+            return
+
+        macros = self._macro_library.macros
+        cols = self._current_cols
+        # Reset any extra column weights from a previous tab render before
+        # configuring only the columns this tab actually uses.
+        for _c in range(cols + 1):
+            self._scroll.columnconfigure(_c, weight=0)
+        for c in range(cols):
+            self._scroll.columnconfigure(c, weight=1)
+
+        # ── Active-session banner (shown when a recording/playback is in progress) ──
+        if self._macro_state != 'idle':
+            state_labels = {
+                'recording': ('⏺  Recording in progress…', '#ef4444'),
+                'ready':     ('⏹  Recording stopped — ready to play', ACCENT),
+                'playing':   ('▶  Playback in progress…', OK),
+            }
+            label_text, label_color = state_labels.get(
+                self._macro_state, ('…', TEXT_S))
+
+            banner = ctk.CTkFrame(self._scroll, fg_color=SURFACE, corner_radius=RADIUS_SM)
+            banner.grid(row=0, column=0, columnspan=cols, padx=8, pady=(8, 4), sticky='ew')
+
+            ctk.CTkLabel(banner, text=label_text,
+                         font=(FONT_FAMILY, 12, 'bold'),
+                         text_color=label_color).pack(side='left', padx=PAD, pady=PAD_SM)
+
+            def _do_reset():
+                if self._on_macro_reset:
+                    self._on_macro_reset()
+            ctk.CTkButton(
+                banner, text='↺  Discard & start fresh',
+                fg_color=SURF2, hover_color=SURF3, text_color=TEXT_S,
+                corner_radius=RADIUS_SM, font=(FONT_FAMILY, 11),
+                width=160, height=26,
+                command=_do_reset,
+            ).pack(side='right', padx=PAD, pady=PAD_SM)
+
+            # Offset saved macro cards below the banner row
+            grid_row_offset = 1
+        else:
+            grid_row_offset = 0
+
+        if not macros:
+            card = ctk.CTkFrame(self._scroll, fg_color=SURFACE, corner_radius=RADIUS_SM)
+            card.grid(row=grid_row_offset, column=0, columnspan=cols, padx=32, pady=32, sticky='ew')
+
+            # Icon + title
+            ctk.CTkLabel(card, text='⏺', font=(FONT_FAMILY, 28),
+                         text_color=ACCENT).pack(pady=(PAD_LG, 2))
+            ctk.CTkLabel(card, text='No macros saved yet',
+                         font=(FONT_FAMILY, 15, 'bold'), text_color=TEXT_P).pack()
+            ctk.CTkLabel(card,
+                         text='Record any sequence of mouse moves, clicks, and key presses — then replay it any time.',
+                         font=(FONT_FAMILY, 12), text_color=TEXT_S,
+                         wraplength=400, justify='center').pack(pady=(4, PAD))
+
+            # Divider
+            ctk.CTkFrame(card, fg_color=SURF2, height=1,
+                         corner_radius=0).pack(fill='x', padx=PAD)
+
+            # Step-by-step instructions
+            steps_frame = ctk.CTkFrame(card, fg_color='transparent')
+            steps_frame.pack(padx=PAD_LG, pady=PAD, anchor='w')
+
+            steps = [
+                ('1', 'Press  Shift+F1  to start recording'),
+                ('2', 'Do your actions — mouse, clicks, or typing'),
+                ('3', 'Press  Shift+F1  again to stop'),
+                ('4', 'Press  Shift+F1  once more to play it back'),
+                ('5', 'Choose  Save  to keep it here with a name & hotkey'),
+            ]
+            for num, desc in steps:
+                row = ctk.CTkFrame(steps_frame, fg_color='transparent')
+                row.pack(fill='x', pady=3)
+                badge = ctk.CTkFrame(row, fg_color=ACCENT, corner_radius=10,
+                                     width=22, height=22)
+                badge.pack(side='left', padx=(0, 10))
+                badge.pack_propagate(False)
+                ctk.CTkLabel(badge, text=num,
+                             font=(FONT_FAMILY, 10, 'bold'),
+                             text_color='#ffffff').pack(expand=True)
+                ctk.CTkLabel(row, text=desc,
+                             font=(FONT_FAMILY, 12), text_color=TEXT_P,
+                             anchor='w').pack(side='left')
+
+            # Right-click hint
+            ctk.CTkFrame(card, fg_color=SURF2, height=1,
+                         corner_radius=0).pack(fill='x', padx=PAD)
+            ctk.CTkLabel(card,
+                         text='Tip: right-click anywhere in this tab to start recording',
+                         font=(FONT_FAMILY, 11), text_color=TEXT_S).pack(pady=(PAD_SM, PAD))
+
+            # Propagate right-click through every widget in the card so the
+            # context menu fires regardless of where the user clicks.
+            def _bind_rc(w):
+                w.bind('<Button-3>', self._on_bg_right_click, add=True)
+                for child in w.winfo_children():
+                    _bind_rc(child)
+            card.after(50, lambda: _bind_rc(card))
+            return
+
+        for idx, m in enumerate(macros):
+            col  = idx % cols
+            row  = idx // cols + grid_row_offset
+            card = self._make_macro_card(m)
+            card.grid(row=row, column=col, padx=8, pady=8, sticky='nsew')
+            self._macro_cards.append(card)
+
+    def _make_macro_card(self, m: dict) -> ctk.CTkFrame:
+        """Build and return a single macro card widget."""
+        mid  = m['id']
+        hk   = m.get('hotkey', '').strip()
+
+        # Parse saved_at for display
+        try:
+            from datetime import datetime as _dt
+            dt = _dt.fromisoformat(m['saved_at'])
+            if dt.year == _dt.now().year:
+                date_str = dt.strftime('%b %-d') if hasattr(dt, 'strftime') else dt.strftime('%b %d').lstrip('0')
+            else:
+                date_str = dt.strftime('%b %d, %Y')
+            # strftime day without zero-pad: use %#d on Windows
+            try:
+                date_str = dt.strftime('%b %#d') if dt.year == _dt.now().year else dt.strftime('%b %#d, %Y')
+            except Exception:
+                date_str = dt.strftime('%b %d').lstrip('0') if dt.year == _dt.now().year else dt.strftime('%b %d, %Y')
+        except Exception:
+            date_str = m.get('saved_at', '')[:10]
+
+        subtitle = f'{m["duration"]:.1f}s · {m["event_count"]} events · {date_str}'
+
+        outer = ctk.CTkFrame(self._scroll, fg_color=SURFACE, corner_radius=RADIUS,
+                             border_width=2, border_color=BORDER)
+
+        # Name label
+        name_lbl = ctk.CTkLabel(
+            outer, text=m['name'],
+            font=(FONT_FAMILY, 14, 'bold'), text_color=TEXT_P,
+            anchor='w', wraplength=CARD_W - 48, justify='left',
+        )
+        name_lbl.pack(anchor='w', fill='x', padx=12, pady=(12, 2))
+
+        # Subtitle
+        ctk.CTkLabel(
+            outer, text=subtitle,
+            font=(FONT_FAMILY, 11), text_color=TEXT_S,
+            anchor='w',
+        ).pack(anchor='w', padx=12, pady=(0, 6))
+
+        # Hotkey badge
+        if hk:
+            hk_badge = ctk.CTkLabel(
+                outer,
+                text=f'  ⌨  {hk.upper()}  ',
+                font=(FONT_FAMILY, 10), text_color=ACCENTL,
+                fg_color=SURF2, corner_radius=RADIUS_SM,
+            )
+        else:
+            hk_badge = ctk.CTkLabel(
+                outer,
+                text='  ⌨  None  ',
+                font=(FONT_FAMILY, 10), text_color=TEXT_S,
+                fg_color=SURF2, corner_radius=RADIUS_SM,
+            )
+        hk_badge.pack(anchor='w', padx=12, pady=(0, 8))
+
+        # Play button (bottom-right area)
+        play_btn = ctk.CTkButton(
+            outer, text='▶  Play', width=72,
+            fg_color=OK, hover_color='#1a9e4a',
+            text_color='#ffffff', corner_radius=RADIUS_SM,
+            font=(FONT_FAMILY, 12),
+            command=lambda meta=m: self._play_macro(meta),
+        )
+        play_btn.pack(anchor='e', padx=12, pady=(0, 10))
+
+        # Delete button (top-right corner, placed after other widgets)
+        del_btn = ctk.CTkButton(
+            outer, text='✕', width=26, height=26,
+            fg_color=SURF3, hover_color='#5a1a1a',
+            text_color=TEXT_S, font=(FONT_FAMILY, 13, 'bold'), corner_radius=13,
+            command=lambda meta=m: self._delete_macro(meta['id'], meta['name']),
+        )
+        del_btn.place(relx=1.0, rely=0.0, anchor='ne', x=-6, y=6)
+        del_btn.lift()
+        del_btn.bind('<Button-1>', lambda e: 'break')
+
+        # Right-click context menu
+        def _show_menu(e, meta=m):
+            menu = tk.Menu(self.win, tearoff=0,
+                           bg=SURFACE, fg=TEXT_P, activebackground=ACCENT,
+                           activeforeground='#ffffff', bd=0,
+                           font=(FONT_FAMILY, 12))
+            menu.add_command(label='✏  Rename',
+                             command=lambda: self._rename_macro_inline(meta['id'], name_lbl))
+            menu.add_command(label='⌨  Assign hotkey…',
+                             command=lambda: self._assign_macro_hotkey(meta['id']))
+            menu.add_separator()
+            def _open_location(mid=meta['id']):
+                import os, subprocess, threading
+                file_path = str(self._macro_library._folder / f'{mid}.json')
+                def _do():
+                    try:
+                        # /select highlights the specific file; works on most systems
+                        subprocess.Popen(['explorer', f'/select,{file_path}'])
+                    except Exception:
+                        # Fallback: just open the containing folder
+                        os.startfile(str(self._macro_library._folder))
+                threading.Thread(target=_do, daemon=False).start()
+            menu.add_command(label='📂  Open file location', command=_open_location)
+            menu.add_separator()
+            menu.add_command(label='✕  Delete',
+                             command=lambda: self._delete_macro(meta['id'], meta['name']))
+            try:
+                menu.tk_popup(e.x_root, e.y_root)
+            finally:
+                menu.grab_release()
+            return 'break'
+
+        # Click on name = inline rename
+        def _name_click(e, meta=m, nl=name_lbl):
+            self._rename_macro_inline(meta['id'], nl)
+
+        name_lbl.bind('<Button-1>', _name_click)
+
+        for w in (outer, hk_badge):
+            w.bind('<Button-3>', _show_menu)
+
+        return outer
+
+    def _play_macro(self, meta: dict) -> None:
+        """Load and play a macro by its metadata dict."""
+        if self._on_macro_play:
+            self._on_macro_play(meta)
+
+    def _rename_macro_inline(self, mid: str, name_lbl: ctk.CTkLabel) -> None:
+        """Replace name label with an inline entry for rename."""
+        old_name = name_lbl.cget('text')
+        entry_var = tk.StringVar(value=old_name)
+
+        entry = ctk.CTkEntry(
+            name_lbl.master, textvariable=entry_var, width=200,
+            fg_color=SURF2, border_color=BORDER2, border_width=1,
+            text_color=TEXT_P, font=(FONT_FAMILY, 13, 'bold'),
+            corner_radius=RADIUS_SM,
+        )
+        # Hide name label and show entry in its place
+        name_lbl.pack_forget()
+        entry.pack(anchor='w', fill='x', padx=12, pady=(12, 2))
+        entry.focus_set()
+        entry.select_range(0, 'end')
+
+        committed: list[bool] = [False]
+
+        def _commit(e=None):
+            if committed[0]:
+                return
+            committed[0] = True
+            new_name = entry_var.get().strip()
+            if not new_name:
+                new_name = old_name
+            if self._macro_library:
+                self._macro_library.rename(mid, new_name)
+            entry.destroy()
+            self._render_cards()
+
+        entry.bind('<Return>',    _commit)
+        entry.bind('<FocusOut>',  _commit)
+        entry.bind('<Escape>',    lambda e: _commit())
+
+    def _assign_macro_hotkey(self, mid: str) -> None:
+        """Open HotkeyCapture; assign result to macro."""
+        # Find current hotkey
+        current = ''
+        if self._macro_library:
+            for m in self._macro_library.macros:
+                if m['id'] == mid:
+                    current = m.get('hotkey', '')
+                    break
+
+        if self._on_hotkey_suspend:
+            self._on_hotkey_suspend()
+        dlg = HotkeyCapture(self.win, current_hotkey=current)
+        self.win.wait_window(dlg)
+        if self._on_hotkey_resume:
+            self._on_hotkey_resume()
+
+        if dlg.result is None:
+            return   # cancelled
+
+        if self._macro_library:
+            self._macro_library.assign_hotkey(mid, dlg.result)
+        if self._on_macro_hotkeys_changed:
+            self._on_macro_hotkeys_changed()
+        self._render_cards()
+
+    def _delete_macro(self, mid: str, name: str) -> None:
+        """Confirm then delete macro."""
+        if confirm(self.win, 'Delete macro',
+                   f'Delete "{name}"?',
+                   action_label='Delete',
+                   action_color='#b03030', action_hover='#d04040'):
+            if self._macro_library:
+                self._macro_library.delete(mid)
+            self._render_cards()
+
+    def refresh_macros(self) -> None:
+        """Public method — re-renders macro cards if Macros tab is active."""
+        if self._active_tab == 'macros':
+            self._render_macro_cards()
+
+    # ── Recorder tab ─────────────────────────────────────────────────────────
+
+    def _render_recorder_tab(self) -> None:
+        """Render the Recorder tab contents inside self._scroll."""
+        # Cancel any existing live ticker from a previous render
+        if self._rec_tab_ticker is not None:
+            try:
+                self.win.after_cancel(self._rec_tab_ticker)
+            except Exception:
+                pass
+            self._rec_tab_ticker = None
+
+        for w in self._scroll.winfo_children():
+            w.destroy()
+        self._cards.clear()
+        self._folder_headers.clear()
+
+        state = self._recorder_state
+
+        # ── Top control card ──────────────────────────────────────────────────
+        # Reset any extra column weights left by a previous Prompts/Macros render
+        # (e.g. if the window was wide enough for 3+ columns those stay weight=1
+        # unless explicitly cleared, causing the 2-column recorder content to
+        # only occupy 2/N of the available width).
+        for _c in range(max(2, self._current_cols) + 1):
+            self._scroll.columnconfigure(_c, weight=0)
+        card = ctk.CTkFrame(self._scroll, fg_color=SURFACE, corner_radius=RADIUS_SM)
+        card.grid(row=0, column=0, columnspan=2, sticky='ew', padx=8, pady=8)
+        self._scroll.columnconfigure(0, weight=1)
+        self._scroll.columnconfigure(1, weight=1)
+
+        if state == 'idle':
+            ctk.CTkLabel(card, text='🎥  Screen Recording',
+                         font=(FONT_FAMILY, 15, 'bold'), text_color=TEXT_P).pack(pady=(PAD, 4))
+            ctk.CTkLabel(
+                card,
+                text='Press  Shift+F2  or click Start Recording to capture your screen.\n'
+                     'H.264 · AAC audio optional · 1 GB auto-stop',
+                font=(FONT_FAMILY, 12), text_color=TEXT_S,
+            ).pack(pady=(0, PAD))
+
+            def _start():
+                if self._on_recorder_toggle:
+                    self._on_recorder_toggle()
+            ctk.CTkButton(
+                card, text='🎥  Start Recording',
+                fg_color=ACCENT, hover_color=ACCENTL,
+                text_color='#ffffff', font=(FONT_FAMILY, 13, 'bold'),
+                width=180, height=36, corner_radius=RADIUS_SM,
+                command=_start,
+            ).pack(pady=(0, PAD))
+
+        elif state == 'recording':
+            # Live timer label — updated by ticker
+            ctk.CTkLabel(card, text='⏺  Recording…',
+                         font=(FONT_FAMILY, 13, 'bold'), text_color='#ef4444').pack(pady=(PAD, 2))
+            self._rec_time_lbl = ctk.CTkLabel(
+                card, text='00:00',
+                font=(FONT_FAMILY, 28, 'bold'), text_color=TEXT_P)
+            self._rec_time_lbl.pack()
+            self._rec_size_lbl = ctk.CTkLabel(
+                card,
+                text=f'{self._recorder_size_mb:.1f} MB  /  1,024 MB cap',
+                font=(FONT_FAMILY, 11), text_color=TEXT_S)
+            self._rec_size_lbl.pack(pady=(0, PAD))
+
+            def _stop():
+                if self._on_recorder_toggle:
+                    self._on_recorder_toggle()
+            ctk.CTkButton(
+                card, text='⏹  Stop Recording',
+                fg_color='#b03030', hover_color='#d04040',
+                text_color='#ffffff', font=(FONT_FAMILY, 13, 'bold'),
+                width=180, height=36, corner_radius=RADIUS_SM,
+                command=_stop,
+            ).pack(pady=(0, PAD))
+
+            # Start live ticker
+            self._rec_tab_ticker_fn()
+
+        elif state == 'stopping':
+            ctk.CTkLabel(card, text='⏳  Finishing encoding…',
+                         font=(FONT_FAMILY, 14, 'bold'), text_color=TEXT_S).pack(pady=PAD*2)
+
+        # ── Recent recordings list ────────────────────────────────────────────
+        from screen_recorder import list_recordings
+        from storage import appdata_dir
+        rec_dir = str(Path(appdata_dir()) / 'recordings')
+        recordings = list_recordings(rec_dir)
+
+        if recordings:
+            sep = ctk.CTkFrame(self._scroll, fg_color='#2a2a3e', height=1, corner_radius=0)
+            sep.grid(row=1, column=0, columnspan=2, sticky='ew', padx=8, pady=(4, 0))
+
+            hdr = ctk.CTkFrame(self._scroll, fg_color='transparent')
+            hdr.grid(row=2, column=0, columnspan=2, sticky='ew', padx=8)
+            ctk.CTkLabel(hdr, text='Recent recordings',
+                         font=(FONT_FAMILY, 12, 'bold'), text_color=TEXT_S).pack(side='left', pady=4)
+
+            def _open_folder():
+                import ctypes, threading
+                p = Path(rec_dir)
+                p.mkdir(parents=True, exist_ok=True)
+                threading.Thread(
+                    target=lambda: ctypes.windll.shell32.ShellExecuteW(
+                        0, 'explore', str(p), None, None, 1),
+                    daemon=False).start()
+            ctk.CTkButton(
+                hdr, text='📁  Open Folder', width=110, height=22,
+                fg_color=SURF2, hover_color=SURF3, text_color='#a0a0a0',
+                corner_radius=RADIUS_SM, font=(FONT_FAMILY, 11),
+                command=_open_folder,
+            ).pack(side='right', pady=4)
+
+            import datetime as _dt
+            for row_i, rec in enumerate(recordings[:10]):
+                rcard = ctk.CTkFrame(self._scroll, fg_color=SURFACE, corner_radius=RADIUS_SM)
+                rcard.grid(row=3 + row_i, column=0, columnspan=2,
+                           sticky='ew', padx=8, pady=4)
+                rcard.columnconfigure(0, weight=1)
+
+                # Info
+                mtime = _dt.datetime.fromtimestamp(rec['mtime']).strftime('%Y-%m-%d %H:%M')
+                ctk.CTkLabel(
+                    rcard, text=rec['name'],
+                    font=(FONT_FAMILY, 12, 'bold'), text_color=TEXT_P,
+                    anchor='w',
+                ).grid(row=0, column=0, sticky='w', padx=PAD, pady=(PAD_SM, 0))
+                ctk.CTkLabel(
+                    rcard,
+                    text=f'{rec["size_mb"]:.1f} MB  ·  {mtime}',
+                    font=(FONT_FAMILY, 11), text_color=TEXT_S,
+                    anchor='w',
+                ).grid(row=1, column=0, sticky='w', padx=PAD, pady=(0, PAD_SM))
+
+                # Buttons
+                btn_row = ctk.CTkFrame(rcard, fg_color='transparent')
+                btn_row.grid(row=0, column=1, rowspan=2, padx=PAD, pady=PAD_SM, sticky='e')
+
+                def _play(path=rec['path']):
+                    import ctypes, threading
+                    threading.Thread(
+                        target=lambda: ctypes.windll.shell32.ShellExecuteW(
+                            0, 'open', os.path.normpath(path), None, None, 1),
+                        daemon=False).start()
+
+                def _del(path=rec['path']):
+                    if not confirm(self.win, 'Delete recording',
+                                   f'Delete {Path(path).name} from disk?',
+                                   action_label='Delete',
+                                   action_color='#b03030', action_hover='#d04040'):
+                        return
+                    try:
+                        os.unlink(path)
+                    except Exception as _e:
+                        alert(self.win, 'Delete failed',
+                              f'Could not delete the file:\n{path}\n\n{_e}')
+                        return
+                    # Prune from the recordings index so it doesn't reappear
+                    try:
+                        from screen_recorder import remove_from_recordings_index
+                        remove_from_recordings_index(path)
+                    except Exception:
+                        pass
+                    if self._active_tab == 'recorder':
+                        self._render_recorder_tab()
+
+                ctk.CTkButton(
+                    btn_row, text='▶  Play', width=70, height=26,
+                    fg_color=SURF2, hover_color=SURF3, text_color=TEXT_P,
+                    corner_radius=RADIUS_SM, font=(FONT_FAMILY, 11),
+                    command=_play,
+                ).pack(side='left', padx=(0, 4))
+                ctk.CTkButton(
+                    btn_row, text='✕', width=30, height=26,
+                    fg_color=SURF2, hover_color='#b03030', text_color='#888888',
+                    corner_radius=RADIUS_SM, font=(FONT_FAMILY, 11),
+                    command=_del,
+                ).pack(side='left')
+
+        else:
+            # No recordings exist — show hint regardless of current recorder state
+            no_rec = ctk.CTkFrame(self._scroll, fg_color='transparent')
+            no_rec.grid(row=1, column=0, columnspan=2, pady=8)
+            ctk.CTkLabel(
+                no_rec,
+                text='No recordings saved yet.',
+                font=(FONT_FAMILY, 12), text_color=TEXT_D,
+            ).pack()
+
+    def _rec_tab_ticker_fn(self) -> None:
+        """Update the live timer in the Recorder tab while recording."""
+        if self._active_tab != 'recorder' or self._recorder_state != 'recording':
+            self._rec_tab_ticker = None
+            return
+        try:
+            elapsed = self._recorder_elapsed
+            m, s = divmod(int(elapsed), 60)
+            self._rec_time_lbl.configure(text=f'{m:02d}:{s:02d}')
+            self._rec_size_lbl.configure(
+                text=f'{self._recorder_size_mb:.1f} MB  /  1,024 MB cap')
+        except Exception:
+            pass
+        self._rec_tab_ticker = self.win.after(500, self._rec_tab_ticker_fn)
+
+    def update_recorder_state(self, state: str,
+                               elapsed: float = 0.0,
+                               size_mb: float = 0.0) -> None:
+        """Called by main.py when recording state changes or ticks."""
+        self._recorder_state   = state
+        self._recorder_elapsed = elapsed
+        self._recorder_size_mb = size_mb
+        if self._active_tab == 'recorder':
+            if state in ('idle', 'stopping'):
+                # Full re-render so button and list update
+                self._render_recorder_tab()
+            elif state == 'recording':
+                # Just update labels without full re-render if ticker is running
+                if self._rec_tab_ticker is None:
+                    self._render_recorder_tab()
+                else:
+                    try:
+                        m, s = divmod(int(elapsed), 60)
+                        self._rec_time_lbl.configure(text=f'{m:02d}:{s:02d}')
+                        self._rec_size_lbl.configure(
+                            text=f'{size_mb:.1f} MB  /  1,024 MB cap')
+                    except Exception:
+                        pass
+
+    # ── GIF tab ───────────────────────────────────────────────────────────────
+
+    def update_gif_state(
+        self, state: str, elapsed: float = 0.0, frames: int = 0
+    ) -> None:
+        """Called by main.py whenever GIF recorder state changes."""
+        self._gif_state   = state
+        self._gif_elapsed = elapsed
+        self._gif_frames  = frames
+        if self._active_tab == 'gif':
+            if state in ('idle', 'encoding'):
+                self._render_gif_tab()
+            elif state == 'recording':
+                if self._gif_tab_ticker is None:
+                    self._render_gif_tab()
+                else:
+                    try:
+                        self._gif_time_lbl.configure(
+                            text=f'{int(elapsed)}s  ·  {frames} frames')
+                    except Exception:
+                        pass
+
+    def _render_gif_tab(self) -> None:
+        """Render the GIF tab contents inside self._scroll."""
+        # Cancel any existing ticker
+        if self._gif_tab_ticker is not None:
+            try:
+                self.win.after_cancel(self._gif_tab_ticker)
+            except Exception:
+                pass
+            self._gif_tab_ticker = None
+
+        for w in self._scroll.winfo_children():
+            w.destroy()
+        self._cards.clear()
+        self._folder_headers.clear()
+
+        state = self._gif_state
+
+        # Reset column weights
+        for _c in range(max(2, self._current_cols) + 1):
+            self._scroll.columnconfigure(_c, weight=0)
+        card = ctk.CTkFrame(self._scroll, fg_color=SURFACE, corner_radius=RADIUS_SM)
+        card.grid(row=0, column=0, columnspan=2, sticky='ew', padx=8, pady=8)
+        self._scroll.columnconfigure(0, weight=1)
+        self._scroll.columnconfigure(1, weight=1)
+
+        if state == 'idle':
+            ctk.CTkLabel(card, text='🎞  GIF Recorder',
+                         font=(FONT_FAMILY, 15, 'bold'), text_color=TEXT_P).pack(pady=(PAD, 4))
+            ctk.CTkLabel(
+                card,
+                text='Capture an animated GIF of your screen.\n'
+                     'Press  Shift+F3  or click Start to begin.',
+                font=(FONT_FAMILY, 12), text_color=TEXT_S,
+            ).pack(pady=(0, PAD))
+
+            def _start():
+                if self._on_gif_toggle:
+                    self._on_gif_toggle()
+            ctk.CTkButton(
+                card, text='🎞  Start GIF',
+                fg_color='#7c3aed', hover_color='#6d28d9',
+                text_color='#ffffff', font=(FONT_FAMILY, 13, 'bold'),
+                width=180, height=36, corner_radius=RADIUS_SM,
+                command=_start,
+            ).pack(pady=(0, PAD))
+
+        elif state == 'recording':
+            ctk.CTkLabel(card, text='🎞  Recording GIF…',
+                         font=(FONT_FAMILY, 13, 'bold'), text_color='#7c3aed').pack(pady=(PAD, 2))
+            self._gif_time_lbl = ctk.CTkLabel(
+                card, text=f'{int(self._gif_elapsed)}s  ·  {self._gif_frames} frames',
+                font=(FONT_FAMILY, 22, 'bold'), text_color=TEXT_P)
+            self._gif_time_lbl.pack()
+            ctk.CTkLabel(
+                card, text='Esc to abort  ·  auto-stops at max duration',
+                font=(FONT_FAMILY, 11), text_color=TEXT_S).pack(pady=(0, PAD))
+
+            def _stop():
+                if self._on_gif_toggle:
+                    self._on_gif_toggle()
+            ctk.CTkButton(
+                card, text='⏹  Stop & Save',
+                fg_color='#5b21b6', hover_color='#7c3aed',
+                text_color='#ffffff', font=(FONT_FAMILY, 13, 'bold'),
+                width=180, height=36, corner_radius=RADIUS_SM,
+                command=_stop,
+            ).pack(pady=(0, PAD))
+
+            # Live ticker — update elapsed/frames every second
+            def _tick():
+                if self._active_tab != 'gif' or self._gif_state != 'recording':
+                    self._gif_tab_ticker = None
+                    return
+                try:
+                    self._gif_time_lbl.configure(
+                        text=f'{int(self._gif_elapsed)}s  ·  {self._gif_frames} frames')
+                except Exception:
+                    pass
+                self._gif_tab_ticker = self.win.after(500, _tick)
+
+            self._gif_tab_ticker = self.win.after(500, _tick)
+
+        elif state == 'encoding':
+            ctk.CTkLabel(card, text='⏳  Encoding GIF…',
+                         font=(FONT_FAMILY, 14, 'bold'), text_color=TEXT_S).pack(pady=PAD * 2)
+
+        # ── Recent GIFs ───────────────────────────────────────────────────────
+        from storage import appdata_dir as _appdata_dir
+        gif_dir = Path(_appdata_dir()) / 'gifs'
+        gif_dir.mkdir(parents=True, exist_ok=True)
+        gifs = sorted(gif_dir.glob('*.gif'), key=lambda p: p.stat().st_mtime, reverse=True)
+
+        if gifs:
+            sep = ctk.CTkFrame(self._scroll, fg_color='#2a2a3e', height=1, corner_radius=0)
+            sep.grid(row=1, column=0, columnspan=2, sticky='ew', padx=8, pady=(4, 0))
+
+            hdr = ctk.CTkFrame(self._scroll, fg_color='transparent')
+            hdr.grid(row=2, column=0, columnspan=2, sticky='ew', padx=8)
+            ctk.CTkLabel(hdr, text='Saved GIFs',
+                         font=(FONT_FAMILY, 12, 'bold'), text_color=TEXT_S).pack(side='left', pady=4)
+
+            def _open_gif_folder():
+                import ctypes as _ct
+                threading.Thread(
+                    target=lambda: _ct.windll.shell32.ShellExecuteW(
+                        0, 'explore', str(gif_dir), None, None, 1),
+                    daemon=False).start()
+            ctk.CTkButton(
+                hdr, text='📁  Open Folder', width=110, height=22,
+                fg_color=SURF2, hover_color=SURF3, text_color='#a0a0a0',
+                corner_radius=RADIUS_SM, font=(FONT_FAMILY, 11),
+                command=_open_gif_folder,
+            ).pack(side='right', pady=4)
+
+            import datetime as _dt
+            for row_i, gif_path in enumerate(gifs[:10]):
+                row_frame = ctk.CTkFrame(self._scroll, fg_color=SURFACE, corner_radius=RADIUS_SM)
+                row_frame.grid(row=row_i + 3, column=0, columnspan=2,
+                               sticky='ew', padx=8, pady=2)
+                row_frame.columnconfigure(0, weight=1)
+
+                try:
+                    mtime = gif_path.stat().st_mtime
+                    size_kb = gif_path.stat().st_size / 1024
+                    ts = _dt.datetime.fromtimestamp(mtime).strftime('%d %b %Y  %H:%M')
+                except Exception:
+                    ts = ''
+                    size_kb = 0
+
+                info_col = ctk.CTkFrame(row_frame, fg_color='transparent')
+                info_col.grid(row=0, column=0, sticky='w', padx=PAD, pady=PAD_SM)
+                ctk.CTkLabel(info_col, text=gif_path.name,
+                             font=(FONT_FAMILY, 13), text_color=TEXT_P).pack(anchor='w')
+                ctk.CTkLabel(info_col, text=f'{ts}  ·  {size_kb:.0f} KB',
+                             font=(FONT_FAMILY, 11), text_color=TEXT_S).pack(anchor='w')
+
+                btn_row = ctk.CTkFrame(row_frame, fg_color='transparent')
+                btn_row.grid(row=0, column=1, sticky='e', padx=PAD, pady=PAD_SM)
+
+                def _open(_p=gif_path):
+                    threading.Thread(
+                        target=lambda: os.startfile(str(_p)),
+                        daemon=False).start()
+
+                def _del(_p=gif_path, _row=row_frame):
+                    from dialogs import confirm as _confirm
+                    if _confirm(self.win, 'Delete GIF?',
+                                f'Delete "{_p.name}"? This cannot be undone.'):
+                        try:
+                            _p.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        _row.destroy()
+
+                ctk.CTkButton(
+                    btn_row, text='▶  Open', width=72, height=26,
+                    fg_color=SURF2, hover_color=SURF3, text_color=TEXT_P,
+                    corner_radius=RADIUS_SM, font=(FONT_FAMILY, 11),
+                    command=_open,
+                ).pack(side='left', padx=(0, 4))
+                ctk.CTkButton(
+                    btn_row, text='✕', width=30, height=26,
+                    fg_color=SURF2, hover_color='#b03030', text_color='#888888',
+                    corner_radius=RADIUS_SM, font=(FONT_FAMILY, 11),
+                    command=_del,
+                ).pack(side='left')
+
+        else:
+            no_gif = ctk.CTkFrame(self._scroll, fg_color='transparent')
+            no_gif.grid(row=1, column=0, columnspan=2, pady=8)
+            ctk.CTkLabel(
+                no_gif, text='No GIFs saved yet.',
+                font=(FONT_FAMILY, 12), text_color=TEXT_D,
+            ).pack()
+
     def _on_bg_right_click(self, event) -> None:
         menu = tk.Menu(self.win, tearoff=0, bg=SURFACE, fg=TEXT_P,
                        activebackground=ACCENT, activeforeground='#fff',
                        font=(FONT_FAMILY, 12))
-        menu.add_command(label='✚  Create prompt',  command=self._add)
-        menu.add_separator()
-        menu.add_command(label='📁  Create folder', command=self._create_folder)
+
+        if self._active_tab == 'prompts':
+            menu.add_command(label='✚  Create prompt',  command=self._add)
+            menu.add_separator()
+            menu.add_command(label='📁  Create folder', command=self._create_folder)
+
+        elif self._active_tab == 'macros':
+            ms = self._macro_state
+            if ms == 'idle':
+                label = '⏺  Record macro'
+            elif ms == 'recording':
+                label = '⏹  Stop recording'
+            elif ms == 'ready':
+                label = '▶  Play back recording'
+            elif ms == 'playing':
+                label = '⏹  Stop playback'
+            else:
+                label = '⏺  Record macro'
+            def _do_macro_toggle():
+                if self._on_macro_toggle:
+                    self._on_macro_toggle()
+            menu.add_command(label=label, command=_do_macro_toggle)
+
+        elif self._active_tab == 'recorder':
+            state = self._recorder_state
+            if state == 'idle':
+                def _do_start():
+                    if self._on_recorder_toggle:
+                        self._on_recorder_toggle()
+                menu.add_command(label='🎥  Start Recording', command=_do_start)
+            elif state == 'recording':
+                def _do_stop():
+                    if self._on_recorder_toggle:
+                        self._on_recorder_toggle()
+                menu.add_command(label='⏹  Stop Recording', command=_do_stop)
+            else:
+                return  # 'stopping' — encoding in progress, nothing useful to show
+
+        elif self._active_tab == 'gif':
+            gs = self._gif_state
+            if gs == 'idle':
+                def _do_gif_start():
+                    if self._on_gif_toggle:
+                        self._on_gif_toggle()
+                menu.add_command(label='🎞  Start GIF', command=_do_gif_start)
+            elif gs == 'recording':
+                def _do_gif_stop():
+                    if self._on_gif_toggle:
+                        self._on_gif_toggle()
+                menu.add_command(label='⏹  Stop GIF', command=_do_gif_stop)
+            else:
+                return  # encoding — nothing useful to show
+
+        else:
+            return
+
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
 
     def show(self) -> None:
-        self._render_cards()
+        try:
+            self._render_cards()
+        except Exception as exc:
+            _log.error('show() _render_cards error: %s', exc, exc_info=True)
         self.win.deiconify()
         self.win.lift()
         self.win.focus_force()

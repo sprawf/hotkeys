@@ -1,0 +1,164 @@
+"""
+build_dist.py — one-shot build script for Hotkeys dist
+Usage:  E:\Hotkeys\venv\Scripts\python.exe build_dist.py
+
+Steps:
+  1. Run PyInstaller with hotkeys.spec
+  2. Copy pywin32_system32 DLLs into dist root  (pywintypes*.dll, pythoncom*.dll)
+  3. Copy macros/ package into dist root         (plain .py — PyInstaller can miss subpackages)
+  4. Verify critical files are present
+  5. Print final dist size
+
+PyInstaller 6.x layout note:
+  dist/Hotkeys/
+    Hotkeys.exe          ← the launcher
+    pywintypes3XX.dll    ← pywin32 DLLs must live here, beside the exe
+    pythoncom3XX.dll
+    macros/              ← source package copied here for runtime import
+    _internal/           ← ALL other bundled files (libs, data, bytecode)
+      customtkinter/
+      av.libs/
+      models/
+      assets/
+      prompts.json
+      ...
+"""
+
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT      = Path(__file__).parent
+VENV      = ROOT / 'venv'
+PYTHON    = VENV / 'Scripts' / 'python.exe'
+PYINST    = VENV / 'Scripts' / 'pyinstaller.exe'
+SPEC      = ROOT / 'hotkeys.spec'
+DIST_ROOT = ROOT / 'dist'
+DIST      = DIST_ROOT / 'Hotkeys'
+INTERNAL  = DIST / '_internal'   # PyInstaller 6.x puts data/libs here
+BUILD_DIR = ROOT / 'build'
+SITE      = VENV / 'Lib' / 'site-packages'
+
+def run(cmd, **kw):
+    print(f'\n>>> {" ".join(str(c) for c in cmd)}')
+    result = subprocess.run(cmd, **kw)
+    if result.returncode != 0:
+        print(f'FAILED (exit {result.returncode})')
+        sys.exit(result.returncode)
+
+# ── 1. PyInstaller ────────────────────────────────────────────────────────────
+print('=' * 60)
+print('Step 1: PyInstaller')
+print('=' * 60)
+run([
+    str(PYINST), str(SPEC), '--noconfirm',
+    '--distpath', str(DIST_ROOT),
+    '--workpath', str(BUILD_DIR),
+])
+
+# ── 2. pywin32 system DLLs ────────────────────────────────────────────────────
+# pywintypes3XX.dll and pythoncom3XX.dll must sit in the dist root alongside
+# the exe so win32ui / win32gui / win32clipboard can load them at runtime.
+# They must NOT only be in _internal — Windows searches beside the exe first.
+print('\n' + '=' * 60)
+print('Step 2: Copy pywin32_system32 DLLs')
+print('=' * 60)
+pw32_dir = SITE / 'pywin32_system32'
+if not pw32_dir.exists():
+    print(f'WARNING: {pw32_dir} not found — skipping')
+else:
+    for dll in pw32_dir.glob('*.dll'):
+        dest = DIST / dll.name
+        shutil.copy2(dll, dest)
+        print(f'  copied {dll.name}')
+
+# ── 3. macros/ subpackage ─────────────────────────────────────────────────────
+# Copy macros/ to the dist root (beside Hotkeys.exe) so the frozen app can
+# import it at runtime from sys.path[0] (the exe's directory).
+print('\n' + '=' * 60)
+print('Step 3: Copy macros/ package')
+print('=' * 60)
+macros_src = ROOT / 'macros'
+macros_dst = DIST / 'macros'
+if macros_dst.exists():
+    shutil.rmtree(macros_dst)
+shutil.copytree(macros_src, macros_dst)
+print(f'  copied macros/ ({len(list(macros_dst.rglob("*.py")))} .py files)')
+
+# ── 4. Verify critical files ──────────────────────────────────────────────────
+# PyInstaller 6.x places almost everything under _internal/ — check both
+# the dist root (exe + pywin32 DLLs) and _internal/ (libraries + data).
+print('\n' + '=' * 60)
+print('Step 4: Verify critical files')
+print('=' * 60)
+
+# Items expected in the dist ROOT (beside the exe)
+root_checks = [
+    DIST / 'Hotkeys.exe',
+    *list(DIST.glob('pywintypes*.dll')),
+    *list(DIST.glob('pythoncom*.dll')),
+    DIST / 'macros',
+]
+
+# Items expected inside _internal/
+internal_checks = [
+    INTERNAL / 'customtkinter',
+    INTERNAL / 'av.libs',
+    INTERNAL / '_sounddevice_data',
+    *list(INTERNAL.glob('ctranslate2*')),
+    INTERNAL / 'prompts.json',
+    INTERNAL / 'assets',
+    INTERNAL / 'models' / 'base',
+    INTERNAL / 'models' / 'small',
+    INTERNAL / 'pynput',
+]
+
+all_ok = True
+seen = set()
+
+for p in root_checks + internal_checks:
+    if p in seen:
+        continue
+    seen.add(p)
+    # Show path relative to DIST for readability
+    try:
+        rel = p.relative_to(DIST)
+    except ValueError:
+        rel = p
+    if p.exists():
+        print(f'  [OK] {rel}')
+    else:
+        print(f'  [MISSING] {rel}')
+        all_ok = False
+
+# Verify model.bin files are non-zero (not accidentally excluded)
+for model_dir in ['base', 'small']:
+    mb = INTERNAL / 'models' / model_dir / 'model.bin'
+    if mb.exists():
+        size_mb = mb.stat().st_size / 1024 / 1024
+        print(f'  [OK] models/{model_dir}/model.bin  ({size_mb:.0f} MB)')
+    else:
+        print(f'  [MISSING] models/{model_dir}/model.bin')
+        all_ok = False
+
+# ── 5. Dist size ──────────────────────────────────────────────────────────────
+print('\n' + '=' * 60)
+print('Step 5: Dist size')
+print('=' * 60)
+total = sum(f.stat().st_size for f in DIST.rglob('*') if f.is_file())
+print(f'  Total: {total / 1024 / 1024:.0f} MB  ({DIST})')
+
+print('\n' + '=' * 60)
+if all_ok:
+    print('BUILD COMPLETE — dist/Hotkeys/ is ready to zip and ship')
+    print()
+    print('Distribution notes:')
+    print('  • Zip the entire dist/Hotkeys/ folder and share it')
+    print('  • Recipient: extract anywhere, run Hotkeys.exe — no install needed')
+    print('  • User data (config, logs, prompts) stored in dist/Hotkeys/data/')
+    print('  • User must add their own API keys via the tray icon → Settings')
+else:
+    print('BUILD COMPLETE WITH WARNINGS — check missing files above')
+print('=' * 60)

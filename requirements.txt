@@ -4,8 +4,10 @@ pillow>=10.0.0
 
 # ── Hotkeys & clipboard ───────────────────────────────────────────────────────
 keyboard>=0.13.5
+mouse>=0.7.1           # macro recorder mouse events
 pyperclip>=1.8.2
 pywin32>=306          # win32clipboard (used by core/typer.py)
+pynput>=1.7.6          # macro recorder keyboard/mouse capture & replay
 
 # ── System tray ───────────────────────────────────────────────────────────────
 pystray>=0.19.5
@@ -15,6 +17,7 @@ groq>=0.4.0
 cerebras-cloud-sdk>=1.0.0
 httpx>=0.25.0
 certifi>=2024.0.0
+truststore>=0.9.0       # makes Python trust OS cert store → AV/corporate SSL works
 
 # ── Speech-to-text (Whisper) ──────────────────────────────────────────────────
 faster-whisper>=1.0.0
@@ -22,6 +25,10 @@ sounddevice>=0.4.6
 numpy>=1.24.0
 onnxruntime>=1.16.0
 noisereduce>=3.0.0
+
+# ── Screen / GIF recording ────────────────────────────────────────────────────
+av>=12.0.0             # PyAV — FFmpeg bindings for screen recorder & GIF encoder
+psutil>=5.9.0          # process utilities (used by screen recorder)
 
 # ── Spell check ──────────────────────────────────────────────────────────────
 pyspellchecker>=0.7.0

@@ -93,7 +93,8 @@ DEFAULT_CONFIG: dict = {
     },
     'providers': {
         'local':    {'model_id': 'Qwen/Qwen2.5-1.5B-Instruct-GGUF'},
-        'groq':     {'api_key': '', 'model': 'llama-3.3-70b-versatile'},
+        'groq':     {'api_key': '', 'model': 'llama-3.3-70b-versatile',
+                     'vision_model': 'meta-llama/llama-4-scout-17b-16e-instruct'},
         'cerebras': {'api_key': '', 'model': 'llama3.1-8b'},
     },
     'whisper': {
@@ -162,10 +163,9 @@ def load_config() -> dict:
         with open(path, encoding='utf-8-sig') as f:   # utf-8-sig strips BOM if present
             cfg = json.load(f)
         merged = {**DEFAULT_CONFIG, **cfg}
-        merged['providers'] = {**DEFAULT_CONFIG['providers'], **cfg.get('providers', {})}
+        merged['providers'] = _deep_merge(DEFAULT_CONFIG['providers'], cfg.get('providers', {}))
         merged['hotkeys']   = {**DEFAULT_CONFIG['hotkeys'],   **cfg.get('hotkeys',   {})}
         merged['whisper']   = _deep_merge(DEFAULT_CONFIG['whisper'], cfg.get('whisper', {}))
-        merged.get('providers', {}).pop('gemini', None)
         return merged
     except FileNotFoundError:
         save_config(DEFAULT_CONFIG)

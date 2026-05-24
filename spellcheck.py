@@ -135,7 +135,10 @@ class _SpellCheck:
 
         menu.add_command(label='  Ignore all  ',       command=lambda w=word: self._ignore(w))
         menu.add_command(label='  Add to dictionary  ', command=lambda w=word: self._add(w))
-        menu.tk_popup(event.x_root, event.y_root)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
 
     # ── Actions ───────────────────────────────────────────────────────────────
 

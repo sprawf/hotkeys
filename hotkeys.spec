@@ -28,10 +28,15 @@ datas += collect_data_files('_sounddevice_data', include_py_files=False)
 # onnxruntime providers + data
 datas += collect_data_files('onnxruntime', include_py_files=False)
 
-# av (PyAV) — required by faster_whisper.audio for audio decoding
+# av (PyAV) — required by faster_whisper.audio, screen recorder, and GIF encoder
 # collect_all picks up pyd files, av.libs FFmpeg DLLs, and data in one shot
 _av_datas, _av_bins, _av_hidden = collect_all('av')
+
+# pynput — macro recorder uses pynput for mouse/keyboard capture & replay
+# collect_all is needed; PyInstaller misses the Windows backend otherwise
+_pynput_datas, _pynput_bins, _pynput_hidden = collect_all('pynput')
 datas += _av_datas
+datas += _pynput_datas
 
 # Whisper models (base=141 MB, small=464 MB; large-v3-turbo excluded — no model.bin)
 datas += [(str(ROOT / 'models' / 'base'),  'models/base')]
@@ -48,7 +53,8 @@ datas += [(str(ROOT / 'prompts.json'), '.')]
 binaries = []
 binaries += collect_dynamic_libs('ctranslate2')
 binaries += collect_dynamic_libs('onnxruntime')
-binaries += _av_bins   # av.libs FFmpeg DLLs + av .pyd extensions
+binaries += _av_bins       # av.libs FFmpeg DLLs + av .pyd extensions
+binaries += _pynput_bins   # pynput Windows backend
 
 # ── Hidden imports ────────────────────────────────────────────────────────────
 
@@ -112,7 +118,18 @@ hiddenimports = [
 
     # Hotkeys / clipboard
     'keyboard',
+    'mouse',
     'pyperclip',
+
+    # pynput — macro recorder (Shift+F1)
+    'pynput',
+    'pynput.keyboard',
+    'pynput.keyboard._win32',
+    'pynput.mouse',
+    'pynput.mouse._win32',
+
+    # Win32 UI — screen capture used by screen recorder + GIF recorder
+    'win32ui',
 
     # Utilities
     'psutil',
@@ -120,7 +137,6 @@ hiddenimports = [
     'spellchecker',
 
     # App core modules
-    'single_instance',
     'storage',
     'engine',
     'overlay',
@@ -138,6 +154,16 @@ hiddenimports = [
     'core.transcriber',
     'core.typer',
     'core.sounds',
+
+    # New feature modules
+    'screenshot',
+    'vision',
+    'screen_recorder',
+    'gif_recorder',
+    'macros',
+    'macros.recorder',
+    'macros.library',
+    'macros.save_prompt',
 ]
 
 # Collect all submodules of heavy packages so nothing gets missed
@@ -150,6 +176,7 @@ hiddenimports += collect_submodules('groq')
 hiddenimports += collect_submodules('cerebras')
 hiddenimports += collect_submodules('pystray')
 hiddenimports += collect_submodules('scipy.signal')
+hiddenimports += _pynput_hidden   # pynput submodules from collect_all
 
 # ── Excludes (heavy packages NOT used by this app) ────────────────────────────
 

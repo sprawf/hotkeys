@@ -16,8 +16,8 @@ ACCENTL  = '#9f67fa'   # light purple
 ACCENTS  = '#4c1d95'   # dark purple
 
 TEXT_P   = '#f0f0f0'   # primary text
-TEXT_S   = '#6b6b6b'   # secondary / muted
-TEXT_D   = '#404040'   # disabled
+TEXT_S   = '#909090'   # secondary / muted  (was #6b6b6b — too dark on dark bg)
+TEXT_D   = '#606060'   # disabled           (was #404040 — nearly invisible)
 
 OK       = '#22c55e'   # success green
 WARN     = '#f59e0b'   # amber

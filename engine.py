@@ -10,6 +10,17 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# ── OS certificate store injection ───────────────────────────────────────────
+# Makes Python trust AV/corporate SSL certs (they live in the Windows cert
+# store, not in certifi's bundle).  Must run before any SSL connection opens.
+# Handles: AVG, Kaspersky, Bitdefender, ESET, Sophos, Norton, McAfee, corporate CAs.
+try:
+    import truststore
+    truststore.inject_into_ssl()
+    logger.debug('SSL: injected OS certificate store via truststore')
+except Exception as _ts_err:
+    logger.debug(f'truststore unavailable ({_ts_err}) — using certifi bundle')
+
 # ── Provider metadata ────────────────────────────────────────────────────────
 
 PROVIDER_KEYS    = ['local', 'groq', 'cerebras', 'openai', 'anthropic', 'gemini', 'custom']
@@ -35,11 +46,49 @@ GEMINI_MODELS    = ['gemini-2.0-flash', 'gemini-1.5-pro', 'gemini-1.5-flash', 'g
 # Falls back to empty strings in open-source / dev builds.
 try:
     from _bundled_keys import CEREBRAS as _CB_KEY, GROQ as _GQ_KEY
-    _BUNDLED = {'cerebras': _CB_KEY, 'groq': _GQ_KEY}
+    try:
+        from _bundled_keys import CEREBRAS_2 as _CB_KEY_2, GROQ_2 as _GQ_KEY_2
+    except ImportError:
+        _CB_KEY_2 = _GQ_KEY_2 = ''
+    _BUNDLED = {
+        'groq':       _GQ_KEY,
+        'groq_2':     _GQ_KEY_2,
+        'cerebras':   _CB_KEY,
+        'cerebras_2': _CB_KEY_2,
+    }
 except ImportError:
-    _BUNDLED: dict = {'cerebras': '', 'groq': ''}
+    _BUNDLED: dict = {'groq': '', 'groq_2': '', 'cerebras': '', 'cerebras_2': ''}
 
-_SSL_ERRS = ('SSL', 'CERTIFICATE', 'ConnectError', 'Connection error', 'certificate')
+_SSL_ERRS = (
+    # SSL / TLS layer (all AV vendors)
+    'SSL', 'CERTIFICATE', 'certificate', 'TLS', 'tls',
+    'VERIFY', 'verify', 'handshake', 'WRONG_VERSION',
+    # httpx / httpcore connection wrappers
+    'ConnectError', 'Connection error', 'RemoteDisconnected',
+    'ConnectionReset', 'ConnectionRefused',
+    # AVG kernel driver named-pipe interception
+    'avgMon', 'Permission denied', '[Errno 13]',
+    # Windows-specific socket / WinError codes
+    'WinError 10054',   # connection reset by peer
+    'WinError 10061',   # connection refused
+    'WinError 995',     # I/O operation aborted (IOCP)
+)
+
+# ── Session-level SSL flag ────────────────────────────────────────────────────
+_ssl_ok = True   # flipped to False once AV SSL interception is detected
+
+def ssl_verify() -> bool:
+    return _ssl_ok
+
+def _mark_ssl_broken() -> None:
+    global _ssl_ok
+    if _ssl_ok:
+        _ssl_ok = False
+        logger.warning(
+            'Antivirus SSL inspection detected — switching to verify=False. '
+            'To fix permanently: add api.groq.com / api.cerebras.ai to your '
+            'antivirus HTTPS scanning exclusions.'
+        )
 
 
 def local_provider_available() -> bool:
@@ -57,20 +106,145 @@ def _clean(text: str) -> str:
     return re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
 
 
+def _robust_post(url: str, payload: dict, headers: dict,
+                 timeout: float = 30.0) -> dict:
+    """POST JSON with three-level antivirus fallback.
+
+    Level 1 — httpx verify=True  : normal SSL.
+                                   truststore (injected at import) makes Python
+                                   trust AV/corporate CAs from the OS cert store,
+                                   so AV SSL-MITM (AVG, Kaspersky, Bitdefender,
+                                   ESET, Sophos, Norton, McAfee) is transparent.
+    Level 2 — httpx verify=False : any remaining SSL issue (edge-case AV configs,
+                                   self-signed certs, truststore unavailable).
+    Level 3 — curl.exe           : AV blocks Python's socket layer entirely via a
+                                   kernel driver (e.g. AVG avgMonFltProxy).
+                                   curl.exe is a native Windows binary that uses
+                                   Schannel — the same SSL stack Windows itself
+                                   uses — so AV proxies it cleanly.
+
+    Returns parsed JSON dict.  Raises RuntimeError with user-actionable message.
+    """
+    import json as _json
+    import subprocess as _sub
+    import os as _os
+
+    last_exc: Exception | None = None
+
+    # ── Levels 1 & 2: httpx ──────────────────────────────────────────────────
+    if _httpx is not None:
+        verify_levels = [False] if not _ssl_ok else [True, False]
+        for verify in verify_levels:
+            try:
+                with _httpx.Client(timeout=timeout, verify=verify) as c:
+                    r = c.post(url, json=payload, headers=headers)
+                if r.status_code == 401:
+                    raise RuntimeError('Invalid API key.')
+                if r.status_code == 429:
+                    raise RuntimeError('Rate limit reached — wait a moment and try again.')
+                if r.status_code >= 400:
+                    raise RuntimeError(f'API error {r.status_code}: {r.text[:120]}')
+                if not verify and _ssl_ok:
+                    _mark_ssl_broken()
+                logger.debug(f'_robust_post: httpx verify={verify} succeeded')
+                return r.json()
+            except RuntimeError:
+                raise                # API / auth errors — do not retry
+            except Exception as e:
+                last_exc = e
+                es = str(e)
+                if any(k in es for k in _SSL_ERRS):
+                    logger.warning(
+                        f'httpx (verify={verify}) blocked by AV/SSL '
+                        f'({type(e).__name__}: {es[:80]}) — trying next level'
+                    )
+                    continue
+                if verify:
+                    continue         # non-SSL error on verify=True: still try False
+                break                # verify=False also failed — fall to curl
+
+    # ── Level 3: curl.exe (Windows system binary, uses Schannel) ─────────────
+    # Prefer C:\Windows\System32\curl.exe — guaranteed on Windows 10 1803+.
+    # Fall back to PATH lookup in case the user has a different curl.
+    system_curl = r'C:\Windows\System32\curl.exe'
+    curl = system_curl if _os.path.isfile(system_curl) else None
+    if curl is None:
+        import shutil as _shutil
+        curl = _shutil.which('curl')
+
+    if curl:
+        logger.warning(f'httpx blocked by AV — falling back to {curl}')
+        try:
+            args = [curl, '-s', '-S', '--max-time', str(int(timeout)),
+                    '-k',           # skip cert verify (Schannel handles trust)
+                    '--ssl-no-revoke',  # skip CRL check (may be blocked by AV too)
+                    '-X', 'POST']
+            for k, v in headers.items():
+                args += ['-H', f'{k}: {v}']
+            args += ['-d', _json.dumps(payload), url]
+            r2 = _sub.run(args, capture_output=True, text=True,
+                          timeout=timeout + 5)
+            if r2.returncode != 0:
+                raise RuntimeError(r2.stderr.strip()[:120])
+            data = _json.loads(r2.stdout)
+            if 'error' in data:
+                err = data['error']
+                msg = err.get('message', str(err))
+                raise RuntimeError(f'API error: {msg[:120]}')
+            logger.info('curl.exe fallback succeeded')
+            return data
+        except RuntimeError:
+            raise
+        except Exception as curl_exc:
+            last_exc = curl_exc
+
+    raise RuntimeError(
+        f'Network blocked by antivirus (all methods failed).\n'
+        f'Fix: open AVG → Settings → Shields → Web Shield → '
+        f'HTTPS Scanning → add exceptions: api.groq.com, api.cerebras.ai\n'
+        f'Last error: {str(last_exc)[:120]}'
+    )
+
+
+# Legacy wrapper kept for _OpenAICompatProvider (uses SDK, not _robust_post)
 def _ssl_retry(call_fn):
-    """Call call_fn(verify=True); on SSL/connection error retry with verify=False."""
+    """SSL retry for SDK-based providers (OpenAI/Anthropic/Gemini/Custom)."""
+    if not _ssl_ok:
+        return call_fn(verify=False)
     try:
         return call_fn(verify=True)
     except Exception as e:
         if any(k in str(e) for k in _SSL_ERRS):
-            logger.warning('SSL/connection error — retrying without verification (antivirus detected)')
+            _mark_ssl_broken()
             return call_fn(verify=False)
         raise
 
 
 def _resolve_key(config: dict, provider: str) -> str:
-    """Return user-configured key, falling back to bundled key."""
+    """Return best single key for a provider (kept for SDK-based providers)."""
     return config.get('providers', {}).get(provider, {}).get('api_key', '') or _BUNDLED.get(provider, '')
+
+
+def _resolve_keys(config: dict, provider: str) -> list[str]:
+    """Return deduplicated ordered list of API keys for a provider.
+
+    Priority: user config key → user config secondary → bundled primary → bundled secondary.
+    Empty strings and duplicates are removed.
+    """
+    pcfg = config.get('providers', {}).get(provider, {})
+    candidates = [
+        pcfg.get('api_key',   ''),
+        pcfg.get('api_key_2', ''),
+        _BUNDLED.get(provider,        ''),
+        _BUNDLED.get(f'{provider}_2', ''),
+    ]
+    seen: set[str] = set()
+    keys: list[str] = []
+    for k in candidates:
+        if k and k not in seen:
+            seen.add(k)
+            keys.append(k)
+    return keys
 
 
 # ── Abstract base ────────────────────────────────────────────────────────────
@@ -201,52 +375,82 @@ class LocalProvider(Provider):
 
 # ── Cloud providers ──────────────────────────────────────────────────────────
 
+_RATE_LIMIT_SIGNALS = ('rate limit', 'rate_limit', '429', 'quota', 'daily limit',
+                       'monthly limit', 'tokens per', 'requests per')
+
+def _is_rate_limit(err: Exception) -> bool:
+    m = str(err).lower()
+    return any(s in m for s in _RATE_LIMIT_SIGNALS)
+
+
 class GroqProvider(Provider):
-    def __init__(self, api_key: str, model: str = 'llama-3.1-8b-instant') -> None:
-        self.api_key = api_key
-        self.model   = model
+    _URL = 'https://api.groq.com/openai/v1/chat/completions'
+
+    def __init__(self, api_keys: list[str], model: str = GROQ_MODELS[0]) -> None:
+        self.api_keys = api_keys
+        self.model    = model
 
     @property
     def name(self)  -> str:  return f'Groq ({self.model})'
     @property
-    def ready(self) -> bool: return bool(self.api_key)
+    def ready(self) -> bool: return bool(self.api_keys)
 
     def refine(self, text: str, system_prompt: str) -> str:
-        from groq import Groq
-        def _call(verify: bool = True) -> str:
-            kw = {} if verify else ({'http_client': _httpx.Client(verify=False)} if _httpx else {})
-            resp = Groq(api_key=self.api_key, **kw).chat.completions.create(
-                model=self.model,
-                messages=[{'role': 'system', 'content': system_prompt},
-                          {'role': 'user',   'content': text}],
-                max_tokens=1024,
-            )
-            return _clean(resp.choices[0].message.content)
-        return _ssl_retry(_call)
+        payload = {
+            'model': self.model,
+            'messages': [{'role': 'system', 'content': system_prompt},
+                         {'role': 'user',   'content': text}],
+            'max_tokens': 1024,
+        }
+        last_err: Exception | None = None
+        for key in self.api_keys:
+            try:
+                headers = {'Authorization': f'Bearer {key}',
+                           'Content-Type': 'application/json'}
+                data = _robust_post(self._URL, payload, headers)
+                return _clean(data['choices'][0]['message']['content'])
+            except RuntimeError as e:
+                if _is_rate_limit(e):
+                    logger.warning(f'Groq key …{key[-6:]} rate-limited — rotating to next key')
+                    last_err = e
+                    continue
+                raise   # auth errors, server errors — don't rotate
+        raise last_err or RuntimeError('All Groq keys exhausted')
 
 
 class CerebrasProvider(Provider):
-    def __init__(self, api_key: str, model: str = 'llama3.1-8b') -> None:
-        self.api_key = api_key
-        self.model   = model
+    _URL = 'https://api.cerebras.ai/v1/chat/completions'
+
+    def __init__(self, api_keys: list[str], model: str = CEREBRAS_MODELS[0]) -> None:
+        self.api_keys = api_keys
+        self.model    = model
 
     @property
     def name(self)  -> str:  return f'Cerebras ({self.model})'
     @property
-    def ready(self) -> bool: return bool(self.api_key)
+    def ready(self) -> bool: return bool(self.api_keys)
 
     def refine(self, text: str, system_prompt: str) -> str:
-        from cerebras.cloud.sdk import Cerebras
-        def _call(verify: bool = True) -> str:
-            kw = {} if verify else ({'http_client': _httpx.Client(verify=False)} if _httpx else {})
-            resp = Cerebras(api_key=self.api_key, **kw).chat.completions.create(
-                model=self.model,
-                messages=[{'role': 'system', 'content': system_prompt},
-                          {'role': 'user',   'content': text}],
-                max_tokens=1024,
-            )
-            return _clean(resp.choices[0].message.content)
-        return _ssl_retry(_call)
+        payload = {
+            'model': self.model,
+            'messages': [{'role': 'system', 'content': system_prompt},
+                         {'role': 'user',   'content': text}],
+            'max_tokens': 1024,
+        }
+        last_err: Exception | None = None
+        for key in self.api_keys:
+            try:
+                headers = {'Authorization': f'Bearer {key}',
+                           'Content-Type': 'application/json'}
+                data = _robust_post(self._URL, payload, headers)
+                return _clean(data['choices'][0]['message']['content'])
+            except RuntimeError as e:
+                if _is_rate_limit(e):
+                    logger.warning(f'Cerebras key …{key[-6:]} rate-limited — rotating to next key')
+                    last_err = e
+                    continue
+                raise
+        raise last_err or RuntimeError('All Cerebras keys exhausted')
 
 
 class _OpenAICompatProvider(Provider):
@@ -418,18 +622,31 @@ class FallbackProvider(Provider):
 
 # ── Factory ──────────────────────────────────────────────────────────────────
 
+def _chain(providers: list[Provider]) -> Provider:
+    """Nest a list of providers into a FallbackProvider chain (left = highest priority)."""
+    if len(providers) == 1:
+        return providers[0]
+    return FallbackProvider(providers[0], _chain(providers[1:]))
+
+
 def build_provider(config: dict) -> Provider:
+    """Build the active provider with a full fallback chain.
+
+    For cloud providers the chain is always:
+        primary[key1, key2] → secondary[key1, key2] → Local Qwen
+    Each cloud provider rotates through its keys on rate-limit before handing
+    off to the next tier.  Local Qwen is always the last resort.
+    """
     active = config.get('active_provider', 'cerebras')
     pcfg   = config.get('providers', {})
 
-    cerebras_key = _resolve_key(config, 'cerebras')
-    groq_key     = _resolve_key(config, 'groq')
-    groq_model   = pcfg.get('groq',     {}).get('model', GROQ_MODELS[0])
-    cb_model     = pcfg.get('cerebras', {}).get('model', CEREBRAS_MODELS[0])
+    groq_model = pcfg.get('groq',     {}).get('model', GROQ_MODELS[0])
+    cb_model   = pcfg.get('cerebras', {}).get('model', CEREBRAS_MODELS[0])
 
-    cerebras = CerebrasProvider(api_key=cerebras_key, model=cb_model)
-    groq     = GroqProvider(api_key=groq_key,         model=groq_model)
+    groq     = GroqProvider(api_keys=_resolve_keys(config, 'groq'),      model=groq_model)
+    cerebras = CerebrasProvider(api_keys=_resolve_keys(config, 'cerebras'), model=cb_model)
 
+    # ── Single-provider modes (no bundled fallback chain) ─────────────────────
     if active == 'openai':
         key   = _resolve_key(config, 'openai')
         model = pcfg.get('openai', {}).get('model', OPENAI_MODELS[0])
@@ -452,19 +669,29 @@ def build_provider(config: dict) -> Provider:
         model    = cpfg.get('model', '')
         return CustomProvider(api_key=key, base_url=base_url, model=model)
 
-    if active == 'cerebras':
-        if cerebras.ready and groq.ready:
-            return FallbackProvider(cerebras, groq)
-        return cerebras if cerebras.ready else (LocalProvider() if local_provider_available() else cerebras)
+    # ── Cloud + local chain ───────────────────────────────────────────────────
+    # Build ordered list: selected provider first, other cloud second, Local last.
+    local = LocalProvider() if local_provider_available() else None
 
     if active == 'groq':
-        if groq.ready and cerebras.ready:
-            return FallbackProvider(groq, cerebras)
-        return groq if groq.ready else (LocalProvider() if local_provider_available() else groq)
+        tiers: list[Provider] = []
+        if groq.ready:     tiers.append(groq)
+        if cerebras.ready: tiers.append(cerebras)
+        if local:          tiers.append(local)
+        return _chain(tiers) if tiers else groq   # groq shown as not-ready if nothing available
 
-    # 'local' selected
-    if local_provider_available():
-        return LocalProvider()
-    if cerebras.ready and groq.ready:
-        return FallbackProvider(cerebras, groq)
-    return cerebras if cerebras.ready else groq
+    if active == 'cerebras':
+        tiers = []
+        if cerebras.ready: tiers.append(cerebras)
+        if groq.ready:     tiers.append(groq)
+        if local:          tiers.append(local)
+        return _chain(tiers) if tiers else cerebras
+
+    # 'local' selected — local first, cloud as silent backup
+    if local:
+        tiers = [local]
+        if cerebras.ready: tiers.append(cerebras)
+        if groq.ready:     tiers.append(groq)
+        return _chain(tiers)
+    if cerebras.ready: return FallbackProvider(cerebras, groq) if groq.ready else cerebras
+    return groq

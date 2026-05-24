@@ -206,6 +206,29 @@ class OverlayWindow:
         sh = win.winfo_screenheight()
         win.geometry(f'{w}x{h}+{min(cx, sw - w - 12)}+{min(cy, sh - h - 12)}')
 
+        # Hide this window from screen-capture APIs (BitBlt, DWM, OBS, etc.)
+        # so it never appears in recordings, while remaining visible to the user.
+        # WDA_EXCLUDEFROMCAPTURE = 0x11, available on Windows 10 2004+.
+        # winfo_id() returns the inner Tk child-frame HWND; Windows ignores the
+        # affinity flag on child windows.  GetAncestor(GA_ROOT=2) walks up to
+        # the real Win32 top-level so the flag is applied to the correct window.
+        try:
+            import ctypes
+            win.update_idletasks()   # ensure the HWND exists before querying
+            _u32 = ctypes.windll.user32
+            # Set argtypes/restype so ctypes uses the correct 64-bit HWND type on
+            # 64-bit Windows (HANDLE is a pointer-sized integer — without this,
+            # ctypes defaults to c_int which silently truncates the upper 32 bits).
+            _u32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+            _u32.GetAncestor.restype  = ctypes.c_void_p
+            _u32.SetWindowDisplayAffinity.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+            _u32.SetWindowDisplayAffinity.restype  = ctypes.c_bool
+            GA_ROOT = 2
+            hwnd = _u32.GetAncestor(win.winfo_id(), GA_ROOT) or win.winfo_id()
+            _u32.SetWindowDisplayAffinity(hwnd, 0x00000011)
+        except Exception:
+            pass
+
         self._win     = win
         self._canvas  = canvas
         self._main_id = text_id
@@ -252,6 +275,133 @@ class OverlayWindow:
         elapsed = time.time() - self._t0
         self._set_text(f'🎙  Recording...  {elapsed:.1f}s')
         self._win.after(80, self._update_recording)
+
+    # ── Macro pill states ─────────────────────────────────────────────────────
+
+    def show_macro_recording(self) -> None:
+        """Macro recording — animated elapsed-time pill."""
+        self._close()
+        self._t0   = time.time()
+        self._tick = True
+        self._build('⏺  Recording macro...  0.0s', _TEXT_CLR, ERR)
+        self._update_macro_recording()
+
+    def show_macro_playing(self) -> None:
+        """Macro playback — animated elapsed-time pill."""
+        self._close()
+        self._t0   = time.time()
+        self._tick = True
+        self._build('▶  Playing macro...  0.0s', _TEXT_CLR, OK)
+        self._update_macro_playing()
+
+    def show_macro_ready(self, n_events: int) -> None:
+        """Recording stopped — show count, then auto-close after 3 s."""
+        self._tick = False
+        self._close()
+        self._build(f'⏹  {n_events} events — Shift+F1 to play', _TEXT_CLR, ACCENT)
+        if self._win:
+            self._win.after(3000, self._close)
+
+    def show_macro_done(self) -> None:
+        self._tick = False
+        if self._win:
+            self._set_text('✓  Macro done — Shift+F1 to replay')
+            self._set_bar(OK)
+            self._win.after(2000, self._close)
+        else:
+            self._build('✓  Macro done — Shift+F1 to replay', _TEXT_CLR, OK)
+            if self._win:
+                self._win.after(2000, self._close)
+
+    def show_macro_stopped(self) -> None:
+        self._tick = False
+        if self._win:
+            self._set_text('⬜  Stopped — Shift+F1 to replay')
+            self._set_bar(WARN)
+            self._win.after(1500, self._close)
+        else:
+            self._build('⬜  Stopped — Shift+F1 to replay', _TEXT_CLR, WARN)
+            if self._win:
+                self._win.after(1500, self._close)
+
+    def show_macro_saved(self, name: str, hotkey: str) -> None:
+        """Brief confirmation pill after a macro is saved."""
+        self._tick = False
+        self._close()
+        hk_part = f'  —  {hotkey.upper()} to play' if hotkey else '  —  assign a hotkey in Library'
+        text = f'✓  "{name}" saved{hk_part}'
+        self._build(text, _TEXT_CLR, OK)
+        if self._win:
+            self._win.after(3500, self._close)
+
+    def _update_macro_recording(self) -> None:
+        if not self._tick or self._win is None:
+            return
+        elapsed = time.time() - self._t0
+        self._set_text(f'⏺  Recording macro...  {elapsed:.1f}s')
+        self._win.after(80, self._update_macro_recording)
+
+    def _update_macro_playing(self) -> None:
+        if not self._tick or self._win is None:
+            return
+        elapsed = time.time() - self._t0
+        self._set_text(f'▶  Playing macro...  {elapsed:.1f}s')
+        self._win.after(80, self._update_macro_playing)
+
+    # ── Recorder pill states ──────────────────────────────────────────────────
+
+    def show_recorder_recording(self) -> None:
+        """Screen recording active — animated elapsed-time pill (red)."""
+        self._close()
+        self._t0   = time.time()
+        self._tick = True
+        self._build('⏺  Recording…  0s', _TEXT_CLR, ERR)
+        self._update_recorder_recording()
+
+    def show_recorder_stopping(self) -> None:
+        """Encoding / finalizing — brief amber pill."""
+        self._tick = False
+        self._close()
+        self._build('⏳  Saving recording…', _TEXT_CLR, WARN)
+
+    def _update_recorder_recording(self) -> None:
+        if not self._tick or self._win is None:
+            return
+        elapsed = time.time() - self._t0
+        m, s = divmod(int(elapsed), 60)
+        self._set_text(f'⏺  Recording…  {m:02d}:{s:02d}  —  Shift+F2 to stop')
+        self._win.after(1000, self._update_recorder_recording)
+
+    # ── GIF pill states ───────────────────────────────────────────────────────
+
+    def show_gif_recording(self) -> None:
+        """GIF capture active — animated frame-count pill (purple/accent)."""
+        self._close()
+        self._t0   = time.time()
+        self._tick = True
+        self._build('🎞  GIF  0s  —  Shift+F3 to stop', _TEXT_CLR, '#7c3aed')
+        self._update_gif_recording()
+
+    def _update_gif_recording(self) -> None:
+        if not self._tick or self._win is None:
+            return
+        elapsed = time.time() - self._t0
+        self._set_text(f'🎞  GIF  {int(elapsed)}s  —  Shift+F3 to stop')
+        self._win.after(1000, self._update_gif_recording)
+
+    def show_gif_encoding(self) -> None:
+        """GIF encoding in progress — brief amber pill."""
+        self._tick = False
+        self._close()
+        self._build('⏳  Saving GIF…', _TEXT_CLR, '#d97706')
+
+    def show_gif_capped(self, dur_s: int) -> None:
+        """Duration cap hit — show notification, then auto-close."""
+        self._tick = False
+        self._close()
+        self._build(f'⏹  Max duration reached ({dur_s}s)', _TEXT_CLR, '#d97706')
+        if self._win:
+            self._win.after(2500, self._close)
 
     def _cancel_safety_timer(self) -> None:
         if self._safety_timer_id is not None:
