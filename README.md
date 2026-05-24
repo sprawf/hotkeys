@@ -1,8 +1,8 @@
 # ⚡ Hotkeys
 
-**Rewrite any text, in any app, instantly. No copy-paste. No switching windows. Just a hotkey.**
+**AI text refiner. Voice to text. Macro recorder. Screen & GIF recorder. All from your system tray.**
 
-Select text anywhere → press `Alt+Shift+W` → AI rewrites it and pastes it back. Done.  
+Select text anywhere → press a hotkey → AI rewrites it and pastes it back in under a second.  
 Works in Gmail, Notion, Slack, Word, VS Code, Discord — every app on your computer.
 
 [![Windows](https://img.shields.io/badge/Windows-Download_v3.0-0078D6?style=for-the-badge&logo=windows)](https://github.com/sprawf/hotkeys/releases/download/v3.0.0/Hotkeys-v3.0-win64.zip)
@@ -20,13 +20,17 @@ Most AI writing tools make you open a browser tab, paste your text, wait, copy t
 
 **Hotkeys does it in 1 step** — without ever leaving whatever you're writing in.
 
-It sits quietly in your system tray and gives you three superpowers:
+It sits quietly in your system tray and gives you a full toolkit:
 
 | | |
 |---|---|
 | ✍️ **AI Text Refiner** | Select any text, press a hotkey — it's rewritten and pasted back in under a second |
 | ⌨️ **Custom Prompt Hotkeys** | Write any instruction, assign it F1–F12, fire it from any app instantly |
 | 🎙️ **Voice to Text** | Hold a hotkey, speak, your words appear wherever your cursor is — fully offline |
+| 🔴 **Macro Recorder** | Record any sequence of keystrokes and mouse clicks, replay it with one key |
+| 🎬 **Screen Recorder** | Capture any window or region of your screen as an MP4 |
+| 🎞️ **GIF Recorder** | Record any window or region as an animated GIF — perfect for sharing clips |
+| 📸 **AI Screenshot** | Capture your screen and instantly ask the AI what's in it |
 
 ---
 
@@ -125,6 +129,30 @@ No Python. No pip. No installing anything. It just works.
 2. Press `Ctrl + Enter` to start recording
 3. Speak naturally
 4. Press `Ctrl + Enter` again to stop — your words appear instantly
+
+### Record and replay a macro
+
+1. Press `Shift + F1` to start recording — a red pill appears in the corner
+2. Do anything: type, click, switch windows, whatever you want to automate
+3. Press `Shift + F1` again to stop — the pill shows how many events were captured
+4. Press `Shift + F1` once more to replay the exact sequence
+5. Press `Esc` at any point to cancel recording or stop playback
+
+### Record your screen
+
+1. Press `Shift + F2` — a setup dialog appears
+2. Pick a window or drag to select a region
+3. Click **Start Recording** — record disappears, recording begins
+4. Press `Shift + F2` again to stop — a save dialog appears
+5. Choose a filename and location — saved as MP4
+
+### Record a GIF
+
+1. Press `Shift + F3` — a setup dialog appears
+2. Pick a window or drag to select a region, set FPS and max duration
+3. Click **Start Recording**
+4. Press `Shift + F3` again (or wait for max duration) to stop
+5. Preview the GIF, then save or discard it
 
 ---
 
@@ -234,6 +262,8 @@ venv/bin/python3 main.py
 | AI text refinement | Cerebras / Groq API |
 | Spell check | pyspellchecker |
 | Global hotkeys | keyboard |
+| Macro recorder | pynput |
+| Screen / GIF recorder | PyAV (FFmpeg) + win32ui |
 | System tray | pystray |
 | Packaging | PyInstaller |
 
