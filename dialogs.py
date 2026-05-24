@@ -10,6 +10,8 @@ Usage:
                action_label='Delete', action_color='#b03030'):
         ...
 """
+import ctypes
+import ctypes.wintypes
 import tkinter as tk
 import customtkinter as ctk
 
@@ -94,8 +96,24 @@ class ThemedDialog(ctk.CTkToplevel):
 
 # ── Shared geometry helper ────────────────────────────────────────────────────
 
+def _work_area() -> tuple[int, int, int, int]:
+    """Return (left, top, right, bottom) of the primary monitor's work area.
+
+    The work area is the screen rectangle excluding the taskbar and any
+    always-on-top toolbars.  Falls back to full screen dimensions on error.
+    """
+    try:
+        rect = ctypes.wintypes.RECT()
+        # SPI_GETWORKAREA = 0x0030
+        ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0)
+        return rect.left, rect.top, rect.right, rect.bottom
+    except Exception:
+        return 0, 0, 0, 0
+
+
 def center_over_parent(dialog, parent) -> None:
-    """Position *dialog* centered over *parent* widget, or screen if parent is hidden."""
+    """Position *dialog* centered over *parent* widget, clamped to the work area
+    (screen minus taskbar) so no part of the dialog is hidden behind the taskbar."""
     dialog.update_idletasks()
     try:
         # winfo_width/height gives actual rendered size after update_idletasks;
@@ -105,21 +123,30 @@ def center_over_parent(dialog, parent) -> None:
         if w <= 1:
             w = dialog.winfo_reqwidth()
             h = dialog.winfo_reqheight()
-        sw = dialog.winfo_screenwidth()
-        sh = dialog.winfo_screenheight()
-        # If parent is withdrawn/iconified fall back to screen centre.
-        # A withdrawn CTkToplevel still reports width=200 so check ismapped() too.
+
+        # Use the Windows work area so we never overlap the taskbar.
+        wa_left, wa_top, wa_right, wa_bottom = _work_area()
+        if wa_right <= wa_left or wa_bottom <= wa_top:
+            # Fallback: use tkinter screen size
+            wa_left, wa_top = 0, 0
+            wa_right  = dialog.winfo_screenwidth()
+            wa_bottom = dialog.winfo_screenheight()
+        wa_w = wa_right  - wa_left
+        wa_h = wa_bottom - wa_top
+
+        # If parent is visible, centre over it; otherwise centre on work area.
         pw, ph = parent.winfo_width(), parent.winfo_height()
         if pw <= 1 or ph <= 1 or not parent.winfo_ismapped():
-            x = (sw - w) // 2
-            y = (sh - h) // 2
+            x = wa_left + (wa_w - w) // 2
+            y = wa_top  + (wa_h - h) // 2
         else:
             px, py = parent.winfo_rootx(), parent.winfo_rooty()
             x = px + (pw - w) // 2
             y = py + (ph - h) // 2
-        # Clamp to screen bounds
-        x = max(0, min(x, sw - w))
-        y = max(0, min(y, sh - h))
+
+        # Clamp fully inside the work area.
+        x = max(wa_left, min(x, wa_right  - w))
+        y = max(wa_top,  min(y, wa_bottom - h))
         dialog.geometry(f'+{x}+{y}')
     except Exception:
         pass

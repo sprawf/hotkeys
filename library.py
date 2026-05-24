@@ -356,14 +356,15 @@ class EditDialog(ctk.CTkToplevel):
         self.after(4000, self._ocr_clear_status)
 
     def _center(self, parent) -> None:
-        center_over_parent(self, parent)
-        # Use <Map> so lift/focus fire exactly when the window appears — no
-        # arbitrary delay that can race on slow machines or waste time on fast ones.
-        def _raise(e=None):
+        # Center inside <Map> so the window has its real rendered size —
+        # update_idletasks() alone is too early for CTkinter toplevels and
+        # returns a smaller reqheight than the fully-laid-out window.
+        def _on_map(e=None):
+            center_over_parent(self, parent)
             self.lift()
             self.focus_force()
             self.unbind('<Map>')
-        self.bind('<Map>', _raise)
+        self.bind('<Map>', _on_map)
 
 
 # ── Hotkey Capture Dialog ─────────────────────────────────────────────────────
@@ -521,12 +522,12 @@ class HotkeyCapture(ctk.CTkToplevel):
     # ── Geometry ──────────────────────────────────────────────────────────────
 
     def _center(self, parent) -> None:
-        center_over_parent(self, parent)
-        def _raise(e=None):
+        def _on_map(e=None):
+            center_over_parent(self, parent)
             self.lift()
             self.focus_force()
             self.unbind('<Map>')
-        self.bind('<Map>', _raise)
+        self.bind('<Map>', _on_map)
 
 
 # ── Folder Input Dialog ───────────────────────────────────────────────────────
@@ -603,13 +604,13 @@ class FolderInputDialog(ctk.CTkToplevel):
         self.bind('<Escape>', lambda e: self.destroy())
         self.bind('<Return>', lambda e: self._save())
 
-        center_over_parent(self, parent)
-        def _raise(e=None):
+        def _on_map(e=None):
+            center_over_parent(self, parent)
             self.lift()
             self.focus_force()
             self._entry.focus_set()
             self.unbind('<Map>')
-        self.bind('<Map>', _raise)
+        self.bind('<Map>', _on_map)
 
     def _pick(self, color: str) -> None:
         self._color_var.set(color)

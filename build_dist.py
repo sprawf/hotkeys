@@ -158,7 +158,7 @@ if all_ok:
     print('  • Zip the entire dist/Hotkeys/ folder and share it')
     print('  • Recipient: extract anywhere, run Hotkeys.exe — no install needed')
     print('  • User data (config, logs, prompts) stored in dist/Hotkeys/data/')
-    print('  • User must add their own API keys via the tray icon → Settings')
+    print('  • User must add their own API keys via the tray icon > Settings')
 else:
     print('BUILD COMPLETE WITH WARNINGS — check missing files above')
 print('=' * 60)
