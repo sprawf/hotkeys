@@ -682,8 +682,17 @@ class RecorderSetupDialog:
         self.win.title('Start Recording')
         self.win.resizable(False, False)
         self.win.configure(bg=BG)
-        self.win.transient(parent)
-        self.win.grab_set()
+        # Only set transient when the parent is actually mapped — on Windows,
+        # a transient child of a withdrawn/hidden parent is itself hidden,
+        # making the dialog invisible and preventing the user from closing it.
+        if parent.winfo_ismapped():
+            self.win.transient(parent)
+        # Ensure the dialog is always visible even when parent is withdrawn.
+        self.win.deiconify()
+        try:
+            self.win.grab_set()
+        except Exception:
+            pass   # grab can fail if window isn't viewable yet; non-fatal
         self._build()
         self._center(parent)
         self.win.bind('<Escape>', lambda e: self.win.destroy())
@@ -922,18 +931,22 @@ class RecorderSetupDialog:
 
     def _center(self, parent) -> None:
         self.win.update_idletasks()
-        pw = parent.winfo_width()
-        ph = parent.winfo_height()
-        px = parent.winfo_rootx()
-        py = parent.winfo_rooty()
         w  = self.win.winfo_reqwidth()
         h  = self.win.winfo_reqheight()
-        x  = px + (pw - w) // 2
-        y  = py + (ph - h) // 2
         sw = self.win.winfo_screenwidth()
         sh = self.win.winfo_screenheight()
-        x  = max(0, min(x, sw - w))
-        y  = max(0, min(y, sh - h))
+        pw = parent.winfo_width()
+        ph = parent.winfo_height()
+        if pw > 1 and ph > 1 and parent.winfo_ismapped():
+            # Centre over the visible parent window
+            x = parent.winfo_rootx() + (pw - w) // 2
+            y = parent.winfo_rooty() + (ph - h) // 2
+        else:
+            # Parent is withdrawn/hidden — centre on screen instead
+            x = (sw - w) // 2
+            y = (sh - h) // 2
+        x = max(0, min(x, sw - w))
+        y = max(0, min(y, sh - h))
         self.win.geometry(f'+{x}+{y}')
 
 

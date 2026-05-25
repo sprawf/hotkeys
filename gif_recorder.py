@@ -288,8 +288,15 @@ class GifSetupDialog:
         win.title('Record GIF')
         win.configure(fg_color=BG)
         win.resizable(False, False)
-        win.transient(self._parent)
-        win.grab_set()
+        # Only set transient when parent is mapped — transient to a withdrawn
+        # parent hides the dialog on Windows, blocking it indefinitely.
+        if self._parent.winfo_ismapped():
+            win.transient(self._parent)
+        win.deiconify()   # force visible even if parent is withdrawn
+        try:
+            win.grab_set()
+        except Exception:
+            pass   # non-fatal if window isn't viewable yet
         self.win = win
 
         # Header
@@ -473,16 +480,18 @@ class GifSetupDialog:
 
     def _center(self, parent) -> None:
         self.win.update_idletasks()
-        pw = parent.winfo_width()
-        ph = parent.winfo_height()
-        px = parent.winfo_rootx()
-        py = parent.winfo_rooty()
         w  = self.win.winfo_reqwidth()
         h  = self.win.winfo_reqheight()
-        x  = px + (pw - w) // 2
-        y  = py + (ph - h) // 2
         sw = self.win.winfo_screenwidth()
         sh = self.win.winfo_screenheight()
+        pw = parent.winfo_width()
+        ph = parent.winfo_height()
+        if pw > 1 and ph > 1 and parent.winfo_ismapped():
+            x = parent.winfo_rootx() + (pw - w) // 2
+            y = parent.winfo_rooty() + (ph - h) // 2
+        else:
+            x = (sw - w) // 2
+            y = (sh - h) // 2
         self.win.geometry(f'+{max(0, min(x, sw-w))}+{max(0, min(y, sh-h))}')
 
 

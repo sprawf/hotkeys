@@ -278,11 +278,13 @@ class App:
         self._screen_recorder: ScreenRecorder | None = None
         self._recorder_state  = 'idle'   # 'idle' | 'recording' | 'stopping'
         self._recorder_t0     = 0.0
+        self._recorder_setup_dlg = None   # open RecorderSetupDialog, if any
 
         # ── GIF recorder ──────────────────────────────────────────────────────
         self._gif_recorder: GifRecorder | None = None
         self._gif_state       = 'idle'   # 'idle' | 'recording' | 'encoding'
         self._gif_t0          = 0.0
+        self._gif_setup_dlg   = None   # open GifSetupDialog, if any
 
         # ── Macro recorder + library ─────────────────────────────────────────
         self._macro          = MacroRecorder()
@@ -589,6 +591,17 @@ class App:
     def _reload_hotkeys_manual(self) -> None:
         """Full reset from tray menu — cancels anything stuck, re-registers hotkeys."""
         logger.info('Manual reload requested from tray.')
+        # Close any open recorder/gif setup dialogs that may be stuck
+        # (e.g. triggered with library closed → parent withdrawn → dialog invisible)
+        for attr in ('_recorder_setup_dlg', '_gif_setup_dlg'):
+            dlg = getattr(self, attr, None)
+            if dlg is not None:
+                try:
+                    dlg.win.grab_release()
+                    dlg.win.destroy()
+                except Exception:
+                    pass
+                setattr(self, attr, None)
         # Cancel any stuck recording
         try:
             if self._whisper_recording:
@@ -915,6 +928,11 @@ class App:
     # ── Event poll loop ───────────────────────────────────────────────────────
 
     def _poll(self) -> None:
+        # Reschedule FIRST so a handler that calls wait_window() (which creates
+        # a nested Tk event loop) doesn't prevent the next poll from running.
+        # Without this, any modal dialog opened from a handler would stop all
+        # queue processing — including tray "Reload hotkeys" — until it closed.
+        self.root.after(30, self._poll)
         try:
             while True:
                 event, data = self._q.get_nowait()
@@ -926,7 +944,6 @@ class App:
                         logger.exception(f'_poll: unhandled exception in handler for {event!r}')
         except queue.Empty:
             pass
-        self.root.after(30, self._poll)
 
     # ── Refine actions ────────────────────────────────────────────────────────
 
@@ -1399,13 +1416,21 @@ class App:
 
     def _recorder_start_setup(self) -> None:
         """Show pre-recording options dialog then start recording."""
-        # Parent to library window if it's mapped, else root
+        # Parent to library window if it's mapped, else root.
+        # RecorderSetupDialog handles the withdrawn-parent case internally
+        # (no transient, deiconify, screen-centre) so we can always pass root.
         try:
             parent = self.library.win if self.library.win.winfo_ismapped() else self.root
         except Exception:
             parent = self.root
-        dlg = RecorderSetupDialog(parent)
+        try:
+            dlg = RecorderSetupDialog(parent)
+        except Exception as exc:
+            logger.exception(f'RecorderSetupDialog creation failed: {exc}')
+            return
+        self._recorder_setup_dlg = dlg
         parent.wait_window(dlg.win)
+        self._recorder_setup_dlg = None
         if dlg.result is None:
             return   # user cancelled
 
@@ -1543,7 +1568,9 @@ class App:
         except Exception as exc:
             logger.exception(f'GIF setup dialog creation failed: {exc}')
             return
+        self._gif_setup_dlg = dlg
         parent.wait_window(dlg.win)
+        self._gif_setup_dlg = None
         if dlg.result is None:
             return   # user cancelled
 
