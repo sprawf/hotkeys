@@ -20,8 +20,11 @@ _EXTRACT_PROMPT = (
 
 # ── Clipboard helper ──────────────────────────────────────────────────────────
 
-def get_clipboard_image():
+def get_clipboard_image() -> tuple:
     """Read an image from the clipboard.
+
+    ALWAYS returns a 2-tuple — callers MUST unpack:
+        img, err = get_clipboard_image()
 
     Returns
     -------

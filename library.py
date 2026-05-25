@@ -258,9 +258,9 @@ class EditDialog(ctk.CTkToplevel):
     def _on_ctrl_v(self, event) -> None:
         """Intercept Ctrl+V: if the clipboard holds an image, run OCR instead."""
         from vision import get_clipboard_image
-        img = get_clipboard_image()
+        img, err = get_clipboard_image()
         if img is None:
-            return None   # fall through to normal paste
+            return None   # no image — fall through to normal text paste
         self._ocr_start(img=img)
         return 'break'   # consumed — don't also paste raw clipboard data
 
@@ -274,10 +274,10 @@ class EditDialog(ctk.CTkToplevel):
 
         if img is None:
             from vision import get_clipboard_image
-            img = get_clipboard_image()
+            img, err = get_clipboard_image()
             if img is None:
                 alert(self, 'No image found',
-                      'Copy an image to the clipboard first,\nthen click Paste Image.')
+                      err or 'Copy an image to the clipboard first,\nthen click Paste Image.')
                 return
 
         self._ocr_pending = True
@@ -339,6 +339,7 @@ class EditDialog(ctk.CTkToplevel):
 
     def _ocr_error(self, message: str) -> None:
         """Called on the UI thread when OCR fails."""
+        _log.warning('OCR failed: %s', message)
         self._ocr_pending = False
         self._ocr_btn.configure(
             text='📷  Paste Image',
