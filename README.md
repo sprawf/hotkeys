@@ -8,7 +8,7 @@ Works in Gmail, Notion, Slack, Word, VS Code, Discord — every app on your comp
 [![Windows](https://img.shields.io/badge/Windows-Download_v3.0-0078D6?style=for-the-badge&logo=windows)](https://github.com/sprawf/hotkeys/releases/download/v3.0.0/Hotkeys-v3.0-win64.zip)
 [![Windows v2](https://img.shields.io/badge/Windows-v2.0_(legacy)-555555?style=for-the-badge&logo=windows)](https://github.com/sprawf/hotkeys/releases/download/v2.0.0/Hotkeys-v2.0-win64.zip)
 [![Windows v1](https://img.shields.io/badge/Windows-v1.0_(legacy)-555555?style=for-the-badge&logo=windows)](https://github.com/sprawf/hotkeys/releases/download/v1.0.0/Hotkeys-v1.0-win64.zip)
-[![Mac](https://img.shields.io/badge/Mac-Installer-999999?style=for-the-badge&logo=apple)](https://github.com/sprawf/hotkeys/raw/main/install_mac.command)
+[![Mac](https://img.shields.io/badge/Mac-Download_v3.0-999999?style=for-the-badge&logo=apple)](https://github.com/sprawf/hotkeys/releases/download/v3.0.0/Hotkeys-mac.dmg)
 [![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10+-blue?style=for-the-badge&logo=python)](https://python.org)
 
@@ -90,13 +90,17 @@ No Python. No pip. No installing anything. It just works.
 
 ---
 
-### 🍎 Mac — automated installer
+### 🍎 Mac — plug and play
 
-1. **[Download install_mac.command](https://github.com/sprawf/hotkeys/raw/main/install_mac.command)**
-2. Right-click → **Open** → click **Open** again (Mac security prompt)
-3. A terminal window installs everything automatically (~10 min, 600 MB models)
-4. Grant keyboard permission when prompted (one-time, 30 seconds)
-5. Double-click **Hotkeys.command** on your Desktop — done
+1. **[Download Hotkeys-mac.dmg](https://github.com/sprawf/hotkeys/releases/download/v3.0.0/Hotkeys-mac.dmg)**
+2. Open the DMG — drag **Hotkeys.app** to your Applications folder
+3. Double-click **Open Hotkeys.command** inside the DMG (bypasses macOS security prompt)
+4. Grant **Accessibility** permission when prompted (one-time, 30 seconds)
+5. The ⚡ icon appears in your menu bar — you're done
+
+No Python. No pip. No installing anything. It just works.
+
+> **Prefer to install from source?** [Download install_mac.command](https://github.com/sprawf/hotkeys/raw/main/install_mac.command) — right-click → Open, terminal does everything automatically (~10 min)
 
 ---
 
