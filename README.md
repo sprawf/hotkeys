@@ -32,6 +32,8 @@ It sits quietly in your system tray and gives you a full toolkit:
 | 🎞️ **GIF Recorder** | Record any window or region as an animated GIF — perfect for sharing clips |
 | 📸 **AI Screenshot** | Capture your screen and instantly ask the AI what's in it |
 
+**No API key needed.** Works out of the box on Windows and Mac — just download and run.
+
 ---
 
 ## The Prompt Library
@@ -84,7 +86,7 @@ These are just the starting point. Hit **+ Add** to write your own.
 3. Open the folder and double-click `Hotkeys.exe`
 4. The ⚡ icon appears in your taskbar tray — you're done
 
-No Python. No pip. No installing anything. It just works.
+No Python. No pip. No API key. No installing anything. It just works.
 
 > [Download v2.0 (legacy)](https://github.com/sprawf/hotkeys/releases/download/v2.0.0/Hotkeys-v2.0-win64.zip) · [Download v1.0 (legacy)](https://github.com/sprawf/hotkeys/releases/download/v1.0.0/Hotkeys-v1.0-win64.zip)
 
@@ -98,7 +100,7 @@ No Python. No pip. No installing anything. It just works.
 4. Grant **Accessibility** permission when prompted (one-time, 30 seconds)
 5. The ⚡ icon appears in your menu bar — you're done
 
-No Python. No pip. No installing anything. It just works.
+No Python. No pip. No API key. No installing anything. It just works.
 
 > **Prefer to install from source?** [Download install_mac.command](https://github.com/sprawf/hotkeys/raw/main/install_mac.command) — right-click → Open, terminal does everything automatically (~10 min)
 
@@ -134,29 +136,40 @@ No Python. No pip. No installing anything. It just works.
 3. Speak naturally
 4. Press `Ctrl + Enter` again to stop — your words appear instantly
 
+> Runs fully offline — nothing is sent anywhere.
+
 ### Record and replay a macro
 
 1. Press `Shift + F1` to start recording — a red pill appears in the corner
-2. Do anything: type, click, switch windows, whatever you want to automate
+2. Do anything: type, click, switch windows, scroll — everything is captured
 3. Press `Shift + F1` again to stop — the pill shows how many events were captured
 4. Press `Shift + F1` once more to replay the exact sequence
 5. Press `Esc` at any point to cancel recording or stop playback
+6. *(Optional)* Save frequently used macros and assign them their own hotkey
 
 ### Record your screen
 
 1. Press `Shift + F2` — a setup dialog appears
-2. Pick a window or drag to select a region
-3. Click **Start Recording** — record disappears, recording begins
-4. Press `Shift + F2` again to stop — a save dialog appears
-5. Choose a filename and location — saved as MP4
+2. Choose **Full screen**, pick a **window**, or drag to select a **region**
+3. *(Optional)* Enable microphone audio
+4. Click **Start Recording** — dialog disappears, recording begins silently
+5. Press `Shift + F2` again to stop — a save dialog appears
+6. Choose a filename and location — saved as MP4
 
 ### Record a GIF
 
 1. Press `Shift + F3` — a setup dialog appears
-2. Pick a window or drag to select a region, set FPS and max duration
-3. Click **Start Recording**
-4. Press `Shift + F3` again (or wait for max duration) to stop
-5. Preview the GIF, then save or discard it
+2. Choose a window or drag to select a region
+3. Set FPS and max duration, then click **Start Recording**
+4. Press `Shift + F3` again (or wait for the time limit) to stop
+5. Preview the GIF — save it or discard it
+
+### AI Screenshot
+
+1. Press `PrtSc` — the screen is captured instantly
+2. A dialog appears with the screenshot and an AI chat box
+3. Ask anything: *"What does this error mean?"*, *"Summarise this page"*, *"What's in this chart?"*
+4. The AI answers immediately
 
 ---
 
@@ -164,12 +177,12 @@ No Python. No pip. No installing anything. It just works.
 
 Everything is configurable. Open the library (`Alt+Shift+E`) and click the gear icon, or right-click the tray icon.
 
-- **AI Provider** — switch between Cerebras and Groq, enter your API key
-- **Hotkeys** — change any global shortcut
-- **Voice model** — choose small (fast) or large (accurate), pick your microphone
+- **AI Provider** — switch between Cerebras and Groq, or enter your own API key
+- **Hotkeys** — change any global shortcut to whatever you prefer
+- **Voice model** — choose small (fast) or large (more accurate), pick your microphone
 - **Transcription** — language, beam size, custom vocabulary
-- **Autostart** — launch automatically with Windows
 - **Push-to-talk** — hold to record, release to transcribe
+- **Autostart** — launch automatically when your computer starts
 
 ---
 
@@ -179,20 +192,24 @@ Everything is configurable. Open the library (`Alt+Shift+E`) and click the gear 
 |---|---|
 | Refine selected text with AI | `Alt + Shift + W` |
 | Open Prompt Library | `Alt + Shift + E` |
+| Undo last refine | `Alt + Shift + Z` |
 | Fire prompt 1–12 | `F1` – `F12` |
 | Start / stop voice recording | `Ctrl + Enter` |
-| Cancel recording | `Escape` |
+| Cancel / stop anything | `Escape` |
 | Record / stop / replay macro | `Shift + F1` |
 | Start / stop screen recorder | `Shift + F2` |
 | Start / stop GIF recorder | `Shift + F3` |
+| AI screenshot | `PrtSc` |
 
 All hotkeys are customisable in Settings. Per-prompt hotkeys are assigned per prompt via right-click → **Assign hotkey**.
 
 ---
 
-## AI Providers — both free
+## AI Providers
 
-Hotkeys uses **Cerebras** or **Groq** to rewrite your text. Both are completely free and take 2 minutes to set up.
+Hotkeys works **out of the box** with no setup required — API access is built in.
+
+If you want to use your own key (for higher limits or your own account), both providers are free:
 
 | Provider | Speed | Free tier | Sign up |
 |---|---|---|---|
@@ -201,7 +218,7 @@ Hotkeys uses **Cerebras** or **Groq** to rewrite your text. Both are completely 
 
 Sign up → copy your API key → paste it into Settings → done.
 
-Voice-to-text works without any API key — it runs fully offline on your device.
+Voice-to-text (Whisper) runs fully offline — no API key, no internet required.
 
 ---
 
@@ -221,19 +238,23 @@ Voice-to-text works without any API key — it runs fully offline on your device
 | 📚 | **Prompt library** | 16 built-in prompts, unlimited custom ones |
 | ⌨️ | **Per-prompt hotkeys** | Assign F1–F12 to any prompt; fires from any app |
 | 🗒️ | **Sticky note popup** | Preview and edit a prompt before it fires |
-| 🔤 | **Live spell check** | Misspellings underlined in red as you type |
+| 🔤 | **Live spell check** | Misspellings underlined in red as you type in the library |
 | 🔍 | **Prompt search** | Find prompts instantly as you type |
 | 🔄 | **Drag to reorder** | Organise prompts by drag and drop |
-| 🎙️ | **Voice to text** | Fully offline, no data sent anywhere |
-| 🔇 | **Noise reduction** | Works in noisy environments |
+| ↩️ | **Undo last refine** | Instantly revert an AI rewrite with `Alt+Shift+Z` |
+| 🎙️ | **Voice to text** | Fully offline, Whisper model runs on-device |
+| 🔇 | **Noise reduction** | Works cleanly in noisy environments |
 | 🚀 | **Push-to-talk** | Hold to record, release to transcribe |
 | 📋 | **Transcription history** | Browse and copy past recordings |
 | ⚡ | **Instant paste** | Output types directly where your cursor is |
-| 🖥️ | **System tray** | Zero UI clutter, always available |
+| 🖥️ | **System tray / menu bar** | Zero UI clutter — always available, never in the way |
 | 🔴 | **Macro recorder** | Record & replay any sequence of keystrokes and mouse clicks (`Shift+F1`) |
-| 🎬 | **Screen recorder** | Capture any window or region as MP4 (`Shift+F2`) |
+| 💾 | **Saved macros** | Name, save, and assign hotkeys to your most-used macros |
+| 🎬 | **Screen recorder** | Capture any window or region as MP4, optional mic audio (`Shift+F2`) |
 | 🎞️ | **GIF recorder** | Record any window or region as an animated GIF (`Shift+F3`) |
-| 📸 | **AI screenshot** | Capture screen and ask AI what's in it |
+| 📸 | **AI screenshot** | Capture screen and ask AI anything about it (`PrtSc`) |
+| 🔁 | **Hotkey watchdog** | Auto-recovers if hotkeys ever stop responding |
+| 🍎 | **macOS support** | Full feature parity on Mac — same plug-and-play experience |
 
 ---
 
@@ -248,7 +269,7 @@ python -m venv venv
 venv\Scripts\pip install -r requirements.txt
 venv\Scripts\python main.py
 
-# Mac / Linux
+# Mac
 python3 -m venv venv
 venv/bin/pip install -r requirements_mac.txt
 venv/bin/python3 main.py
@@ -267,7 +288,8 @@ venv/bin/python3 main.py
 | Spell check | pyspellchecker |
 | Global hotkeys | keyboard |
 | Macro recorder | pynput |
-| Screen / GIF recorder | PyAV (FFmpeg) + win32ui |
+| Screen capture | mss (cross-platform) |
+| Screen / GIF recorder | PyAV (FFmpeg) |
 | System tray | pystray |
 | Packaging | PyInstaller |
 
