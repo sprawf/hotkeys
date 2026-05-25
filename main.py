@@ -647,13 +647,25 @@ class App:
         # instead of plain Ctrl+C and silently ignores it (→ "select text first").
         # GetAsyncKeyState is used directly so this works even while the
         # keyboard hook is briefly suspended during re-registration.
-        _u32 = ctypes.windll.user32
-        _deadline = time.time() + 0.5          # give up after 500 ms
-        while time.time() < _deadline:
-            if not (_u32.GetAsyncKeyState(0x10) & 0x8000 or   # VK_SHIFT
-                    _u32.GetAsyncKeyState(0x12) & 0x8000):    # VK_MENU (Alt)
-                break
-            time.sleep(0.015)
+        if sys.platform == 'win32':
+            _u32 = ctypes.windll.user32
+            _deadline = time.time() + 0.5
+            while time.time() < _deadline:
+                if not (_u32.GetAsyncKeyState(0x10) & 0x8000 or   # VK_SHIFT
+                        _u32.GetAsyncKeyState(0x12) & 0x8000):    # VK_MENU (Alt)
+                    break
+                time.sleep(0.015)
+        else:
+            # macOS: use keyboard.is_pressed — brief wait for modifier release
+            try:
+                import keyboard as _kb
+                _deadline = time.time() + 0.5
+                while time.time() < _deadline:
+                    if not (_kb.is_pressed('shift') or _kb.is_pressed('alt')):
+                        break
+                    time.sleep(0.015)
+            except Exception:
+                pass
         time.sleep(0.04)                       # brief settle after release
         try:
             prev = pyperclip.paste()

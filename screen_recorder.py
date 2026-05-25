@@ -17,6 +17,7 @@ import ctypes
 import os
 import queue
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -26,12 +27,14 @@ from pathlib import Path
 from tkinter import filedialog, ttk
 from typing import Callable
 
+if sys.platform == 'win32':
+    import win32con
+    import win32gui
+    import win32ui
+
 import av
 import numpy as np
 import sounddevice as sd
-import win32con
-import win32gui
-import win32ui
 from PIL import ImageTk
 
 from theme import (
@@ -53,23 +56,44 @@ RECORDINGS_DIR_NAME = 'recordings'   # sub-folder of appdata_dir()
 
 def list_windows() -> list[tuple[int, str]]:
     """Return [(hwnd, title), …] for all visible, non-trivial windows."""
-    results: list[tuple[int, str]] = []
+    if sys.platform == 'win32':
+        results: list[tuple[int, str]] = []
 
-    def _cb(hwnd, _):
-        if not win32gui.IsWindowVisible(hwnd):
-            return
-        if not win32gui.IsWindowEnabled(hwnd):
-            return
-        title = win32gui.GetWindowText(hwnd)
-        if not title or len(title) < 2:
-            return
-        cls = win32gui.GetClassName(hwnd)
-        if cls in ('Shell_TrayWnd', 'Progman', 'WorkerW'):
-            return
-        results.append((hwnd, title))
+        def _cb(hwnd, _):
+            if not win32gui.IsWindowVisible(hwnd):
+                return
+            if not win32gui.IsWindowEnabled(hwnd):
+                return
+            title = win32gui.GetWindowText(hwnd)
+            if not title or len(title) < 2:
+                return
+            cls = win32gui.GetClassName(hwnd)
+            if cls in ('Shell_TrayWnd', 'Progman', 'WorkerW'):
+                return
+            results.append((hwnd, title))
 
-    win32gui.EnumWindows(_cb, None)
-    return results
+        win32gui.EnumWindows(_cb, None)
+        return results
+    else:
+        # macOS: use Quartz
+        try:
+            from Quartz import CGWindowListCopyWindowInfo, kCGWindowListOptionOnScreenOnly, kCGNullWindowID, kCGWindowListExcludeDesktopElements
+            import Quartz
+            opts = kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements
+            wl = CGWindowListCopyWindowInfo(opts, kCGNullWindowID)
+            results = []
+            for w in wl:
+                title = w.get('kCGWindowName') or w.get('kCGWindowOwnerName', '')
+                if not title or len(title) < 2:
+                    continue
+                layer = w.get('kCGWindowLayer', 0)
+                if layer != 0:
+                    continue   # skip menu bar, dock, etc.
+                wid = w.get('kCGWindowNumber', 0)
+                results.append((wid, title))
+            return results
+        except Exception:
+            return []
 
 
 def list_input_devices() -> list[tuple[int | None, str]]:
@@ -90,77 +114,134 @@ def list_input_devices() -> list[tuple[int | None, str]]:
     return entries
 
 
-class ScreenCapture:
-    """
-    Capture a region of the screen using Win32 BitBlt.
+if sys.platform == 'win32':
+    class ScreenCapture:
+        """
+        Capture a region of the screen using Win32 BitBlt.
 
-    Parameters
-    ----------
-    hwnd  : 0 = primary monitor, else a specific window handle.
-    mon   : (left, top, width, height). Pass None to auto-detect.
-    """
+        Parameters
+        ----------
+        hwnd  : 0 = primary monitor, else a specific window handle.
+        mon   : (left, top, width, height). Pass None to auto-detect.
+        """
 
-    def __init__(self, hwnd: int = 0, mon=None):
-        self.hwnd = hwnd
-        if mon is not None:
-            self._l, self._t, self._w, self._h = mon
-        elif hwnd:
-            rect = win32gui.GetWindowRect(hwnd)
-            self._l = rect[0]
-            self._t = rect[1]
-            self._w = max(2, rect[2] - rect[0])
-            self._h = max(2, rect[3] - rect[1])
-        else:
-            user32 = ctypes.windll.user32
-            self._l = 0
-            self._t = 0
-            self._w = user32.GetSystemMetrics(0)
-            self._h = user32.GetSystemMetrics(1)
+        def __init__(self, hwnd: int = 0, mon=None):
+            self.hwnd = hwnd
+            if mon is not None:
+                self._l, self._t, self._w, self._h = mon
+            elif hwnd:
+                rect = win32gui.GetWindowRect(hwnd)
+                self._l = rect[0]
+                self._t = rect[1]
+                self._w = max(2, rect[2] - rect[0])
+                self._h = max(2, rect[3] - rect[1])
+            else:
+                user32 = ctypes.windll.user32
+                self._l = 0
+                self._t = 0
+                self._w = user32.GetSystemMetrics(0)
+                self._h = user32.GetSystemMetrics(1)
 
-        # yuv420p requires even dimensions
-        self._w -= self._w % 2
-        self._h -= self._h % 2
+            # yuv420p requires even dimensions
+            self._w -= self._w % 2
+            self._h -= self._h % 2
 
-        self._desk = win32gui.GetDesktopWindow()
-        self._hdcSrc = None
-        self._open()
+            self._desk = win32gui.GetDesktopWindow()
+            self._hdcSrc = None
+            self._open()
 
-    def _open(self):
-        src = self.hwnd if self.hwnd else self._desk
-        self._hdcSrc = win32gui.GetWindowDC(src)
-        self._mfcDC  = win32ui.CreateDCFromHandle(self._hdcSrc)
-        self._saveDC = self._mfcDC.CreateCompatibleDC()
-        self._bmp    = win32ui.CreateBitmap()
-        self._bmp.CreateCompatibleBitmap(self._mfcDC, self._w, self._h)
-        self._saveDC.SelectObject(self._bmp)
-
-    def grab(self) -> np.ndarray:
-        """Return (H, W, 3) uint8 BGR array."""
-        src = self.hwnd if self.hwnd else self._desk
-        try:
-            self._saveDC.BitBlt(
-                (0, 0), (self._w, self._h),
-                self._mfcDC, (self._l, self._t),
-                win32con.SRCCOPY,
-            )
-        except Exception:
-            return np.zeros((self._h, self._w, 3), dtype=np.uint8)
-        raw = self._bmp.GetBitmapBits(True)
-        arr = np.frombuffer(raw, dtype=np.uint8).reshape(self._h, self._w, 4)
-        return arr[:, :, :3].copy()
-
-    def size(self) -> tuple[int, int]:
-        return self._w, self._h
-
-    def close(self):
-        try:
-            win32gui.DeleteObject(self._bmp.GetHandle())
-            self._saveDC.DeleteDC()
-            self._mfcDC.DeleteDC()
+        def _open(self):
             src = self.hwnd if self.hwnd else self._desk
-            win32gui.ReleaseDC(src, self._hdcSrc)
-        except Exception:
-            pass
+            self._hdcSrc = win32gui.GetWindowDC(src)
+            self._mfcDC  = win32ui.CreateDCFromHandle(self._hdcSrc)
+            self._saveDC = self._mfcDC.CreateCompatibleDC()
+            self._bmp    = win32ui.CreateBitmap()
+            self._bmp.CreateCompatibleBitmap(self._mfcDC, self._w, self._h)
+            self._saveDC.SelectObject(self._bmp)
+
+        def grab(self) -> np.ndarray:
+            """Return (H, W, 3) uint8 BGR array."""
+            src = self.hwnd if self.hwnd else self._desk
+            try:
+                self._saveDC.BitBlt(
+                    (0, 0), (self._w, self._h),
+                    self._mfcDC, (self._l, self._t),
+                    win32con.SRCCOPY,
+                )
+            except Exception:
+                return np.zeros((self._h, self._w, 3), dtype=np.uint8)
+            raw = self._bmp.GetBitmapBits(True)
+            arr = np.frombuffer(raw, dtype=np.uint8).reshape(self._h, self._w, 4)
+            return arr[:, :, :3].copy()
+
+        def size(self) -> tuple[int, int]:
+            return self._w, self._h
+
+        def close(self):
+            try:
+                win32gui.DeleteObject(self._bmp.GetHandle())
+                self._saveDC.DeleteDC()
+                self._mfcDC.DeleteDC()
+                src = self.hwnd if self.hwnd else self._desk
+                win32gui.ReleaseDC(src, self._hdcSrc)
+            except Exception:
+                pass
+
+else:
+    class ScreenCapture:
+        """macOS screen capture using mss."""
+        def __init__(self, hwnd: int = 0, mon=None):
+            import mss as _mss
+            self._sct = _mss.mss()
+            if mon is not None:
+                self._l, self._t, self._w, self._h = mon
+            elif hwnd:
+                # hwnd is a Quartz window ID; get its bounds
+                try:
+                    from Quartz import CGWindowListCopyWindowInfo, kCGWindowListOptionIncludingWindow, kCGNullWindowID
+                    wl = CGWindowListCopyWindowInfo(
+                        0x00000001,  # kCGWindowListOptionIncludingWindow
+                        hwnd)
+                    if wl:
+                        b = wl[0].get('kCGWindowBounds', {})
+                        self._l = int(b.get('X', 0))
+                        self._t = int(b.get('Y', 0))
+                        self._w = max(2, int(b.get('Width', 100)))
+                        self._h = max(2, int(b.get('Height', 100)))
+                    else:
+                        raise ValueError('window not found')
+                except Exception:
+                    m = self._sct.monitors[1]
+                    self._l, self._t = m['left'], m['top']
+                    self._w, self._h = m['width'], m['height']
+            else:
+                m = self._sct.monitors[1]   # [0]=all monitors combined, [1]=primary
+                self._l = m['left']
+                self._t = m['top']
+                self._w = m['width']
+                self._h = m['height']
+            self._w -= self._w % 2
+            self._h -= self._h % 2
+            self._monitor = {'left': self._l, 'top': self._t,
+                             'width': self._w, 'height': self._h}
+
+        def grab(self) -> 'np.ndarray':
+            try:
+                img = self._sct.grab(self._monitor)
+                # mss returns BGRA; drop alpha → BGR
+                arr = np.frombuffer(img.bgra, dtype=np.uint8).reshape(img.height, img.width, 4)
+                return arr[:, :, :3].copy()
+            except Exception:
+                return np.zeros((self._h, self._w, 3), dtype=np.uint8)
+
+        def size(self) -> tuple:
+            return self._w, self._h
+
+        def close(self):
+            try:
+                self._sct.close()
+            except Exception:
+                pass
 
 
 # ── Recorder ─────────────────────────────────────────────────────────────────
@@ -430,11 +511,26 @@ class RegionSelectorOverlay:
         self._build()
 
     def _build(self) -> None:
-        user32 = ctypes.windll.user32
-        vx = user32.GetSystemMetrics(76)
-        vy = user32.GetSystemMetrics(77)
-        vw = user32.GetSystemMetrics(78)
-        vh = user32.GetSystemMetrics(79)
+        if sys.platform == 'win32':
+            user32 = ctypes.windll.user32
+            vx = user32.GetSystemMetrics(76)
+            vy = user32.GetSystemMetrics(77)
+            vw = user32.GetSystemMetrics(78)
+            vh = user32.GetSystemMetrics(79)
+        else:
+            # macOS: use mss to get bounding box of all monitors
+            try:
+                import mss as _mss
+                with _mss.mss() as sct:
+                    all_mon = sct.monitors[0]  # index 0 = all monitors combined
+                    vx = all_mon['left']
+                    vy = all_mon['top']
+                    vw = all_mon['width']
+                    vh = all_mon['height']
+            except Exception:
+                vx, vy = 0, 0
+                vw = self._root.winfo_screenwidth()
+                vh = self._root.winfo_screenheight()
         self._vx, self._vy, self._vw, self._vh = vx, vy, vw, vh
 
         from PIL import ImageGrab, ImageEnhance

@@ -39,6 +39,10 @@ hiddenimports = [
     # clipboard
     'pyperclip',
     'psutil',
+    # screen / GIF recording
+    'av',
+    'mss',
+    'pyspellchecker',
 ]
 hiddenimports += collect_submodules('groq')
 hiddenimports += collect_submodules('cerebras_cloud_sdk')
@@ -99,12 +103,15 @@ app = BUNDLE(
     info_plist={
         'CFBundleName':                   'Hotkeys',
         'CFBundleDisplayName':            'Hotkeys',
-        'CFBundleShortVersionString':     '2.0.0',
-        'CFBundleVersion':                '2.0.0',
+        'CFBundleShortVersionString':     '3.0.0',
+        'CFBundleVersion':                '3.0.0',
         'NSHighResolutionCapable':        True,
         'NSMicrophoneUsageDescription':   'Hotkeys uses the microphone for voice-to-text transcription.',
         'NSAppleEventsUsageDescription':  'Hotkeys uses Apple Events to type text into other apps.',
+        'NSScreenCaptureUsageDescription': 'Hotkeys uses screen capture to record video and GIFs.',
         # LSUIElement = True hides the dock icon (menu-bar / tray app)
         'LSUIElement':                    True,
+        # Note: screen recording entitlement (com.apple.security.screen-recording)
+        # must also be set in the entitlements .plist passed to codesign.
     },
 )
