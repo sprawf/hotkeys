@@ -5,7 +5,7 @@
 Select text anywhere → press a hotkey → AI rewrites it and pastes it back in under a second.  
 Works in Gmail, Notion, Slack, Word, VS Code, Discord — every app on your computer.
 
-[![Windows](https://img.shields.io/badge/Windows-Download_v3.0-0078D6?style=for-the-badge&logo=windows)](https://github.com/sprawf/hotkeys/releases/download/v3.0.0/Hotkeys-v3.0-win64.zip)
+[![Windows](https://img.shields.io/badge/Windows-Download_v3.1-0078D6?style=for-the-badge&logo=windows)](https://github.com/sprawf/hotkeys/releases/download/v3.0.0/Hotkeys-v3.1-win64.zip)
 [![Windows v2](https://img.shields.io/badge/Windows-v2.0_(legacy)-555555?style=for-the-badge&logo=windows)](https://github.com/sprawf/hotkeys/releases/download/v2.0.0/Hotkeys-v2.0-win64.zip)
 [![Windows v1](https://img.shields.io/badge/Windows-v1.0_(legacy)-555555?style=for-the-badge&logo=windows)](https://github.com/sprawf/hotkeys/releases/download/v1.0.0/Hotkeys-v1.0-win64.zip)
 [![Mac](https://img.shields.io/badge/Mac-Download_v3.0-999999?style=for-the-badge&logo=apple)](https://github.com/sprawf/hotkeys/releases/download/v3.0.0/Hotkeys-mac.dmg)
@@ -82,7 +82,7 @@ These are just the starting point. Hit **+ Add** to write your own.
 
 ### ⊞ Windows — one click, no setup
 
-1. **[Download Hotkeys-v3.0-win64.zip](https://github.com/sprawf/hotkeys/releases/download/v3.0.0/Hotkeys-v3.0-win64.zip)**
+1. **[Download Hotkeys-v3.1-win64.zip](https://github.com/sprawf/hotkeys/releases/download/v3.0.0/Hotkeys-v3.1-win64.zip)**
 2. Extract the zip — you'll get a `Hotkeys` folder
 3. Open the folder and double-click `Hotkeys.exe`
 4. The ⚡ icon appears in your taskbar tray — you're done
