@@ -8,12 +8,12 @@ import time
 import tkinter as tk
 from tkinter.font import Font as TkFont
 
-from theme import ACCENT, OK, WARN, ERR, INFO, FONT_FAMILY, FONT_MONO
+from theme import ACCENT, OK, WARN, ERR, INFO, FONT_FAMILY, FONT_MONO, SURFACE, BORDER, TEXT_P
 
 # Pill styling
-_PILL_BG    = '#141414'
-_BORDER_CLR = '#2a2a2a'
-_TEXT_CLR   = '#f0f0f0'
+_PILL_BG    = SURFACE      # '#141414' — dark surface for pill background
+_BORDER_CLR = BORDER       # '#2a2a2a' — subtle separator border
+_TEXT_CLR   = TEXT_P       # '#f0f0f0' — primary text
 _TRANSP     = '#010101'    # Windows transparentcolor (near-black = transparent)
 _RADIUS     = 20
 _PAD_X      = 22
@@ -48,8 +48,9 @@ class OverlayWindow:
         self._tick     = False
         self._t0       = 0.0
         self._fnt             = TkFont(family=FONT_FAMILY, size=11)
-        self._fnt_mono        = TkFont(family='Consolas', size=11)
+        self._fnt_mono        = TkFont(family=FONT_MONO, size=11)
         self._safety_timer_id = None   # after() ID for the 30 s transcribe safety close
+        self._pulse_job       = None   # after() ID for chain step pulse animation
 
     # ── Refine pill states ────────────────────────────────────────────────────
 
@@ -379,7 +380,7 @@ class OverlayWindow:
         self._close()
         self._t0   = time.time()
         self._tick = True
-        self._build('🎞  GIF  0s  —  Shift+F3 to stop', _TEXT_CLR, '#7c3aed')
+        self._build('🎞  GIF  0s  —  Shift+F3 to stop', _TEXT_CLR, ACCENT)
         self._update_gif_recording()
 
     def _update_gif_recording(self) -> None:
@@ -393,15 +394,73 @@ class OverlayWindow:
         """GIF encoding in progress — brief amber pill."""
         self._tick = False
         self._close()
-        self._build('⏳  Saving GIF…', _TEXT_CLR, '#d97706')
+        self._build('⏳  Saving GIF…', _TEXT_CLR, WARN)
 
     def show_gif_capped(self, dur_s: int) -> None:
         """Duration cap hit — show notification, then auto-close."""
         self._tick = False
         self._close()
-        self._build(f'⏹  Max duration reached ({dur_s}s)', _TEXT_CLR, '#d97706')
+        self._build(f'⏹  Max duration reached ({dur_s}s)', _TEXT_CLR, WARN)
         if self._win:
             self._win.after(2500, self._close)
+
+    # ── Chain pill states ─────────────────────────────────────────────────────
+
+    def show_chain_step(self, step_num: int, total: int, label: str) -> None:
+        """Animated pulsing pill while a chain step is running."""
+        # Cancel any outstanding pulse timer before starting a new one (UI-1)
+        if self._pulse_job is not None:
+            try:
+                if self._win:
+                    self._win.after_cancel(self._pulse_job)
+            except Exception:
+                pass
+            self._pulse_job = None
+        self._tick = False
+        text = f'⛓  Step {step_num}/{total} — {label}…'
+        if self._win:
+            self._set_text(text)
+            self._set_bar(ACCENT)
+        else:
+            self._close()
+            self._build(text, _TEXT_CLR, ACCENT)
+        self._tick = True
+        self._pulse_phase = 0
+        self._update_chain_pulse()
+
+    def show_chain_done(self, name: str) -> None:
+        """Brief success pill after all chain steps finish."""
+        self._tick = False   # UI-2: stop pulse before transitioning to done state
+        if self._pulse_job is not None:
+            try:
+                if self._win:
+                    self._win.after_cancel(self._pulse_job)
+            except Exception:
+                pass
+            self._pulse_job = None
+        text = f'✓  Chain done — {name}'
+        if self._win:
+            self._set_text(text)
+            self._set_bar(OK)
+            self._win.after(3000, self._close)
+        else:
+            self._build(text, _TEXT_CLR, OK)
+            if self._win:
+                self._win.after(3000, self._close)
+
+    def hide(self) -> None:
+        """Public alias for _close — lets external callers hide the overlay."""
+        self._close()
+
+    def _update_chain_pulse(self) -> None:
+        """Alternate bar colour between ACCENT and ACCENTL to indicate activity."""
+        if not self._tick or self._win is None:
+            self._pulse_job = None
+            return
+        self._pulse_phase = getattr(self, '_pulse_phase', 0) + 1
+        clr = ACCENT if self._pulse_phase % 2 == 0 else '#9f67fa'
+        self._set_bar(clr)
+        self._pulse_job = self._win.after(500, self._update_chain_pulse)
 
     def _cancel_safety_timer(self) -> None:
         if self._safety_timer_id is not None:

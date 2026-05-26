@@ -64,6 +64,47 @@ def history_path() -> str:
     return os.path.join(appdata_dir(), 'history.json')
 
 
+def bookmarks_path() -> str:
+    return os.path.join(appdata_dir(), 'bookmarks.json')
+
+
+def notes_path() -> str:
+    return os.path.join(appdata_dir(), 'notes.json')
+
+
+def load_notes() -> list:
+    try:
+        with open(notes_path(), encoding='utf-8') as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except FileNotFoundError:
+        return []
+    except Exception:
+        logger.warning('Failed to load notes')
+        return []
+
+
+_MAX_NOTES = 500   # hard cap — oldest unpinned trimmed first, then oldest pinned
+
+
+def save_notes(notes: list) -> None:
+    if len(notes) > _MAX_NOTES:
+        # Keep all pinned notes first, then fill with the most-recent unpinned
+        pinned   = [n for n in notes if n.get('pinned')]
+        unpinned = [n for n in notes if not n.get('pinned')]
+        # Trim unpinned from the oldest end (front of list, which is oldest)
+        keep_unpinned = _MAX_NOTES - len(pinned)
+        if keep_unpinned < 0:
+            keep_unpinned = 0
+        notes = pinned + unpinned[-keep_unpinned:] if keep_unpinned else pinned
+        logger.info(f'Notes trimmed to {_MAX_NOTES} (cap reached)')
+    try:
+        with open(notes_path(), 'w', encoding='utf-8') as f:
+            json.dump(notes, f, ensure_ascii=False, indent=2)
+    except Exception:
+        logger.warning('Failed to save notes')
+
+
 def models_dir() -> str:
     """Return path to the whisper model folder (bundled or project-local)."""
     if getattr(sys, 'frozen', False):
@@ -85,11 +126,19 @@ DEFAULT_CONFIG: dict = {
     'active_provider': 'cerebras',   # fastest out of the box
     'autostart':       True,
     'push_to_talk':    False,
+    'notes_geometry':  '',           # saved geometry for Quick Notes window (WxH+X+Y)
     'hotkeys': {
         'refine':       'alt+shift+w',
         'library':      'alt+shift+e',
         'whisper':      'ctrl+enter',
         'undo_refine':  'alt+shift+z',
+        'macro_record': 'shift+f1',
+        'recorder':     'shift+f2',
+        'gif_record':   'shift+f3',
+        'ask':          'shift+f4',
+        'web':          'shift+f5',
+        'chain':        'shift+f6',
+        'notes':        'shift+f7',
     },
     'providers': {
         'local':    {'model_id': 'Qwen/Qwen2.5-1.5B-Instruct-GGUF'},
@@ -350,3 +399,126 @@ def _set_autostart_mac(enabled: bool) -> None:
             plist_path.unlink(missing_ok=True)
     except Exception as e:
         logger.error(f'Autostart (Mac) error: {e}')
+
+
+# ── Bookmarks ─────────────────────────────────────────────────────────────────
+
+_DEFAULT_BOOKMARKS = [
+    {'name': 'YouTube',  'url': 'https://www.youtube.com',           'active': True},
+    {'name': 'Google',   'url': 'https://www.google.com',            'active': False},
+    {'name': 'EditPad',  'url': 'https://www.editpad.org',           'active': False},
+    {'name': 'X',        'url': 'https://www.x.com',                 'active': False},
+    {'name': 'WhatsApp', 'url': 'https://web.whatsapp.com',           'active': False},
+    {'name': 'GeoScore', 'url': 'geoscoreapp.pages.dev',             'active': False},
+]
+
+
+def load_bookmarks() -> list:
+    try:
+        with open(bookmarks_path(), encoding='utf-8') as f:
+            bms = json.load(f)
+        # Migrate: ensure every entry has an 'active' field
+        changed = False
+        for i, b in enumerate(bms):
+            if 'active' not in b:
+                b['active'] = (i == 0)
+                changed = True
+        # Ensure exactly one is active
+        active_count = sum(1 for b in bms if b.get('active'))
+        if active_count == 0 and bms:
+            bms[0]['active'] = True
+            changed = True
+        if changed:
+            save_bookmarks(bms)
+        return bms
+    except FileNotFoundError:
+        save_bookmarks(_DEFAULT_BOOKMARKS)
+        return copy.deepcopy(_DEFAULT_BOOKMARKS)
+    except Exception as e:
+        logger.error(f'Bookmarks load error: {e}')
+        return copy.deepcopy(_DEFAULT_BOOKMARKS)
+
+
+def save_bookmarks(bookmarks: list) -> None:
+    try:
+        with open(bookmarks_path(), 'w', encoding='utf-8') as f:
+            json.dump(bookmarks, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f'Bookmarks save error: {e}')
+
+
+def get_active_bookmark() -> dict | None:
+    """Return the currently active bookmark, or None."""
+    bms = load_bookmarks()
+    for b in bms:
+        if b.get('active'):
+            return b
+    return bms[0] if bms else None
+
+
+# ── Chains ─────────────────────────────────────────────────────────────────────
+
+def chains_path() -> str:
+    return os.path.join(appdata_dir(), 'chains.json')
+
+
+DEFAULT_CHAINS: list = [
+    {
+        'name':   'Refine & Translate',
+        'color':  '#B2EBF2',
+        'active': True,
+        'hotkey': '',
+        'steps': [
+            {
+                'label':  'Refine',
+                'prompt': 'Fix grammar, spelling, and clarity. Return only the improved text.',
+            },
+            {
+                'label':  'Translate',
+                'prompt': 'Translate the text to Spanish. Return only the translated text.',
+            },
+        ],
+    },
+    {
+        'name':   'Simplify & Tweet',
+        'color':  '#DCEDC8',
+        'active': False,
+        'hotkey': '',
+        'steps': [
+            {
+                'label':  'Simplify',
+                'prompt': 'Rewrite this in simple, clear language. Return only the simplified text.',
+            },
+            {
+                'label':  'Tweet',
+                'prompt': 'Compress this into a tweet (max 280 chars, no hashtags). Return only the tweet.',
+            },
+        ],
+    },
+]
+
+
+def load_chains() -> list:
+    path = chains_path()
+    if not os.path.exists(path):
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(DEFAULT_CHAINS, f, indent=2, ensure_ascii=False)
+            logger.info('Default chains written to AppData.')
+        except Exception as e:
+            logger.error(f'Chains init error: {e}')
+        return copy.deepcopy(DEFAULT_CHAINS)
+    try:
+        with open(path, encoding='utf-8-sig') as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f'Chains load error: {e}')
+        return copy.deepcopy(DEFAULT_CHAINS)
+
+
+def save_chains(chains: list) -> None:
+    try:
+        with open(chains_path(), 'w', encoding='utf-8') as f:
+            json.dump(chains, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f'Chains save error: {e}')

@@ -108,7 +108,8 @@ class Transcriber:
         self._queue         = queue.Queue()
         self._cancelled     = threading.Event()
 
-        self._preview_model = None
+        self._preview_model      = None
+        self._preview_model_lock = threading.Lock()   # guards concurrent use of _preview_model
         self._preview_queue = queue.Queue(maxsize=1)
 
         threading.Thread(target=self._worker,          daemon=True).start()
@@ -211,7 +212,38 @@ class Transcriber:
                 continue
             try:
                 lang = self._cfg.transcription.language or None
-                segments, info = self._preview_model.transcribe(
+                with self._preview_model_lock:
+                    segments, info = self._preview_model.transcribe(
+                        audio,
+                        language=lang,
+                        beam_size=1,
+                        temperature=0.0,
+                        condition_on_previous_text=False,
+                        vad_filter=True,
+                        no_speech_threshold=0.6,
+                    )
+                text = ''.join(s.text for s in segments).strip()
+                if text and not self._cancelled.is_set():
+                    self._on_preview(text)
+            except Exception as e:
+                logger.warning(f'Preview transcription error: {e}')
+
+    def transcribe_for_notes(self, audio) -> str:
+        """Synchronous transcription using the base preview model — for Quick Notes.
+        Blocks until complete. Safe to call from any thread."""
+        if self._preview_model is None:
+            # Wait up to 8 s for the model to finish loading
+            for _ in range(80):
+                import time as _time
+                _time.sleep(0.1)
+                if self._preview_model is not None:
+                    break
+            if self._preview_model is None:
+                return ''
+        try:
+            lang = self._cfg.transcription.language or None
+            with self._preview_model_lock:
+                segments, _ = self._preview_model.transcribe(
                     audio,
                     language=lang,
                     beam_size=1,
@@ -220,11 +252,10 @@ class Transcriber:
                     vad_filter=True,
                     no_speech_threshold=0.6,
                 )
-                text = ''.join(s.text for s in segments).strip()
-                if text and not self._cancelled.is_set():
-                    self._on_preview(text)
-            except Exception as e:
-                logger.warning(f'Preview transcription error: {e}')
+                return ''.join(s.text for s in segments).strip()
+        except Exception as e:
+            logger.warning(f'Notes transcription error: {e}')
+            return ''
 
     def submit(self, audio: np.ndarray):
         self._cancelled.clear()

@@ -176,7 +176,7 @@ def confirm(parent, title: str, message: str,
 # ── PopupMenu ────────────────────────────────────────────────────────────────
 
 class PopupMenu:
-    """Lightweight custom popup menu styled to match the app's dark theme.
+    """Lightweight custom popup menu with optional theme color overrides.
 
     Usage:
         m = PopupMenu(parent_window)
@@ -186,25 +186,36 @@ class PopupMenu:
         m.separator()
         m.add('Paste Image',  cmd_ocr)
         m.show(event.x_root, event.y_root)
+
+    Pass colors=dict(bg=..., border=..., text=..., dim=..., sep=...) to
+    override the default dark-theme palette.
     """
 
-    _BG       = '#1c1c1c'
-    _BORDER   = '#333333'
-    _TEXT     = '#e8e8e8'
-    _DIM      = '#484848'
-    _HOVER_BG = ACCENT        # purple highlight — same as rest of app
+    # Default dark-theme palette
+    _BG_D       = '#1c1c1c'
+    _BORDER_D   = '#333333'
+    _TEXT_D     = '#e8e8e8'
+    _DIM_D      = '#484848'
+    _SEP_D      = '#2a2a2a'
+
+    _HOVER_BG = ACCENT   # purple — same in both themes
     _HOVER_FG = '#ffffff'
-    _SEP      = '#2a2a2a'
     _FONT     = (FONT_FAMILY, 11)
     _PAD_X    = 14
     _ITEM_PY  = 5
     _MIN_W    = 140
 
-    def __init__(self, parent) -> None:
+    def __init__(self, parent, colors: dict | None = None) -> None:
         self._parent = parent
         self._items: list = []
         self._win: tk.Toplevel | None = None
         self._alive = [False]
+        c = colors or {}
+        self._BG     = c.get('bg',     self._BG_D)
+        self._BORDER = c.get('border', self._BORDER_D)
+        self._TEXT   = c.get('text',   self._TEXT_D)
+        self._DIM    = c.get('dim',    self._DIM_D)
+        self._SEP    = c.get('sep',    self._SEP_D)
 
     def add(self, label: str, command, enabled: bool = True) -> 'PopupMenu':
         self._items.append(('item', label, command, enabled))
@@ -268,25 +279,21 @@ class PopupMenu:
         sh = win.winfo_screenheight()
         win.geometry(f'+{min(x, sw - mw - 4)}+{min(y, sh - mh - 4)}')
 
-        # grab_set() routes all in-app mouse events to this window so any
-        # click outside the menu (on another widget) is redirected here and
-        # triggers dismissal via the <ButtonRelease-1> binding on win.
-        # This is far more reliable than <FocusOut> which fires immediately
-        # on overrideredirect windows and kills the menu before it's seen.
+        # grab_set() routes all in-app mouse events to this window.
+        # We skip focus_force(): on Windows it never gets OS focus on an
+        # overrideredirect window, which causes immediate <FocusOut> and
+        # self-destruction before the user can see the menu.
         try:
             win.grab_set()
         except Exception:
             pass
-        # Click on win background or redirected outside click → dismiss.
-        # <ButtonRelease-3> is intentionally NOT bound here: grab_set routes
-        # the release of the right-click that opened this menu to win, which
-        # would immediately kill it before the user sees anything.
+        # Dismiss on left-click outside items, or Escape.
+        # We intentionally do NOT bind <ButtonRelease-3>: the normal right-click
+        # release happens 80–200 ms after the press, so any timed delay is
+        # unreliable and causes the menu to vanish the moment the user lets go.
+        # Standard Windows UX: left-click selects/dismisses, Escape cancels.
         win.bind('<ButtonRelease-1>', lambda e: self._dismiss())
         win.bind('<Escape>',          lambda e: self._dismiss())
-        # Fallback: clicking outside the whole app (another application's
-        # window) doesn't trigger grab_set, but does cause FocusOut.
-        win.bind('<FocusOut>', lambda e: win.after(150, self._dismiss))
-        win.focus_force()
 
     def _dismiss(self) -> None:
         if not self._alive[0]:
@@ -359,12 +366,18 @@ class Tooltip:
             relief='flat',
         )
         lbl.pack()
-        # Position below the widget, horizontally centred on it
+        # Position above the widget (avoids overlapping window content below tabs)
+        # Falls back to below if not enough screen space above.
         self._win.update_idletasks()
         tw = self._win.winfo_reqwidth()
+        th = self._win.winfo_reqheight()
         ww = self._widget.winfo_width()
+        sw = self._win.winfo_screenwidth()
         x  = wx + max(0, (ww - tw) // 2)
-        y  = wy + wh + 4
+        x  = min(x, sw - tw - 4)   # clamp to screen right edge
+        y  = wy - th - 6            # above the widget
+        if y < 0:
+            y = wy + wh + 4         # not enough room above → fall back to below
         self._win.geometry(f'+{x}+{y}')
 
     def _hide(self) -> None:

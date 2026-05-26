@@ -39,3 +39,33 @@ def play_stop():
     """Single longer soft vibration — signals recording has ended."""
     pulse = _vibration(90.0, 0.18, amplitude=0.24)
     _play_async(pulse)
+
+
+def play_flip(reverse: bool = False) -> None:
+    """Crisp paper page-flip whoosh.
+
+    forward (default) — high → mid frequency sweep, feels like turning a page ahead.
+    reverse           — mid → high frequency sweep, feels like going back.
+    """
+    duration = 0.11
+    n = int(SAMPLE_RATE * duration)
+    t = np.linspace(0, duration, n, endpoint=False)
+
+    # Frequency chirp: linear sweep from f_start → f_end
+    f_start, f_end = (1800.0, 600.0) if not reverse else (600.0, 1800.0)
+    freq = np.linspace(f_start, f_end, n)
+    phase = np.cumsum(2 * np.pi * freq / SAMPLE_RATE)
+    wave = np.sin(phase).astype(np.float32)
+
+    # Envelope: sharp attack, exponential decay (feels like a quick flick)
+    attack = int(0.008 * SAMPLE_RATE)
+    envelope = np.exp(-t * 22)
+    envelope[:attack] *= np.linspace(0, 1, attack)
+    wave *= (envelope * 0.32).astype(np.float32)
+
+    # Thin high-frequency rustle layered on top (paper texture)
+    rustle_freq = np.linspace(3400.0, 1200.0, n) if not reverse else np.linspace(1200.0, 3400.0, n)
+    rustle_phase = np.cumsum(2 * np.pi * rustle_freq / SAMPLE_RATE)
+    rustle = (np.sin(rustle_phase) * envelope * 0.13).astype(np.float32)
+
+    _play_async(wave + rustle)

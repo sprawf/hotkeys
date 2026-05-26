@@ -27,6 +27,7 @@ It sits quietly in your system tray and gives you a full toolkit:
 | ✍️ **AI Text Refiner** | Select any text, press a hotkey — it's rewritten and pasted back in under a second |
 | ⌨️ **Custom Prompt Hotkeys** | Write any instruction, assign it F1–F12, fire it from any app instantly |
 | 🎙️ **Voice to Text** | Hold a hotkey, speak, your words appear wherever your cursor is — fully offline |
+| 📝 **Quick Notes** | Floating scratchpad window — capture thoughts, paste clips, drag to resize from any edge |
 | 🔴 **Macro Recorder** | Record any sequence of keystrokes and mouse clicks, replay it with one key |
 | 🎬 **Screen Recorder** | Capture any window or region of your screen as an MP4 |
 | 🎞️ **GIF Recorder** | Record any window or region as an animated GIF — perfect for sharing clips |
@@ -129,6 +130,13 @@ No Python. No pip. No API key. No installing anything. It just works.
 4. *(Optional)* Assign a hotkey via right-click → **Assign hotkey**
 5. Click **Save** — available everywhere immediately
 
+### Quick Notes (floating scratchpad)
+
+1. Press `Shift + F7` — a resizable notes window opens instantly
+2. Type your note or paste anything from the clipboard
+3. Press `Shift + F7` again (or `Esc`) to close — notes are saved automatically
+4. Drag any edge or corner to resize; drag the title bar to move
+
 ### Dictate text (voice to text)
 
 1. Place your cursor where you want the text
@@ -199,6 +207,8 @@ Everything is configurable. Open the library (`Alt+Shift+E`) and click the gear 
 | Record / stop / replay macro | `Shift + F1` |
 | Start / stop screen recorder | `Shift + F2` |
 | Start / stop GIF recorder | `Shift + F3` |
+| Explain selected text (AI ask) | `Shift + F4` |
+| Open / close Quick Notes | `Shift + F7` |
 | AI screenshot | `PrtSc` |
 
 All hotkeys are customisable in Settings. Per-prompt hotkeys are assigned per prompt via right-click → **Assign hotkey**.
@@ -253,6 +263,7 @@ Voice-to-text (Whisper) runs fully offline — no API key, no internet required.
 | 🎬 | **Screen recorder** | Capture any window or region as MP4, optional mic audio (`Shift+F2`) |
 | 🎞️ | **GIF recorder** | Record any window or region as an animated GIF (`Shift+F3`) |
 | 📸 | **AI screenshot** | Capture screen and ask AI anything about it (`PrtSc`) |
+| 📝 | **Quick Notes** | Floating scratchpad window, resizable from all edges, auto-saves (`Shift+F7`) |
 | 🔁 | **Hotkey watchdog** | Auto-recovers if hotkeys ever stop responding |
 | 🍎 | **macOS support** | Full feature parity on Mac — same plug-and-play experience |
 

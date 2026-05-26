@@ -39,7 +39,7 @@ from PIL import ImageTk
 
 from theme import (
     BG, SURFACE, SURF2, SURF3, ACCENT, ACCENTL,
-    TEXT_P, TEXT_S, FONT_FAMILY, PAD, PAD_SM, RADIUS_SM,
+    TEXT_P, TEXT_S, FONT_FAMILY, PAD, PAD_SM, RADIUS_SM, BORDER,
 )
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -628,7 +628,7 @@ class RegionSelectorOverlay:
         c.create_rectangle(bx, by, bx + tw, by + 18,
                            fill='#1a1a1a', outline='', tags=('badge',))
         c.create_text(bx + 7, by + 9, text=txt, fill='#ffffff',
-                      font=('Segoe UI', 9), anchor='w', tags=('badge',))
+                      font=(FONT_FAMILY, 9), anchor='w', tags=('badge',))
 
         # Confirm button below selection
         btn_y = min(y2 + 10, self._vh - 36)
@@ -801,7 +801,7 @@ class RecorderSetupDialog:
                  bg=SURFACE, fg=TEXT_P,
                  font=(FONT_FAMILY, 14, 'bold')).pack(anchor='w', padx=PAD, pady=PAD_SM)
 
-        tk.Frame(self.win, bg='#2a2a3e', height=1).pack(fill='x')
+        tk.Frame(self.win, bg=BORDER, height=1).pack(fill='x')
 
         body = tk.Frame(self.win, bg=BG, padx=PAD, pady=PAD)
         body.pack(fill='both')
@@ -910,14 +910,14 @@ class RecorderSetupDialog:
             ).pack(side='left', padx=(0, 8))
 
         # ── Footer ────────────────────────────────────────────────────────────
-        tk.Frame(self.win, bg='#2a2a3e', height=1).pack(fill='x')
+        tk.Frame(self.win, bg=BORDER, height=1).pack(fill='x')
         foot = tk.Frame(self.win, bg=SURFACE)
         foot.pack(fill='x')
 
         self._start_btn = tk.Button(
             foot, text='Start Recording',
-            bg=ACCENT, fg='#ffffff',
-            activebackground=ACCENTL, activeforeground='#ffffff',
+            bg=ACCENT, fg=TEXT_P,
+            activebackground=ACCENTL, activeforeground=TEXT_P,
             relief='flat', font=(FONT_FAMILY, 12, 'bold'),
             padx=16, pady=6, cursor='hand2',
             command=self._start,
@@ -972,7 +972,7 @@ class RecorderSetupDialog:
                                       bg=SURF2, fg=TEXT_S, cursor='arrow')
         else:
             self._start_btn.configure(state='normal',
-                                      bg=ACCENT, fg='#ffffff', cursor='hand2')
+                                      bg=ACCENT, fg=TEXT_P, cursor='hand2')
 
     def _pick_region(self) -> None:
         """Hide dialog, show full-screen region selector, restore dialog."""
@@ -1062,9 +1062,12 @@ def show_save_dialog(parent, tmp_path: str, dur: int, size_mb: float,
         default_dir = str(Path(appdata_dir()) / RECORDINGS_DIR_NAME)
     os.makedirs(default_dir, exist_ok=True)
 
-    import datetime
-    ts   = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    name = f'recording_{ts}.mp4'
+    # Auto-increment: find the next unused number (1, 2, 3, …)
+    existing = {Path(f).stem for f in Path(default_dir).glob('*.mp4')} if Path(default_dir).exists() else set()
+    n = 1
+    while str(n) in existing:
+        n += 1
+    name = f'{n}.mp4'
 
     dest = filedialog.asksaveasfilename(
         parent=parent,

@@ -33,10 +33,12 @@ WHISPER_LANGS = [
 
 
 class SettingsWindow:
-    def __init__(self, root, config: dict, on_save: Callable) -> None:
-        self.root    = root
-        self.config  = config
-        self.on_save = on_save
+    def __init__(self, root, config: dict, on_save: Callable,
+                 on_restore: Callable | None = None) -> None:
+        self.root       = root
+        self.config     = config
+        self.on_save    = on_save
+        self.on_restore = on_restore
         self._api_widgets: dict[str, dict]          = {}
         self._nav_btns:    dict[str, ctk.CTkButton] = {}
         self._panels:      dict[str, ctk.CTkFrame]  = {}
@@ -102,6 +104,11 @@ class SettingsWindow:
         ctk.CTkButton(foot, text='Cancel', width=80,  height=34, fg_color=SURF2,   hover_color=SURF3,
                       text_color=TEXT_P, font=(FONT_FAMILY, 10), corner_radius=RADIUS_SM,
                       command=self.hide).pack(side='right', pady=PAD_SM)
+        if self.on_restore:
+            ctk.CTkButton(foot, text='↺  Restore to Default', width=160, height=34,
+                          fg_color=SURF2, hover_color=ERR,
+                          text_color=TEXT_S, font=(FONT_FAMILY, 10), corner_radius=RADIUS_SM,
+                          command=self.on_restore).pack(side='left', padx=PAD, pady=PAD_SM)
 
         self._show_panel('general')
         self._center()
@@ -129,15 +136,8 @@ class SettingsWindow:
 
         # ── HOTKEYS (configurable) ────────────────────────────────────────────
         section('HOTKEYS')
-        HK_DEFAULTS = {
-            'refine':        'alt+shift+w',
-            'library':       'alt+shift+e',
-            'whisper':       'ctrl+enter',
-            'undo_refine':   'alt+shift+z',
-            'macro_record':  'shift+f1',
-            'recorder':      'shift+f2',
-            'gif_record':    'shift+f3',
-        }
+        from storage import DEFAULT_CONFIG as _DC
+        HK_DEFAULTS = _DC['hotkeys']
         hk_cfg = self.config.get('hotkeys', {})
         self._hotkey_vars: dict[str, tk.StringVar] = {}
 
@@ -149,6 +149,8 @@ class SettingsWindow:
             ('macro_record', 'Record / stop / play macro'),
             ('recorder',     'Toggle screen recording'),
             ('gif_record',   'Start / stop GIF recording'),
+            ('ask',          'Explain / ask a question'),
+            ('web',          'Open active web bookmark'),
         ]
         for action, label in hk_actions:
             row = ctk.CTkFrame(frame, fg_color='transparent')
@@ -661,10 +663,10 @@ class SettingsWindow:
             def _update() -> None:
                 if success:
                     btn.configure(text='✓ OK', fg_color=OK, hover_color=OK,
-                                  text_color='#ffffff', state='normal')
+                                  text_color=TEXT_P, state='normal')
                 else:
                     btn.configure(text='✗ Failed', fg_color=ERR, hover_color=ERR,
-                                  text_color='#ffffff', state='normal')
+                                  text_color=TEXT_P, state='normal')
                 self.win.after(3000, lambda: btn.configure(
                     text='Test', fg_color=SURF3, hover_color=SURF2, text_color=TEXT_P))
 

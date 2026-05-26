@@ -11,6 +11,10 @@ from pathlib import Path
 
 from macros.recorder import MacroRecorder
 
+# Hard cap on how many macros can be saved — keeps the library manageable and
+# prevents the macros/ folder from growing without bound.
+_MAX_SAVED_MACROS = 50
+
 
 class MacroLibrary:
     """Manages saved macros stored as JSON files on disk."""
@@ -48,7 +52,15 @@ class MacroLibrary:
         return ''
 
     def save(self, recorder: MacroRecorder, name: str, hotkey: str) -> dict:
-        """Save a recording to disk. Returns the metadata dict."""
+        """Save a recording to disk. Returns the metadata dict.
+
+        If the library is already at _MAX_SAVED_MACROS, the oldest macro
+        (by saved_at) is deleted first to make room.
+        """
+        if len(self._macros) >= _MAX_SAVED_MACROS:
+            oldest = min(self._macros, key=lambda m: m.get('saved_at', ''))
+            self.delete(oldest['id'])
+
         mid      = uuid.uuid4().hex[:8]
         saved_at = datetime.now().replace(microsecond=0).isoformat()
         data = {

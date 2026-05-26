@@ -1,0 +1,2623 @@
+"""
+Quick Notes — Shift+F7
+Simplenote-inspired: two-column, flat, minimal.
+Left  — searchable list of saved notes
+Right — editor (text / checklist / voice)
+"""
+import logging
+import sys
+import threading
+import time
+import tkinter as tk
+import uuid
+from datetime import datetime, timedelta
+from typing import Callable
+
+import customtkinter as ctk
+import numpy as np
+
+from theme import (
+    FONT_FAMILY,
+    OK, WARN, ERR,
+)
+from storage import load_notes, save_notes
+from dialogs import PopupMenu, confirm, alert
+
+logger = logging.getLogger(__name__)
+
+SAMPLE_RATE = 16_000
+_MAX_REC_S  = 180          # 3-min hard cap on voice recording
+_MAX_RENDERED = 250        # max note rows rendered in list (virtual perf cap)
+
+_W, _H  = 1216, 796        # window size — matches Claude desktop app
+_LIST_W = 300              # left panel fixed width
+
+# ── Palette — left panel follows app theme; editor stays dark/neutral ─────────
+_WIN    = '#0e0e0e'        # outermost bg  (app BG)
+_LIST   = '#141414'        # left panel bg (app SURFACE)
+_EDIT   = '#1a1a1a'        # right editor bg
+_DIV    = '#2a2a2a'        # dividers      (app BORDER)
+_HOVER  = '#1e1e1e'        # row hover     (app SURF2)
+_SEL_BG = '#20163a'        # selected row  (accent-tinted dark)
+_SRCH   = '#1e1e1e'        # search bar bg (app SURF2)
+
+# App accent colours (match theme.py)
+_ACCENT  = '#7c3aed'       # primary purple
+_ACCENTL = '#9f67fa'       # light purple (pill text)
+_SURF2   = '#1e1e1e'       # pill bg
+_SURF3   = '#282828'       # pressed/active bg
+
+_SEL_EM = _ACCENT          # star/pin accent
+
+# Text
+_T1     = '#f0f0f0'        # primary text  (app TEXT_P)
+_T2     = '#909090'        # secondary     (app TEXT_S)
+_T3     = '#606060'        # dim / timestamps (app TEXT_D)
+
+# Status
+_ERR    = '#ef4444'
+_OK_C   = '#22c55e'
+_WARN_C = '#f59e0b'
+_BLUE   = '#60a5fa'
+
+# Active font family — switched to monospace in light mode
+_ACTIVE_FF = FONT_FAMILY   # updated by _set_theme
+
+# ── Palette presets (for light/dark theme switching) ─────────────────────────
+_DARK_PALETTE = dict(
+    _WIN='#0e0e0e', _LIST='#141414', _EDIT='#1a1a1a',
+    _DIV='#2a2a2a', _HOVER='#1e1e1e', _SEL_BG='#20163a',
+    _SRCH='#1e1e1e', _SURF2='#1e1e1e', _SURF3='#282828',
+    _T1='#f0f0f0', _T2='#909090', _T3='#606060',
+    _ACTIVE_FF=FONT_FAMILY,
+)
+_LIGHT_PALETTE = dict(
+    _WIN='#ffffff', _LIST='#f7f7f7', _EDIT='#ffffff',
+    _DIV='#e0e0e0', _HOVER='#f0f0f0', _SEL_BG='#ede9fe',
+    _SRCH='#ebebeb', _SURF2='#ebebeb', _SURF3='#e5e5e5',
+    _T1='#111111', _T2='#555555', _T3='#999999',
+    _ACTIVE_FF='Consolas',
+)
+
+# ── Color label palette (chip_hex, border_hex, name) ─────────────────────────
+NOTE_COLORS = [
+    (None,      None,      'None'),
+    ('#a78bfa', '#7c3aed', 'Purple'),
+    ('#60a5fa', '#2563eb', 'Blue'),
+    ('#4ade80', '#16a34a', 'Green'),
+    ('#f87171', '#dc2626', 'Red'),
+    ('#fbbf24', '#d97706', 'Amber'),
+]
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _normalize_paste(text: str) -> str:
+    """Strip heavy formatting from pasted text — plain body text only.
+
+    Handles clipboard content from Word, Google Docs, web pages, etc.:
+    • Normalise line endings  (\r\n / \r  → \n)
+    • Line/paragraph separators (U+2028/2029 → \n)
+    • Remove invisible/zero-width characters
+    • Non-breaking & narrow spaces → regular space
+    • Soft hyphen → remove
+    • Straighten smart / curly quotes
+    • Collapse runs of 3+ blank lines to a single blank line
+    """
+    import re
+
+    # Line endings
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+    text = text.replace(' ', '\n').replace(' ', '\n')
+
+    # Invisible / zero-width characters
+    for ch in ('​', '‌', '‍', '⁠', '﻿', '­'):
+        text = text.replace(ch, '')
+
+    # Non-breaking and other whitespace-like spaces → regular space
+    for ch in (' ', ' ', ' ', ' ', ' ',
+               ' ', ' ', '　', ' ', ' ',
+               ' ', ' ', ' ', ' ', ' '):
+        text = text.replace(ch, ' ')
+
+    # Smart / curly quotes → straight
+    text = text.replace('‘', "'").replace('’', "'")   # ' '
+    text = text.replace('“', '"').replace('”', '"')   # " "
+    text = text.replace('‚', ',').replace('„', '"')   # ‚ „
+    text = text.replace('‹', '<').replace('›', '>')   # ‹ ›
+    text = text.replace('«', '"').replace('»', '"')   # « »
+
+    # Collapse 3+ consecutive blank lines → one blank line
+    text = re.sub(r'\n{3,}', '\n\n', text)
+
+    return text
+
+
+def _rel_time(iso: str) -> str:
+    try:
+        dt = datetime.fromisoformat(iso)
+        d  = datetime.now() - dt
+        if d < timedelta(minutes=1): return 'now'
+        if d < timedelta(hours=1):   return f'{int(d.total_seconds()//60)}m'
+        if d < timedelta(days=1):    return f'{int(d.total_seconds()//3600)}h'
+        if d < timedelta(days=7):    return dt.strftime('%a')
+        return dt.strftime('%b %d')
+    except Exception:
+        return ''
+
+
+def _word_count(text: str) -> str:
+    n = len(text.split())
+    return f'{n}w' if n else ''
+
+
+def _note_title(note: dict) -> str:
+    # Unified notes: prefer text first line, then checklist, then voice
+    raw = note.get('text', '').strip()
+    if raw:
+        lines = [l.strip() for l in raw.splitlines() if l.strip()]
+        if lines:
+            return lines[0][:48]
+    items = note.get('items', [])
+    if items and items[0].get('text'):
+        return items[0]['text'][:48]
+    voice = note.get('voice', '').strip()
+    if voice:
+        return voice[:48]
+    return '(new note)'
+
+
+def _note_preview(note: dict) -> str:
+    # Unified notes: text body → checklist count → voice snippet
+    raw = note.get('text', '').strip()
+    if raw:
+        lines = [l.strip() for l in raw.splitlines() if l.strip()]
+        return lines[1][:58] if len(lines) > 1 else ''
+    items = note.get('items', [])
+    if items:
+        done = sum(1 for it in items if it.get('checked'))
+        return f'{done}/{len(items)} done'
+    voice = note.get('voice', '').strip()
+    if voice:
+        lines = voice.splitlines()
+        return lines[0][:58] if lines else ''
+    return ''
+
+
+def _split_text(text: str) -> tuple[str, str]:
+    """Split stored text into (title_line, body_rest)."""
+    if not text:
+        return '', ''
+    idx = text.find('\n')
+    if idx == -1:
+        return text.strip(), ''
+    return text[:idx].strip(), text[idx + 1:]
+
+
+def _attach_tooltip(widget, text: str, delay_ms: int = 500) -> None:
+    _job = [None]
+    _tip = [None]
+
+    def _show():
+        _job[0] = None
+        if _tip[0] is not None or not widget.winfo_exists():
+            return
+        x = widget.winfo_rootx() + widget.winfo_width() // 2
+        y = widget.winfo_rooty() + widget.winfo_height() + 4
+        win = tk.Toplevel(widget)
+        win.overrideredirect(True)
+        win.attributes('-topmost', True)
+        win.configure(bg='#1a1a1a')
+        tk.Label(win, text=text, bg='#1a1a1a', fg='#b0b0b0',
+                 font=(FONT_FAMILY, 9), padx=6, pady=2).pack()
+        win.update_idletasks()
+        sw = widget.winfo_screenwidth()
+        w  = win.winfo_width()
+        if x + w > sw - 8:
+            x = sw - w - 8
+        win.geometry(f'+{x}+{y}')
+        _tip[0] = win
+
+    def _hide():
+        if _job[0] is not None:
+            try: widget.after_cancel(_job[0])
+            except Exception: pass
+            _job[0] = None
+        if _tip[0] is not None:
+            try: _tip[0].destroy()
+            except Exception: pass
+            _tip[0] = None
+
+    def _on_enter(e):
+        _hide()
+        _job[0] = widget.after(delay_ms, _show)
+
+    widget.bind('<Enter>',         _on_enter,         add='+')
+    widget.bind('<Leave>',         lambda e: _hide(), add='+')
+    widget.bind('<ButtonPress-1>', lambda e: _hide(), add='+')
+
+
+# ── Checklist editor ──────────────────────────────────────────────────────────
+
+class _ChecklistEditor(ctk.CTkFrame):
+
+    def __init__(self, parent, items=None, **kw):
+        kw.setdefault('fg_color', 'transparent')
+        super().__init__(parent, **kw)
+        self._rows: list[tuple] = []
+        self._items = list(items) if items else [{'text': '', 'checked': False}]
+        self._render()
+
+    def get_items(self) -> list[dict]:
+        for i, (_, vc, vt, _) in enumerate(self._rows):
+            if i < len(self._items):
+                self._items[i]['text']    = vt.get()
+                self._items[i]['checked'] = bool(vc.get())
+        return [it for it in self._items if it['text'].strip()]
+
+    def focus_last(self) -> None:
+        if self._rows:
+            self._rows[-1][3].focus_set()
+
+    def _render(self) -> None:
+        for w in self.winfo_children():
+            w.destroy()
+        self._rows = []
+        for i, item in enumerate(self._items):
+            self._make_row(i, item)
+        self._make_add_btn()
+
+    def _make_row(self, idx: int, item: dict) -> None:
+        row = ctk.CTkFrame(self, fg_color='transparent')
+        row.pack(fill='x', pady=1)
+        row.columnconfigure(1, weight=1)
+
+        vc = tk.BooleanVar(value=bool(item.get('checked', False)))
+        cb = ctk.CTkCheckBox(
+            row, text='', variable=vc,
+            checkbox_width=15, checkbox_height=15, corner_radius=7,
+            fg_color=_BLUE, hover_color='#5a8adc', border_color='#404040',
+            command=lambda i=idx, v=vc: self._on_check(i, v.get()),
+        )
+        cb.grid(row=0, column=0, padx=(2, 8))
+
+        vt = tk.StringVar(value=item.get('text', ''))
+        entry = ctk.CTkEntry(
+            row, textvariable=vt,
+            font=(FONT_FAMILY, 13), fg_color='transparent',
+            border_width=0,
+            text_color=_T3 if item.get('checked') else _T1,
+        )
+        entry.grid(row=0, column=1, sticky='ew', padx=(0, 4))
+        entry.bind('<Return>',    lambda e, i=idx: self._enter(i))
+        entry.bind('<BackSpace>', lambda e, i=idx: self._backspace(i))
+        self._rows.append((row, vc, vt, entry))
+
+    def _make_add_btn(self) -> None:
+        ctk.CTkButton(
+            self, text='＋  Add item', width=90, height=22,
+            fg_color='transparent', hover_color=_HOVER,
+            text_color=_T3, font=(FONT_FAMILY, 11), corner_radius=3,
+            command=self._add_item,
+        ).pack(anchor='w', pady=(4, 0))
+
+    def _flush(self) -> None:
+        for i, (_, vc, vt, _) in enumerate(self._rows):
+            if i < len(self._items):
+                self._items[i]['text']    = vt.get()
+                self._items[i]['checked'] = bool(vc.get())
+
+    def _on_check(self, idx: int, checked: bool) -> None:
+        if idx < len(self._items): self._items[idx]['checked'] = checked
+        if idx < len(self._rows):
+            self._rows[idx][3].configure(text_color=_T3 if checked else _T1)
+
+    def _enter(self, idx: int) -> None:
+        self._flush()
+        self._items.insert(idx + 1, {'text': '', 'checked': False})
+        self._render()
+        if idx + 1 < len(self._rows):
+            self._rows[idx + 1][3].focus_set()
+
+    def _backspace(self, idx: int) -> None:
+        _, _, vt, _ = self._rows[idx]
+        if vt.get() == '' and len(self._items) > 1:
+            self._flush()
+            self._items.pop(idx)
+            self._render()
+            prev = max(0, idx - 1)
+            if prev < len(self._rows):
+                self._rows[prev][3].focus_set()
+
+    def _add_item(self) -> None:
+        self._flush()
+        self._items.append({'text': '', 'checked': False})
+        self._render()
+        self.focus_last()
+
+
+# ── Main window ───────────────────────────────────────────────────────────────
+
+class QuickNotesWindow(ctk.CTkToplevel):
+
+    def __init__(self, root: tk.Tk,
+                 transcribe_fn: Callable | None = None,
+                 on_close: Callable | None = None,
+                 mic_busy_fn: Callable | None = None,
+                 vision_extractor: Callable | None = None,
+                 provider=None,
+                 initial_geometry: str = '',
+                 on_geometry_change: Callable | None = None) -> None:
+        """
+        mic_busy_fn      — optional callable() -> bool; returns True when the main
+                           Whisper recorder is active. Quick Notes won't record while it's True.
+        vision_extractor — optional callable(img) -> str; Groq vision API extractor.
+        provider         — optional LLM provider with .refine(text, prompt) -> str.
+        """
+        super().__init__(root)
+        self._transcribe_fn    = transcribe_fn
+        self._provider         = provider
+        self._on_close            = on_close
+        self._mic_busy_fn         = mic_busy_fn
+        self._vision_extractor    = vision_extractor
+        self._on_geometry_change  = on_geometry_change
+        self._initial_geometry    = initial_geometry
+
+        # Editor state
+        self._mode    = 'text'
+        self._color   = None
+        self._pinned  = False
+        self._text_content     = ''
+        self._checklist_items  = [{'text': '', 'checked': False}]
+        self._voice_transcript = ''
+        self._editing_nid: str | None = None   # nid of note open in editor, or None for new
+        self._prev_note_nid: str | None = None # nid of note open before current (for swipe-back)
+
+        # OCR state
+        self._ocr_pending         = False
+        self._ocr_staged_img      = None
+        self._ocr_status_visible  = False
+        self._ocr_preview_visible = False
+        self._ocr_thumb_ref       = None   # PhotoImage GC guard
+
+        # Swipe gesture state
+        self._swipe_start_x        = 0
+        self._swipe_start_y        = 0
+        self._swipe_active         = False
+        self._swipe_btn1_down      = False   # track L button ourselves (state flags unreliable)
+        self._swipe_btn3_down      = False   # track R button ourselves
+        self._swipe_just_completed = False   # suppress spurious right-click after swipe
+
+        # Recording state
+        self._rec_state  = 'idle'
+        self._rec_stream = None
+        self._rec_frames: list = []
+        self._rec_start  = 0.0
+        self._pulse_job  = None
+
+        # Gesture undo stack
+        self._gesture_undo_stack: list = []
+
+        # Window maximize state
+        self._maximized   = False
+        self._restore_geo: str | None = None
+
+        # Drag
+        self._drag_ox = self._drag_oy = 0
+
+        # Resize drag start state (7-tuple: start_x, start_y, orig_w, orig_h, orig_wx, orig_wy, edge)
+        self._rsz = (0, 0, 0, 0, 0, 0, 'se')
+
+        # Search debounce
+        self._search_job = None
+
+        # Notes cache (avoids re-reading JSON on every keystroke)
+        self._notes_cache: list = []
+        self._notes_dirty = True
+
+        # Theme — apply light palette to module globals before _build()
+        self._theme = 'light'
+        _mod = sys.modules[__name__]
+        for _k, _v in _LIGHT_PALETTE.items():
+            setattr(_mod, _k, _v)
+
+        # Voice decide bar (inline recording confirmation)
+        self._voice_decide_bar = None
+        self._pending_audio    = None
+
+        # Drag-and-drop state
+        self._note_drag_nid: str | None = None   # note row being dragged to editor
+        self._drop_indicator     = None    # floating drop-target overlay
+
+        # Search placeholder tracking
+        self._srch_placeholder = True
+        self._selected_row_widgets: list = []  # widgets of currently selected note row
+        self._trash_expanded = False
+
+        # ── Window chrome ─────────────────────────────────────────────────────
+        self.withdraw()
+        self.overrideredirect(True)
+        self.attributes('-topmost', True)
+        self.configure(fg_color=_WIN)
+
+        self._build()
+        self._bind_keys()
+
+        self.update_idletasks()
+        if self._initial_geometry:
+            # Restore saved geometry, but clamp position to visible screen area
+            try:
+                self.geometry(self._initial_geometry)
+                self.update_idletasks()
+                # Clamp so window stays on screen
+                sw = self.winfo_screenwidth()
+                sh = self.winfo_screenheight()
+                wx, wy = self.winfo_x(), self.winfo_y()
+                ww, wh = self.winfo_width(), self.winfo_height()
+                x = max(0, min(wx, sw - ww))
+                y = max(0, min(wy, sh - wh))
+                self.geometry(f'+{x}+{y}')
+            except Exception:
+                self._initial_geometry = ''
+        if not self._initial_geometry:
+            sw = self.winfo_screenwidth()
+            sh = self.winfo_screenheight()
+            x  = (sw - _W) // 2
+            y  = max(40, (sh - _H) // 2)
+            self.geometry(f'{_W}x{_H}+{x}+{y}')
+        self.minsize(600, 400)
+
+        # Windows 11 rounded corners
+        try:
+            import ctypes as _ct
+            val = _ct.c_int(2)
+            _ct.windll.dwmapi.DwmSetWindowAttribute(
+                self.winfo_id(), 33, _ct.byref(val), _ct.sizeof(val))
+        except Exception:
+            pass
+
+        self.deiconify()
+        self.lift()
+        self._enable_native_resize()
+        self.after(80, self._focus_content)
+
+    # ── Build ─────────────────────────────────────────────────────────────────
+
+    def _build(self) -> None:
+        # 1px accent border via highlightthickness — drawn synchronously with
+        # the frame itself, so it never distorts during live OS-native resize.
+        outer = tk.Frame(self, bg=_WIN,
+                         highlightthickness=1,
+                         highlightbackground=_ACCENT,
+                         highlightcolor=_ACCENT)
+        outer.pack(fill='both', expand=True)
+
+        # Left panel (note list)
+        left = tk.Frame(outer, bg=_LIST, width=_LIST_W)
+        left.pack(side='left', fill='y')
+        left.pack_propagate(False)
+        self._build_left(left)
+
+        # Vertical divider
+        tk.Frame(outer, bg=_DIV, width=1).pack(side='left', fill='y')
+
+        # Right panel (editor)
+        right = tk.Frame(outer, bg=_EDIT)
+        right.pack(side='left', fill='both', expand=True)
+        self._build_right(right)
+
+    # ── Left panel ────────────────────────────────────────────────────────────
+
+    def _build_left(self, parent) -> None:
+        # Header
+        hdr = tk.Frame(parent, bg=_LIST, height=44)
+        hdr.pack(fill='x')
+        hdr.pack_propagate(False)
+        hdr.bind('<ButtonPress-1>', self._drag_start)
+        hdr.bind('<B1-Motion>',     self._drag_move)
+        hdr.bind('<Double-Button-1>', lambda e: self._toggle_maximize())
+
+        # Header label — app-style bold section title
+        tk.Label(hdr, text='Notes', bg=_LIST, fg=_T1,
+                 font=(FONT_FAMILY, 13, 'bold'),
+                 ).pack(side='left', padx=(14, 0), pady=12)
+
+        # New-note button — large, accent-filled, impossible to miss
+        nb = ctk.CTkButton(
+            hdr, text='+', width=32, height=32,
+            fg_color=_ACCENT, hover_color='#6d28d9',
+            text_color='#ffffff', font=(FONT_FAMILY, 15, 'bold'),
+            corner_radius=8, cursor='hand2',
+            anchor='center',
+            command=self._new_note,
+        )
+        nb.pack(side='right', padx=(0, 10), pady=6)
+        _attach_tooltip(nb, 'New note  (saves current)')
+
+        # Separator
+        tk.Frame(parent, bg=_DIV, height=1).pack(fill='x')
+
+        # Search bar — CTkEntry for rounded pill look
+        sf = tk.Frame(parent, bg=_LIST, pady=8, padx=10)
+        sf.pack(fill='x')
+
+        self._srch_entry = ctk.CTkEntry(
+            sf, height=28, corner_radius=6,
+            fg_color=_SRCH, border_color='#2a2a2a', border_width=1,
+            text_color=_T3, placeholder_text='Search notes…',
+            placeholder_text_color=_T3,
+            font=(FONT_FAMILY, 11),
+        )
+        self._srch_entry.pack(fill='x')
+        self._srch_entry.bind('<FocusIn>',    self._srch_in)
+        self._srch_entry.bind('<FocusOut>',   self._srch_out)
+        self._srch_entry.bind('<KeyRelease>', self._on_search_key)
+
+        # Separator
+        tk.Frame(parent, bg=_DIV, height=1).pack(fill='x')
+
+        # ── Small paste zone — just below search bar ────────────────────────
+        pz = tk.Frame(parent, bg=_LIST, height=26)
+        pz.pack(fill='x')
+        pz.pack_propagate(False)
+        pz_lbl = tk.Label(pz, text='  + Paste as note',
+                          bg=_LIST, fg=_T3, font=(FONT_FAMILY, 9),
+                          anchor='w', cursor='hand2')
+        pz_lbl.pack(fill='both', expand=True)
+        # Click on the label directly pastes; hover gives feedback
+        pz_lbl.bind('<Button-1>',  self._paste_to_list)
+        pz_lbl.bind('<Enter>',     lambda e: pz_lbl.configure(fg=_T2))
+        pz_lbl.bind('<Leave>',     lambda e: pz_lbl.configure(fg=_T3))
+        for w in (pz, pz_lbl):
+            w.bind('<Button-3>',  self._on_list_bg_rclick)
+            w.bind('<Control-v>', self._paste_to_list)
+            w.bind('<Control-V>', self._paste_to_list)
+        tk.Frame(parent, bg=_DIV, height=1).pack(fill='x')
+
+        # ── Trash toggle — bottom-pinned (36px, matches right-panel bottom bar) ─
+        self._trash_section = tk.Frame(parent, bg=_LIST, height=36)
+        self._trash_section.pack(side='bottom', fill='x')
+        self._trash_section.pack_propagate(False)
+        # Separator sits above the trash section — packed side='bottom' after the
+        # section so it appears just above it (same level as right-panel separator)
+        tk.Frame(parent, bg=_DIV, height=1).pack(side='bottom', fill='x')
+        self._trash_btn: tk.Label | None = None
+
+        # ── Scrollable note list (fills space above trash) ───────────────────
+        lf = tk.Frame(parent, bg=_LIST)
+        lf.pack(fill='both', expand=True)
+
+        self._list_canvas = tk.Canvas(lf, bg=_LIST, highlightthickness=0, bd=0)
+        self._list_canvas.pack(side='left', fill='both', expand=True)
+        # Focus canvas on click so it can receive Ctrl+V
+        self._list_canvas.bind('<Button-1>',
+            lambda e: self._list_canvas.focus_set(), add='+')
+        self._list_canvas.bind('<Control-v>', self._paste_to_list)
+        self._list_canvas.bind('<Control-V>', self._paste_to_list)
+        self._list_canvas.bind('<Button-3>',  self._on_list_bg_rclick)
+
+        self._list_inner = tk.Frame(self._list_canvas, bg=_LIST)
+        self._list_win_id = self._list_canvas.create_window(
+            (0, 0), window=self._list_inner, anchor='nw')
+
+        self._list_inner.bind('<Configure>',
+            lambda e: self._list_canvas.configure(
+                scrollregion=self._list_canvas.bbox('all')))
+        self._list_inner.bind('<Button-3>', self._on_list_bg_rclick)
+        def _on_canvas_resize(e):
+            self._list_canvas.itemconfigure(self._list_win_id, width=e.width)
+            # Stretch inner frame to at least the canvas height so
+            # the empty area below notes is always right-clickable.
+            inner_h = self._list_inner.winfo_reqheight()
+            if inner_h < e.height:
+                self._list_canvas.itemconfigure(
+                    self._list_win_id, height=e.height)
+        self._list_canvas.bind('<Configure>', _on_canvas_resize)
+        # Scroll routing: on Windows <MouseWheel> goes to the keyboard-focused widget,
+        # not the widget under the cursor. Intercept at the window level and forward
+        # to the canvas when the cursor is inside the list panel.
+        def _on_window_scroll(e):
+            try:
+                cx = self._list_canvas.winfo_rootx()
+                cy = self._list_canvas.winfo_rooty()
+                cw = self._list_canvas.winfo_width()
+                ch = self._list_canvas.winfo_height()
+                if cx <= e.x_root <= cx + cw and cy <= e.y_root <= cy + ch:
+                    self._list_canvas.yview_scroll(int(-1 * (e.delta / 120)), 'units')
+            except Exception:
+                pass
+
+        # Bind at the toplevel — fires for every scroll anywhere in the window
+        self.bind('<MouseWheel>', _on_window_scroll, add='+')
+
+        # Dummy enter/leave stores (no-ops now, kept so _make_note_row doesn't break)
+        self._list_enter_fn = lambda e: None
+        self._list_leave_fn = lambda e: None
+
+        self._refresh_list()
+
+    def _srch_in(self, _=None) -> None:
+        # CTkEntry handles its own placeholder — just update text color on focus
+        try: self._srch_entry.configure(text_color=_T1)
+        except Exception: pass
+
+    def _srch_out(self, _=None) -> None:
+        try:
+            val = self._srch_entry.get().strip()
+            self._srch_entry.configure(text_color=_T1 if val else _T3)
+        except Exception: pass
+
+    def _get_search(self) -> str:
+        try:
+            val = self._srch_entry.get().strip()
+            return val.lower() if val else ''
+        except Exception:
+            return ''
+
+    def _invalidate_notes_cache(self) -> None:
+        """Mark notes cache stale so next _refresh_list re-reads from disk."""
+        self._notes_dirty = True
+
+    def _rebuild_trash_section(self, trashed_notes: list) -> None:
+        """Rebuild the bottom-pinned trash toggle (always visible, 36px)."""
+        for w in self._trash_section.winfo_children():
+            w.destroy()
+        arrow = '▾' if self._trash_expanded else '▸'
+        if trashed_notes:
+            label = f'  {arrow} Trash  ({len(trashed_notes)})'
+            fg = _T2
+            cursor = 'hand2'
+        else:
+            label = f'  {arrow} Trash'
+            fg = _T3
+            cursor = 'arrow'
+        btn = tk.Label(
+            self._trash_section,
+            text=label, bg=_LIST, fg=fg,
+            font=(FONT_FAMILY, 10), cursor=cursor,
+        )
+        btn.pack(fill='both', expand=True)
+        if trashed_notes:
+            _toggle = lambda e: self._toggle_trash_section()
+            btn.bind('<Button-1>', _toggle)
+            self._trash_section.bind('<Button-1>', _toggle)
+            btn.bind('<Enter>', lambda e: btn.configure(fg=_T1))
+            btn.bind('<Leave>', lambda e: btn.configure(fg=_T2))
+
+    def _toggle_trash_section(self) -> None:
+        self._trash_expanded = not self._trash_expanded
+        self._refresh_list()
+
+    # ── Drag and drop ─────────────────────────────────────────────────────────
+
+    def _on_note_row_drag(self, event, nid: str) -> None:
+        """Note row dragged rightward into editor → show open indicator."""
+        try:
+            abs_x = event.widget.winfo_rootx() + event.x
+        except Exception:
+            return
+        win_x = abs_x - self.winfo_rootx()
+        if win_x > _LIST_W + 30:
+            if self._note_drag_nid != nid:
+                self._note_drag_nid = nid
+                self._show_note_drag_indicator(nid)
+        else:
+            if self._note_drag_nid is not None:
+                self._note_drag_nid = None
+                self._hide_note_drag_indicator()
+
+    def _on_window_mouse_release(self, event) -> None:
+        """Complete note-row drag to editor on mouse release."""
+        if self._note_drag_nid is not None:
+            nid = self._note_drag_nid
+            self._note_drag_nid = None
+            self._hide_note_drag_indicator()
+            rel_x = event.x_root - self.winfo_rootx()
+            if rel_x > _LIST_W + 10:
+                self._open_note(nid)
+
+    def _show_note_drag_indicator(self, nid: str) -> None:
+        """Show a pill in the editor area indicating the note will be opened."""
+        try:
+            if self._drop_indicator is None or not self._drop_indicator.winfo_exists():
+                self._drop_indicator = tk.Label(
+                    self._content_host,
+                    text='↗ Open note',
+                    bg=_ACCENT, fg='#ffffff',
+                    font=(FONT_FAMILY, 11, 'bold'),
+                    padx=12, pady=6,
+                )
+            self._drop_indicator.place(relx=0.5, rely=0.5, anchor='center')
+            self._drop_indicator.lift()
+        except Exception:
+            pass
+
+    def _hide_note_drag_indicator(self) -> None:
+        try:
+            if self._drop_indicator and self._drop_indicator.winfo_exists():
+                self._drop_indicator.place_forget()
+        except Exception:
+            pass
+
+    def _paste_to_list(self, event=None) -> str:
+        """Ctrl+V on the list panel — create a new note from clipboard text."""
+        try:
+            raw = self.clipboard_get()
+        except tk.TclError:
+            return 'break'
+        text = _normalize_paste(raw).strip()
+        if not text:
+            return 'break'
+        note = {
+            'id':         str(uuid.uuid4()),
+            'text':       text,
+            'items':      [{'text': '', 'checked': False}],
+            'voice':      '',
+            'color':      None,
+            'pinned':     False,
+            'created_at': datetime.now().isoformat(timespec='seconds'),
+        }
+        notes = load_notes()
+        notes.append(note)
+        save_notes(notes)
+        self._invalidate_notes_cache()
+        self._refresh_list()
+        logger.info('Quick note created from clipboard paste (%d chars)', len(text))
+        return 'break'
+
+    def _refresh_list(self) -> None:
+        self._search_job = None
+        for w in self._list_inner.winfo_children():
+            w.destroy()
+
+        # Load / refresh cache
+        if self._notes_dirty:
+            self._notes_cache = load_notes()
+            self._notes_dirty = False
+
+        # Auto-purge trash older than 30 days
+        _cutoff = datetime.now() - timedelta(days=30)
+        _purged = [n for n in self._notes_cache
+                   if not (n.get('trashed') and
+                           datetime.fromisoformat(n.get('trashed_at', '1970-01-01')) < _cutoff)]
+        if len(_purged) < len(self._notes_cache):
+            save_notes(_purged)
+            self._notes_cache = _purged
+        all_notes = self._notes_cache
+
+        active_notes  = [n for n in all_notes if not n.get('trashed')]
+        trashed_notes = [n for n in all_notes if n.get('trashed')]
+
+        q = self._get_search()
+        if q:
+            active_notes = [n for n in active_notes
+                            if q in n.get('text', '').lower()
+                            or q in n.get('voice', '').lower()
+                            or any(q in it.get('text', '').lower()
+                                   for it in n.get('items', []))
+                            or q in _note_title(n).lower()]
+
+        # Pinned first, then newest
+        pinned   = [n for n in reversed(active_notes) if n.get('pinned')]
+        unpinned = [n for n in reversed(active_notes) if not n.get('pinned')]
+        notes    = pinned + unpinned
+
+        # Auto-collapse trash view if it's now empty
+        if self._trash_expanded and not trashed_notes:
+            self._trash_expanded = False
+
+        if self._trash_expanded:
+            # Trash view: show ONLY trashed notes, no active notes
+            if not trashed_notes:
+                tk.Label(self._list_inner, text='Trash is empty',
+                         bg=_LIST, fg=_T3, font=(FONT_FAMILY, 11),
+                         ).pack(padx=14, pady=20, anchor='w')
+            else:
+                for note in reversed(trashed_notes):
+                    self._make_note_row(note)
+        else:
+            # Normal view: active notes only
+            if not notes:
+                if q:
+                    tk.Label(self._list_inner, text='No results',
+                             bg=_LIST, fg=_T3, font=(FONT_FAMILY, 11),
+                             ).pack(padx=14, pady=20, anchor='w')
+                else:
+                    # Empty state — show brief usage hints
+                    hint_frame = tk.Frame(self._list_inner, bg=_LIST)
+                    hint_frame.pack(fill='x', padx=14, pady=(20, 4))
+                    tk.Label(hint_frame, text='No notes yet',
+                             bg=_LIST, fg=_T2, font=(FONT_FAMILY, 12, 'bold'),
+                             anchor='w').pack(fill='x')
+                    hints = [
+                        'Click + New or start typing →',
+                        'Ctrl+V here to paste as note',
+                        'Right-click for more options',
+                    ]
+                    for h in hints:
+                        tk.Label(hint_frame, text=h,
+                                 bg=_LIST, fg=_T3, font=(FONT_FAMILY, 10),
+                                 anchor='w').pack(fill='x', pady=(4, 0))
+            else:
+                total = len(notes)
+                for note in notes[:_MAX_RENDERED]:
+                    self._make_note_row(note)
+                if total > _MAX_RENDERED:
+                    tk.Label(
+                        self._list_inner,
+                        text=f'Showing {_MAX_RENDERED} of {total} — search to filter',
+                        bg=_LIST, fg=_T3, font=(FONT_FAMILY, 9),
+                    ).pack(padx=14, pady=(4, 0), anchor='w')
+
+        # Spacer — always fills remaining height so right-click / Ctrl+V
+        # has a generous target area even when the note list is short.
+        # Small spacer so the last note isn't flush with the paste zone
+        spacer = tk.Frame(self._list_inner, bg=_LIST, height=8)
+        spacer.pack(fill='x')
+
+        # Trash toggle pinned to bottom (outside scroll area)
+        self._rebuild_trash_section(trashed_notes)
+
+        # Always reset scroll to top so deleting notes doesn't leave a gap
+        self._list_canvas.yview_moveto(0.0)
+
+    def _make_note_row(self, note: dict) -> None:
+        nid    = note.get('id', '')
+        title  = _note_title(note)
+        prev   = _note_preview(note)
+        ts     = _rel_time(note.get('created_at', ''))
+        ntype  = note.get('type', 'text')
+        color  = note.get('color')   # border_hex for coloured notes
+        pinned = note.get('pinned', False)
+
+        is_selected = (nid == self._editing_nid)
+        base_bg  = _SEL_BG if is_selected else _LIST
+
+        # ── Outer row — fixed height so next row snaps to the same Y position ──
+        row = tk.Frame(self._list_inner, bg=base_bg, cursor='hand2', height=58)
+        row.pack(fill='x')
+        row.pack_propagate(False)  # lock height regardless of content
+
+        # ── Left accent bar — always purple; custom color overrides ──────────
+        bar_color = color if color else _ACCENT
+        tk.Frame(row, bg=bar_color, width=3).pack(side='left', fill='y')
+
+        # ── Content area ─────────────────────────────────────────────────────
+        content = tk.Frame(row, bg=base_bg, padx=10, pady=7)
+        content.pack(side='left', fill='both', expand=True)
+
+        # Top line: [★] title
+        top = tk.Frame(content, bg=base_bg)
+        top.pack(fill='x')
+
+        pin_lbl = None
+        if pinned:
+            pin_lbl = tk.Label(top, text='★', bg=base_bg, fg=_ACCENT,
+                               font=(FONT_FAMILY, 9))
+            pin_lbl.pack(side='left', padx=(0, 3))
+
+        is_trashed  = note.get('trashed', False)
+        is_untitled = (title == '(new note)')
+        title_fg = _T3 if (is_trashed or is_untitled) else _T1
+
+        # Action button — pack side='right' BEFORE the expanding title label
+        # so Tkinter reserves its space first and it's never crowded out.
+        action_fn = (
+            (lambda i=nid: self._del_note_permanent(i)) if is_trashed
+            else (lambda i=nid: self._trash_note(i))
+        )
+        trash_cvs = tk.Canvas(top, width=16, height=18, bg=base_bg,
+                              highlightthickness=0, cursor='hand2')
+        trash_cvs.pack(side='right', padx=(2, 1))
+
+        title_lbl = tk.Label(top, text=title, bg=base_bg, fg=title_fg,
+                             font=(_ACTIVE_FF, 12), anchor='w')
+        title_lbl.pack(side='left', fill='x', expand=True, padx=(0, 6))
+
+        _trash_fg = ['#3a3a3a']  # mutable cell so closures below can update it
+
+        def _draw_trash(fg: str | None = None, bg: str | None = None) -> None:
+            if fg is not None:
+                _trash_fg[0] = fg
+            if bg is not None:
+                trash_cvs.configure(bg=bg)
+            trash_cvs.delete('all')
+            c = _trash_fg[0]
+            # Handle (short bar at top centre)
+            trash_cvs.create_line(5.5, 1.5, 10.5, 1.5, fill=c, width=1.5, capstyle='round')
+            # Lid (full-width bar)
+            trash_cvs.create_line(1, 5, 15, 5, fill=c, width=1.5, capstyle='round')
+            # Body rectangle
+            trash_cvs.create_rectangle(2, 6.5, 14, 17, outline=c, width=1.5)
+            # Three vertical stripes inside body
+            for lx in (5.0, 8.0, 11.0):
+                trash_cvs.create_line(lx, 9, lx, 15, fill=c, width=1.2)
+
+        _draw_trash()
+        trash_cvs.bind('<Button-1>', lambda e, fn=action_fn: fn())
+
+        # ── Bottom row: preview text  +  info pills ───────────────────────
+        bot = tk.Frame(content, bg=base_bg)
+        bot.pack(fill='x', pady=(3, 0))
+
+        prev_lbl = None
+        if prev:
+            prev_lbl = tk.Label(bot, text=prev, bg=base_bg, fg=_T2,
+                                font=(_ACTIVE_FF, 10), anchor='w')
+            prev_lbl.pack(side='left', fill='x', expand=True)
+
+        # ── Hover / selection state ───────────────────────────────────────────
+        tk_widgets = [row, content, top, bot, title_lbl]
+        if pin_lbl:  tk_widgets.append(pin_lbl)
+        if prev_lbl: tk_widgets.append(prev_lbl)
+        _active = [False]
+
+        hover_fg = _ERR  # 🗑 always red on hover (trash or permanent delete)
+
+        def _set_bg(bg):
+            for w in tk_widgets:
+                try: w.configure(bg=bg)
+                except Exception: pass
+            _draw_trash(bg=bg)
+
+        def _enter(e):
+            if _active[0]: return
+            _active[0] = True
+            if not is_selected:
+                _set_bg(_HOVER)
+                _draw_trash(fg='#5a5a5a')
+
+        def _leave(e):
+            try:
+                rx, ry = row.winfo_rootx(), row.winfo_rooty()
+                rw, rh = row.winfo_width(), row.winfo_height()
+                if rx <= row.winfo_pointerx() <= rx+rw and ry <= row.winfo_pointery() <= ry+rh:
+                    return
+            except Exception: pass
+            _active[0] = False
+            if not is_selected:
+                _set_bg(_LIST)
+                _draw_trash(fg='#3a3a3a')
+
+        for w in tk_widgets + [trash_cvs]:
+            w.bind('<Enter>', _enter, add='+')
+            w.bind('<Leave>', _leave, add='+')
+
+        trash_cvs.bind('<Enter>', lambda e, hfg=hover_fg: _draw_trash(fg=hfg) if _active[0] else _draw_trash(fg='#5a5a5a'), add='+')
+        trash_cvs.bind('<Leave>', lambda e: _draw_trash(fg=_T3) if _active[0] else _draw_trash(fg='#3a3a3a'), add='+')
+
+        # ── Click to open / right-click menu ─────────────────────────────────
+        def _click(e, i=nid):
+            self._open_note(i)
+
+        def _rclick(e, i=nid):
+            self._row_context_menu(e, i)
+
+        for w in tk_widgets:
+            w.bind('<Button-1>', _click,                  add='+')
+            w.bind('<Button-3>', _rclick,                 add='+')
+            w.bind('<Enter>',    self._list_enter_fn,     add='+')
+            w.bind('<Leave>',    self._list_leave_fn,     add='+')
+            w.bind('<B1-Motion>', lambda e, i=nid: self._on_note_row_drag(e, i), add='+')
+
+        # Thin separator
+        tk.Frame(self._list_inner, bg=_DIV, height=1).pack(fill='x')
+
+    def _del_note(self, nid: str) -> None:
+        self._trash_note(nid)
+
+    def _trash_note(self, nid: str) -> None:
+        # Work directly on the cache so refresh is instant (no race with bg save)
+        if self._notes_dirty:
+            self._notes_cache = load_notes()
+        notes = list(self._notes_cache)
+        for n in notes:
+            if n.get('id') == nid:
+                n['trashed']    = True
+                n['trashed_at'] = datetime.now().isoformat(timespec='seconds')
+                break
+        self._notes_cache = notes
+        self._notes_dirty = False
+        threading.Thread(target=lambda: save_notes(notes), daemon=True).start()
+        if self._editing_nid == nid:
+            self._editing_nid = None
+            self._reset_editor()
+        else:
+            self._refresh_list()
+
+    def _restore_note(self, nid: str) -> None:
+        if self._notes_dirty:
+            self._notes_cache = load_notes()
+        notes = list(self._notes_cache)
+        for n in notes:
+            if n.get('id') == nid:
+                n.pop('trashed', None)
+                n.pop('trashed_at', None)
+                break
+        self._notes_cache = notes
+        self._notes_dirty = False
+        threading.Thread(target=lambda: save_notes(notes), daemon=True).start()
+        self._refresh_list()
+
+    def _del_note_permanent(self, nid: str) -> None:
+        if self._notes_dirty:
+            self._notes_cache = load_notes()
+        notes = [n for n in self._notes_cache if n.get('id') != nid]
+        self._notes_cache = notes
+        self._notes_dirty = False
+        threading.Thread(target=lambda: save_notes(notes), daemon=True).start()
+        if self._editing_nid == nid:
+            self._editing_nid = None
+            self._reset_editor()
+        else:
+            self._refresh_list()
+
+    def _open_note(self, nid: str) -> None:
+        """Load an existing note into the editor for viewing / editing."""
+        if self._editing_nid == nid:
+            return  # already open
+        # Save any unsaved current draft first (new note only)
+        if self._editing_nid is None:
+            data = self._get_note_data()
+            if data:
+                self._save_current_as_new()
+        self._prev_note_nid = self._editing_nid   # remember for swipe-back
+        note = next((n for n in load_notes() if n.get('id') == nid), None)
+        if note is None:
+            return
+        self._editing_nid = nid
+        self._pinned      = bool(note.get('pinned', False))
+        self._color       = None
+
+        # ── Unified load with backwards compat ───────────────────────────────
+        ntype = note.get('type', 'text')   # legacy field
+        if ntype == 'checklist':
+            # Old format: items in 'items', text is serialized — ignore serialized text
+            self._text_content = ''
+            items = note.get('items')
+            if items:
+                self._checklist_items = [dict(it) for it in items]
+            else:
+                lines  = note.get('text', '').splitlines()
+                parsed = []
+                for l in lines:
+                    if l.startswith('☑ '):
+                        parsed.append({'text': l[2:], 'checked': True})
+                    elif l.startswith('☐ '):
+                        parsed.append({'text': l[2:], 'checked': False})
+                    else:
+                        parsed.append({'text': l, 'checked': False})
+                self._checklist_items = parsed or [{'text': '', 'checked': False}]
+            self._voice_transcript = note.get('voice', '')
+        elif ntype == 'voice':
+            # Old format: transcript stored in 'text' field
+            self._text_content     = ''
+            self._checklist_items  = [{'text': '', 'checked': False}]
+            self._voice_transcript = note.get('voice', '') or note.get('text', '')
+        else:
+            # Unified / plain text note
+            self._text_content    = note.get('text', '')
+            items = note.get('items')
+            self._checklist_items = (
+                [dict(it) for it in items] if items
+                else [{'text': '', 'checked': False}]
+            )
+            self._voice_transcript = note.get('voice', '')
+
+        # Update pin button
+        try: self._pin_btn.configure(fg='#d4aa00' if self._pinned else _T3)
+        except Exception: pass
+        self._show_panel()
+        self._refresh_list()   # re-render rows to highlight selected
+        self.after(30, self._focus_content)
+
+    def _save_current_as_new(self) -> None:
+        """Persist the current editor draft as a brand-new note (no nid)."""
+        data = self._get_note_data()
+        if not data:
+            return
+        note = {
+            'id':         str(uuid.uuid4()),
+            'text':       data['text'],
+            'items':      data['items'],
+            'voice':      data['voice'],
+            'color':      None,
+            'pinned':     self._pinned,
+            'created_at': datetime.now().isoformat(timespec='seconds'),
+        }
+        notes = load_notes()
+        notes.append(note)
+        self._invalidate_notes_cache()
+        save_notes(notes)
+
+    def _reset_editor(self) -> None:
+        """Clear editor back to a blank new-note state."""
+        self._editing_nid      = None
+        self._text_content     = ''
+        self._checklist_items  = [{'text': '', 'checked': False}]
+        self._voice_transcript = ''
+        self._color            = None
+        self._pinned           = False
+        try: self._pin_btn.configure(fg=_T3)
+        except Exception: pass
+        self._show_panel()
+        self._refresh_list()
+        self.after(30, self._focus_content)
+
+    def _popup(self) -> 'PopupMenu':
+        """Create a PopupMenu pre-coloured for the current light/dark theme."""
+        return PopupMenu(self, colors={
+            'bg':     _SURF2,
+            'border': _DIV,
+            'text':   _T1,
+            'dim':    _T3,
+            'sep':    _DIV,
+        })
+
+    def _new_note(self) -> None:
+        """Save current note (new draft or update existing), then open a fresh editor."""
+        self._prev_note_nid = self._editing_nid   # remember for swipe-back
+        data = self._get_note_data()
+        if data:
+            if self._editing_nid:
+                # Update the existing note in place
+                notes = load_notes()
+                for n in notes:
+                    if n.get('id') == self._editing_nid:
+                        n['text']   = data['text']
+                        n['items']  = data['items']
+                        n['voice']  = data['voice']
+                        n['pinned'] = self._pinned
+                        break
+                self._invalidate_notes_cache()
+                threading.Thread(target=lambda: save_notes(notes), daemon=True).start()
+                logger.info('Quick note updated via New')
+            else:
+                note = {
+                    'id':         str(uuid.uuid4()),
+                    'text':       data['text'],
+                    'items':      data['items'],
+                    'voice':      data['voice'],
+                    'color':      None,
+                    'pinned':     self._pinned,
+                    'created_at': datetime.now().isoformat(timespec='seconds'),
+                }
+                notes = load_notes()
+                notes.append(note)
+                self._invalidate_notes_cache()
+                threading.Thread(target=lambda: save_notes(notes), daemon=True).start()
+                logger.info('Quick note saved via New')
+
+        self._reset_editor()
+
+    # ── Right-click context menu (note rows) ──────────────────────────────────
+
+    def _on_list_bg_rclick(self, event) -> None:
+        """Right-click on empty list background — quick actions."""
+        try:
+            has_clip = bool(self.clipboard_get().strip())
+        except tk.TclError:
+            has_clip = False
+        (self._popup()
+            .add('New note',        self._new_note)
+            .add('Paste as note',   self._paste_to_list, enabled=has_clip)
+            .show(event.x_root, event.y_root))
+
+    def _row_context_menu(self, event, nid: str) -> None:
+        note = next((n for n in load_notes() if n.get('id') == nid), None)
+        if note is None:
+            return
+        pinned   = note.get('pinned', False)
+        trashed  = note.get('trashed', False)
+        m = self._popup()
+        if trashed:
+            m.add('Restore', lambda: self._restore_note(nid))
+            m.separator()
+            m.add('Delete permanently', lambda: self._del_note_permanent(nid))
+        else:
+            m.add('Open', lambda: self._open_note(nid), enabled=(self._editing_nid != nid))
+            m.separator()
+            m.add('Unpin' if pinned else 'Pin to top', lambda: self._toggle_note_pin(nid))
+            m.separator()
+            m.add('Move to Trash', lambda: self._trash_note(nid))
+        m.show(event.x_root, event.y_root)
+
+    def _toggle_note_pin(self, nid: str) -> None:
+        notes = load_notes()
+        for n in notes:
+            if n.get('id') == nid:
+                n['pinned'] = not n.get('pinned', False)
+                break
+        self._invalidate_notes_cache()
+        threading.Thread(target=lambda: save_notes(notes), daemon=True).start()
+        # If this note is open in the editor, update the in-memory pin state too
+        if self._editing_nid == nid:
+            self._pinned = not self._pinned
+            try: self._pin_btn.configure(fg='#d4aa00' if self._pinned else _T3)
+            except Exception: pass
+        self._refresh_list()
+
+    # ── OCR ───────────────────────────────────────────────────────────────────
+
+    _STATUS_H  = 26
+    _PREVIEW_H = 72
+
+    def _ocr_stage(self, img) -> None:
+        self._ocr_staged_img = img
+        self._ocr_show_preview(img)
+        self._ocr_show_status('↵ Enter to extract  ·  Esc to cancel', _T2, dismissable=True)
+
+    def _ocr_show_preview(self, img) -> None:
+        try:
+            from PIL import Image, ImageTk
+            w, h  = img.size
+            max_h = self._PREVIEW_H - 8
+            if h > max_h:
+                scale = max_h / h
+                img   = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+            self._ocr_thumb_ref = ImageTk.PhotoImage(img)
+            self._ocr_thumb_lbl.configure(image=self._ocr_thumb_ref)
+            if not self._ocr_preview_visible:
+                offset = -self._STATUS_H if self._ocr_status_visible else 0
+                self._ocr_preview_frame.place(
+                    x=0, rely=1.0, relwidth=1.0,
+                    height=self._PREVIEW_H, anchor='sw', y=offset,
+                )
+                self._ocr_preview_frame.lift()
+                self._ocr_preview_visible = True
+        except Exception:
+            pass
+
+    def _ocr_hide_preview(self) -> None:
+        try:
+            if self._ocr_preview_visible:
+                self._ocr_preview_frame.place_forget()
+                self._ocr_preview_visible = False
+        except Exception:
+            pass
+
+    def _ocr_show_status(self, text: str, color: str, dismissable: bool = False) -> None:
+        try:
+            self._ocr_status_lbl.configure(text=text, fg=color)
+            if dismissable:
+                self._ocr_dismiss_btn.pack(side='right', padx=(0, 4))
+            else:
+                self._ocr_dismiss_btn.pack_forget()
+            if not self._ocr_status_visible:
+                self._ocr_status_frame.place(
+                    x=0, rely=1.0, relwidth=1.0,
+                    height=self._STATUS_H, anchor='sw',
+                )
+                self._ocr_status_frame.lift()
+                self._ocr_status_visible = True
+                if self._ocr_preview_visible:
+                    self._ocr_preview_frame.place_configure(y=-self._STATUS_H)
+        except Exception as exc:
+            logger.error('quicknotes: _ocr_show_status: %s', exc)
+
+    def _ocr_hide_status(self) -> None:
+        self._ocr_staged_img = None
+        self._ocr_hide_preview()
+        try:
+            self._ocr_status_frame.place_forget()
+            self._ocr_status_visible = False
+        except Exception:
+            pass
+
+    def _on_ctrl_v(self, event) -> str | None:
+        from vision import get_clipboard_image
+        img, err = get_clipboard_image()
+        if err:
+            self._ocr_show_status(f'⚠  {err}', _WARN_C, dismissable=True)
+            return 'break'
+        if img is not None:
+            self._ocr_stage(img)
+            return 'break'
+        # No image — paste as normalized plain text
+        try:
+            raw = self.clipboard_get()
+        except tk.TclError:
+            return 'break'
+        text = _normalize_paste(raw)
+        tb = self._tb._textbox
+        # Clear placeholder if active (ph text lives inside the textbox)
+        if self._ph:
+            self._tb.delete('1.0', 'end')
+            self._tb.configure(text_color=_T1)
+            self._ph = False
+        else:
+            try:
+                tb.delete('sel.first', 'sel.last')
+            except tk.TclError:
+                pass
+        tb.insert('insert', text)
+        return 'break'
+
+    def _on_return_key(self, event) -> str | None:
+        if self._ocr_staged_img is not None:
+            img = self._ocr_staged_img
+            self._ocr_staged_img = None
+            self._ocr_hide_preview()
+            self._ocr_hide_status()
+            self._ocr_start(img=img)
+            return 'break'
+        return None
+
+    def _on_title_right_click(self, event) -> None:
+        w = event.widget
+        has_sel = bool(w.selection_present() if hasattr(w, 'selection_present') else False)
+        (self._popup()
+            .add('Cut',   lambda: w.event_generate('<<Cut>>'),   enabled=has_sel)
+            .add('Copy',  lambda: w.event_generate('<<Copy>>'),  enabled=has_sel)
+            .add('Paste', lambda: w.event_generate('<<Paste>>'))
+            .show(event.x_root, event.y_root))
+
+    def _on_editor_right_click(self, event) -> None:
+        # Suppress menu if L is still held, OR if a swipe just completed
+        if self._swipe_btn1_down or self._swipe_just_completed:
+            self._swipe_just_completed = False
+            return
+        import webbrowser, urllib.parse
+        w = event.widget
+        has_sel = bool(w.tag_ranges('sel'))
+        has_text = bool(self._tb_text())
+        can_proofread = bool(self._provider and getattr(self._provider, 'ready', False) and has_text)
+        proofread_label = 'Proofread selection' if has_sel else 'Proofread'
+
+        # Grab selected text for Google search label
+        sel_text = ''
+        if has_sel:
+            try:
+                sel_text = w.get('sel.first', 'sel.last').strip()
+            except tk.TclError:
+                pass
+        if sel_text:
+            label = f'Search Google for "{sel_text[:28]}…"' if len(sel_text) > 28 else f'Search Google for "{sel_text}"'
+        else:
+            label = 'Search Google'
+
+        def _search_google():
+            try:
+                q = w.get('sel.first', 'sel.last').strip()
+            except tk.TclError:
+                q = ''
+            if q:
+                webbrowser.open(f'https://www.google.com/search?q={urllib.parse.quote(q)}')
+
+        def _smart_paste():
+            from vision import get_clipboard_image
+            img, err = get_clipboard_image()
+            if err:
+                self._ocr_show_status(f'⚠  {err}', _WARN_C, dismissable=True)
+                return
+            if img is not None:
+                self._ocr_stage(img)
+            else:
+                w.event_generate('<<Paste>>')
+        (self._popup()
+            .add('Cut',          lambda: w.event_generate('<<Cut>>'),   enabled=has_sel)
+            .add('Copy',         lambda: w.event_generate('<<Copy>>'),  enabled=has_sel)
+            .add('Paste',        lambda: w.event_generate('<<Paste>>'))
+            .separator()
+            .add(label,          _search_google,                         enabled=has_sel)
+            .separator()
+            .add(proofread_label, self._proofread,                        enabled=can_proofread)
+            .separator()
+            .add('Paste & Extract Image', _smart_paste)
+            .show(event.x_root, event.y_root))
+
+    def _proofread(self) -> None:
+        """Proofread selected text (or full note if no selection) via LLM."""
+        if not self._provider or not getattr(self._provider, 'ready', False):
+            return
+        tb = self._tb._textbox
+        # Decide scope: selection if active, else full note
+        try:
+            sel_start = tb.index('sel.first')
+            sel_end   = tb.index('sel.last')
+            text      = tb.get(sel_start, sel_end)
+            selection = True
+        except tk.TclError:
+            text      = self._tb_text()
+            sel_start = sel_end = None
+            selection = False
+        if not text.strip():
+            return
+        self._set_status('Proofreading…', _BLUE)
+
+        def _run():
+            try:
+                result = self._provider.refine(
+                    text,
+                    'Proofread the following text. Fix spelling, grammar, and '
+                    'punctuation errors. Preserve the original meaning, tone, '
+                    'line breaks, and formatting. Return ONLY the corrected text '
+                    '— no explanations, no commentary.',
+                )
+            except Exception as exc:
+                self.after(0, lambda: self._set_status(f'⚠ Proofread failed: {exc}', _ERR))
+                return
+
+            def _apply():
+                try:
+                    if selection:
+                        tb.delete(sel_start, sel_end)
+                        tb.insert(sel_start, result.strip())
+                    else:
+                        tb.delete('1.0', 'end')
+                        tb.insert('1.0', result.strip())
+                    self._ph = False
+                    self._tb.configure(text_color=_T1)
+                    self._set_status('✓ Proofread done', _OK_C)
+                    self.after(2000, lambda: self._set_status(''))
+                except Exception:
+                    pass
+            self.after(0, _apply)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _ocr_start(self, img=None) -> None:
+        if self._ocr_pending:
+            return
+        if self._vision_extractor is None:
+            alert(self, 'OCR unavailable', 'No vision API key configured.')
+            return
+        if img is None:
+            from vision import get_clipboard_image
+            img, err = get_clipboard_image()
+            if err:
+                self._ocr_show_status(f'⚠  {err}', _WARN_C, dismissable=True)
+                return
+            if img is None:
+                alert(self, 'No image found',
+                      'Copy an image to the clipboard, then click 📷 or press Ctrl+V.')
+                return
+        self._ocr_pending = True
+        self._ocr_show_preview(img)
+        try: self._ocr_btn.configure(fg=_T3)
+        except Exception: pass
+        self._ocr_show_status('⏳ Extracting…', _T2, dismissable=False)
+        _extractor = self._vision_extractor
+        def _worker():
+            try:
+                text = _extractor(img)
+                self.after(0, lambda: self._ocr_done(text))
+            except Exception as exc:
+                self.after(0, lambda: self._ocr_error(str(exc)))
+        threading.Thread(target=_worker, daemon=True).start()
+
+    _OCR_REFUSAL_PATTERNS = (
+        'no text', 'no readable', 'no visible', 'cannot extract',
+        'unable to extract', 'does not contain', 'no text found',
+        'there is no text', 'i cannot', "i can't", 'no legible',
+        'no written', 'no words', 'this image does not', 'image contains no',
+    )
+    _OCR_SHORT_THRESHOLD = 15
+
+    @classmethod
+    def _ocr_quality_issue(cls, text: str) -> str | None:
+        stripped = text.strip()
+        lower    = stripped.lower()
+        n        = len(stripped)
+        if n == 0:
+            return 'No text found'
+        if n < 200:
+            for pat in cls._OCR_REFUSAL_PATTERNS:
+                if pat in lower:
+                    return 'No text detected'
+        if n < cls._OCR_SHORT_THRESHOLD:
+            return f'Only {n} char{"s" if n != 1 else ""} extracted'
+        return None
+
+    def _ocr_done(self, text: str) -> None:
+        self._ocr_pending = False
+        self._ocr_hide_preview()
+        try: self._ocr_btn.configure(fg=_T3)
+        except Exception: pass
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:
+            return
+        from vision import LONG_TEXT_WARN
+        if len(text) > LONG_TEXT_WARN:
+            if not confirm(self, 'Long text extracted',
+                           f'Extracted {len(text)} characters. Insert into note?',
+                           action_label='Insert'):
+                self._ocr_hide_status()
+                return
+        issue = self._ocr_quality_issue(text)
+        if issue in ('No text found', 'No text detected'):
+            self._ocr_show_status(f'⚠ {issue}', _WARN_C, dismissable=True)
+            return
+        # Clear placeholder if present, then insert
+        if self._ph:
+            self._tb.delete('1.0', 'end')
+            self._tb.configure(text_color=_T1)
+            self._ph = False
+        try:
+            pos = self._tb._textbox.index('insert')
+        except Exception:
+            pos = 'end'
+        self._tb.insert(pos, text)
+        self._update_wcount()
+        if issue:
+            self._ocr_show_status(f'⚠ {issue}', _WARN_C, dismissable=True)
+        else:
+            self._ocr_show_status('✓ Extracted', _OK_C, dismissable=False)
+            self.after(1400, self._ocr_hide_status)
+
+    def _ocr_error(self, message: str) -> None:
+        self._ocr_pending = False
+        self._ocr_hide_preview()
+        try: self._ocr_btn.configure(fg=_T3)
+        except Exception: pass
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:
+            return
+        m = message.lower()
+        if 'api key' in m or ('invalid' in m and 'key' in m):
+            friendly = 'No API key configured'
+        elif 'connect' in m or 'network' in m or 'timeout' in m:
+            friendly = 'Network error — check connection'
+        else:
+            friendly = f'Error: {message[:80]}'
+        self._ocr_show_status(f'⚠ {friendly}', _ERR, dismissable=True)
+
+    # ── Swipe gestures (book-page flip) ───────────────────────────────────────
+
+    _SWIPE_MIN_X = 90    # minimum horizontal pixels for a swipe
+    _SWIPE_MAX_Y = 45    # maximum vertical pixels (keeps it horizontal)
+
+    def _swipe_press(self, event) -> None:
+        # Track button state ourselves — Tkinter's event.state bitmask is
+        # populated inconsistently on Windows for the *second* button press.
+        if event.num == 1:
+            self._swipe_btn1_down = True
+            if self._swipe_btn3_down:          # R was already held → both down
+                self._swipe_start_x = event.x_root
+                self._swipe_start_y = event.y_root
+                self._swipe_active  = True
+        elif event.num == 3:
+            self._swipe_btn3_down = True
+            if self._swipe_btn1_down:          # L was already held → both down
+                self._swipe_start_x = event.x_root
+                self._swipe_start_y = event.y_root
+                self._swipe_active  = True
+
+    def _swipe_release(self, event) -> None:
+        if event.num == 1:
+            self._swipe_btn1_down = False
+        elif event.num == 3:
+            self._swipe_btn3_down = False
+
+        if not self._swipe_active:
+            return
+        # Only evaluate the swipe when the FIRST button to come up fires
+        # (the second release will arrive with _swipe_active already False)
+        self._swipe_active = False
+        dx = event.x_root - self._swipe_start_x
+        dy = event.y_root - self._swipe_start_y
+        if abs(dx) < self._SWIPE_MIN_X or abs(dy) > self._SWIPE_MAX_Y:
+            return
+        if abs(dy) > abs(dx) * 0.55:
+            return
+        self._swipe_just_completed = True   # suppress next right-click menu
+        if dx < 0:
+            self._swipe_forward()
+
+    def _swipe_forward(self) -> None:
+        """Right-to-left swipe: save current note, open a fresh blank note."""
+        self._push_undo_state()
+        try:
+            from core.sounds import play_start
+            play_start()
+        except Exception:
+            pass
+        self._flip_animate(direction='left', callback=self._new_note)
+
+    def _swipe_back(self) -> None:
+        """Left-to-right swipe: open the previously viewed note."""
+        if self._prev_note_nid is None:
+            return   # nowhere to go back
+        self._push_undo_state()
+        try:
+            from core.sounds import play_flip
+            play_flip(reverse=True)
+        except Exception:
+            pass
+        prev = self._prev_note_nid
+        def _go():
+            self._open_note(prev)
+        self._flip_animate(direction='right', callback=_go)
+
+    def _flip_animate(self, direction: str, callback) -> None:
+        """Brief page-flip visual: overlay slides off in `direction`, then callback."""
+        try:
+            w = self._content_host.winfo_width()
+            h = self._content_host.winfo_height()
+        except Exception:
+            callback()
+            return
+
+        overlay = tk.Frame(self._content_host, bg='#0e0e0e')
+        overlay.place(x=0, y=0, width=w, height=h)
+        overlay.lift()
+
+        steps   = 7
+        delay   = 18   # ms per step
+        sign    = -1 if direction == 'left' else 1
+        step_px = w // steps
+
+        def _step(i):
+            if not self._content_host.winfo_exists():
+                return
+            x = sign * step_px * i
+            try:
+                overlay.place_configure(x=x)
+            except Exception:
+                return
+            if i >= steps:
+                try: overlay.destroy()
+                except Exception: pass
+                callback()
+            else:
+                self.after(delay, lambda: _step(i + 1))
+
+        _step(1)
+
+    # ── Right panel ───────────────────────────────────────────────────────────
+
+    def _build_right(self, parent) -> None:
+        self._right_panel = parent   # needed for OCR overlay placement
+        # Top bar: drag handle + pin + close
+        tb = tk.Frame(parent, bg=_EDIT, height=40)
+        tb.pack(fill='x')
+        tb.pack_propagate(False)
+        tb.bind('<ButtonPress-1>', self._drag_start)
+        tb.bind('<B1-Motion>',     self._drag_move)
+        tb.bind('<Double-Button-1>', lambda e: self._toggle_maximize())
+
+        # Right controls: pin + minimize + close
+        ctrl = tk.Frame(tb, bg=_EDIT)
+        ctrl.pack(side='right', padx=(0, 12), pady=8)
+
+        # Pin / star — gold when pinned, dim when not
+        self._pin_btn = tk.Label(ctrl, text='★', bg=_EDIT, fg=_T3,
+                                  font=(FONT_FAMILY, 14), cursor='hand2')
+        self._pin_btn.pack(side='left', padx=(0, 10))
+        self._pin_btn.bind('<Button-1>', lambda e: self._toggle_pin())
+        self._pin_btn.bind('<Enter>', lambda e: self._pin_btn.configure(fg='#d4aa00'))
+        self._pin_btn.bind('<Leave>', lambda e: self._pin_btn.configure(
+            fg='#d4aa00' if self._pinned else _T3))
+        _attach_tooltip(self._pin_btn, 'Pin to top of list')
+
+        # Minimize — hide without saving
+        mn = tk.Label(ctrl, text='–', bg=_EDIT, fg=_T3,
+                       font=(FONT_FAMILY, 16), cursor='hand2')
+        mn.pack(side='left', padx=(0, 10))
+        mn.bind('<Button-1>', lambda e: self.withdraw())
+        mn.bind('<Enter>', lambda e: mn.configure(fg=_T1))
+        mn.bind('<Leave>', lambda e: mn.configure(fg=_T3))
+        _attach_tooltip(mn, 'Minimize  (Shift+F7 to reopen)')
+
+        # Maximize / restore
+        self._max_btn = tk.Label(ctrl, text='□', bg=_EDIT, fg=_T3,
+                                  font=(FONT_FAMILY, 13), cursor='hand2')
+        self._max_btn.pack(side='left', padx=(0, 10))
+        self._max_btn.bind('<Button-1>', lambda e: self._toggle_maximize())
+        self._max_btn.bind('<Enter>', lambda e: self._max_btn.configure(fg=_T1))
+        self._max_btn.bind('<Leave>', lambda e: self._max_btn.configure(fg=_T3))
+        _attach_tooltip(self._max_btn, 'Maximize / restore window')
+
+        # Close — save and close
+        cl = tk.Label(ctrl, text='×', bg=_EDIT, fg=_T3,
+                       font=(FONT_FAMILY, 20), cursor='hand2')
+        cl.pack(side='left')
+        cl.bind('<Button-1>', lambda e: self._save_and_close())
+        cl.bind('<Enter>', lambda e: cl.configure(fg=_ERR))
+        cl.bind('<Leave>', lambda e: cl.configure(fg=_T3))
+        _attach_tooltip(cl, 'Save & close  (Esc)')
+
+        # Theme toggle — ☀ light / 🌙 dark
+        _theme_icon = '☀' if self._theme == 'light' else '🌙'
+        self._theme_btn = tk.Label(ctrl, text=_theme_icon, bg=_EDIT, fg=_T3,
+                                    font=(FONT_FAMILY, 13), cursor='hand2')
+        self._theme_btn.pack(side='left', padx=(14, 0))
+        self._theme_btn.bind('<Button-1>', lambda e: self._toggle_theme())
+        self._theme_btn.bind('<Enter>', lambda e: self._theme_btn.configure(fg=_T1))
+        self._theme_btn.bind('<Leave>', lambda e: self._theme_btn.configure(fg=_T3))
+        _attach_tooltip(self._theme_btn, 'Toggle light / dark mode')
+
+        # Separator
+        tk.Frame(parent, bg=_DIV, height=1).pack(fill='x')
+
+        # Gesture hint — persistent dim hint bar (survives panel rebuilds)
+        _hint = tk.Frame(parent, bg=_EDIT, height=18)
+        _hint.pack(fill='x')
+        _hint.pack_propagate(False)
+        tk.Label(_hint,
+                 text='Hold L+R mouse buttons and swipe left to save',
+                 bg=_EDIT, fg='#585858',
+                 font=(FONT_FAMILY, 9),
+                 ).pack(side='right', padx=(0, 18))
+
+        # Content host (fills remaining height above bottom bar)
+        self._content_host = tk.Frame(parent, bg=_EDIT)
+        self._content_host.pack(fill='both', expand=True)
+
+        self._show_panel()
+
+        # ── OCR overlays — placed on _content_host so they float above the editor ──
+        # Status strip (pinned to bottom of content host)
+        self._ocr_status_frame = tk.Frame(self._content_host, bg='#1a1a1a')
+        self._ocr_status_lbl = tk.Label(
+            self._ocr_status_frame, text='', bg='#1a1a1a', fg=_T2,
+            font=(FONT_FAMILY, 10), anchor='w', padx=10,
+        )
+        self._ocr_status_lbl.pack(side='left', fill='x', expand=True)
+        self._ocr_dismiss_btn = tk.Button(
+            self._ocr_status_frame, text='✕', bg='#1a1a1a', fg=_T3,
+            activebackground=_HOVER, activeforeground=_T1,
+            relief='flat', font=(FONT_FAMILY, 9), bd=0, cursor='hand2',
+            command=self._ocr_hide_status,
+        )
+        # Preview thumbnail strip (sits above status)
+        self._ocr_preview_frame = tk.Frame(self._content_host, bg='#1e1e1e')
+        self._ocr_thumb_lbl = tk.Label(self._ocr_preview_frame, bg='#1e1e1e', anchor='w')
+        self._ocr_thumb_lbl.pack(side='left', padx=10)
+
+        # Bottom bar
+        tk.Frame(parent, bg=_DIV, height=1).pack(fill='x')
+        self._build_bottom_bar(parent)
+
+    def _build_bottom_bar(self, parent) -> None:
+        bar = tk.Frame(parent, bg=_EDIT, height=36)
+        bar.pack(fill='x')
+        bar.pack_propagate(False)
+
+        self._chip_canvases = []
+
+        # Left side: inline content tools (Task + Voice)
+        lf = tk.Frame(bar, bg=_EDIT)
+        lf.pack(side='left', padx=(10, 0), pady=6)
+
+        # ☑ Task — insert checkbox line at cursor
+        task_btn = ctk.CTkButton(
+            lf, text='☑  Task', width=64, height=24,
+            fg_color='transparent', hover_color=_SURF3,
+            text_color=_T3, font=(FONT_FAMILY, 11), corner_radius=4,
+            command=self._insert_task,
+        )
+        task_btn.pack(side='left', padx=(0, 4))
+        _attach_tooltip(task_btn, 'Insert checklist item at cursor')
+
+        # 🎙 Voice — inline recording button
+        self._toolbar_mic = ctk.CTkButton(
+            lf, text='🎙  Voice', width=68, height=24,
+            fg_color='transparent', hover_color=_SURF3,
+            text_color=_T3, font=(FONT_FAMILY, 11), corner_radius=4,
+            command=self._toggle_rec,
+            state='normal' if self._transcribe_fn else 'disabled',
+        )
+        self._toolbar_mic.pack(side='left', padx=(0, 4))
+        _attach_tooltip(self._toolbar_mic, 'Record voice → transcribe into note')
+
+        # Right side: word count
+        rf = tk.Frame(bar, bg=_EDIT)
+        rf.pack(side='right', padx=(0, 14), pady=7)
+        self._ocr_btn = None   # removed; OCR still available via Ctrl+V / right-click
+
+        # Word count
+        self._wcount = tk.Label(rf, text='', bg=_EDIT, fg=_T3, font=(FONT_FAMILY, 10))
+        self._wcount.pack(side='left')
+
+        # Status
+        self._status = tk.Label(bar, text='', bg=_EDIT, fg=_T2, font=(FONT_FAMILY, 10))
+        self._status.pack(side='left', padx=(14, 0))
+
+    def _show_panel(self) -> None:
+        for w in self._content_host.winfo_children():
+            w.destroy()
+        self._panel_unified()
+
+    # ── Unified panel ─────────────────────────────────────────────────────────
+
+    def _panel_unified(self) -> None:
+        """Inline editor: title + flowing body (text + □ tasks + voice inline)."""
+        _PH_TITLE = 'Title…'
+        _PH_BODY  = 'Start writing…'
+        _PH_COLOR = '#5a5a5a'
+
+        title_text, body_text = _split_text(self._text_content)
+
+        # Build inline body: combine text lines + checklist items + voice transcript
+        inline_parts: list[str] = []
+        if body_text:
+            inline_parts.append(body_text)
+        for it in self._checklist_items:
+            if it.get('text', '').strip():
+                prefix = '✓ ' if it.get('checked') else '□ '
+                inline_parts.append(prefix + it['text'])
+        if self._voice_transcript:
+            inline_parts.append(self._voice_transcript)
+        full_body = '\n'.join(inline_parts)
+
+        # ── Outer container (no scroll — body textbox grows naturally) ────────
+        outer = tk.Frame(self._content_host, bg=_EDIT)
+        outer.pack(fill='both', expand=True)
+
+        # ── Title entry ──────────────────────────────────────────────────────
+        self._title_ph  = not bool(title_text)
+        self._title_var = tk.StringVar(value=title_text if title_text else _PH_TITLE)
+
+        self._title_entry = tk.Entry(
+            outer,
+            textvariable=self._title_var,
+            bg=_EDIT, fg=_T1 if title_text else _PH_COLOR,
+            font=(_ACTIVE_FF, 20, 'bold'),
+            relief='flat', bd=0, insertbackground=_T1, highlightthickness=0,
+        )
+        self._title_entry.pack(fill='x', padx=18, pady=(14, 0))
+
+        def _title_focus_in(e):
+            if self._title_ph:
+                self._title_var.set('')
+                self._title_entry.configure(fg=_T1)
+                self._title_ph = False
+
+        def _title_focus_out(e):
+            if not self._title_var.get().strip():
+                self._title_var.set(_PH_TITLE)
+                self._title_entry.configure(fg=_PH_COLOR)
+                self._title_ph = True
+
+        self._title_entry.bind('<FocusIn>',    _title_focus_in)
+        self._title_entry.bind('<FocusOut>',   _title_focus_out)
+        self._title_entry.bind('<Return>',     lambda e: self._tb._textbox.focus_set())
+        self._title_entry.bind('<KeyRelease>', self._on_key)
+        self._title_entry.bind('<ButtonPress-1>',   self._swipe_press,   add='+')
+        self._title_entry.bind('<ButtonRelease-1>', self._swipe_release, add='+')
+        self._title_entry.bind('<ButtonPress-3>',   self._swipe_press,   add='+')
+        self._title_entry.bind('<ButtonRelease-3>', self._swipe_release, add='+')
+
+        # ── Body textbox — ALL content lives here ────────────────────────────
+        self._tb = ctk.CTkTextbox(
+            outer,
+            font=(_ACTIVE_FF, 15), fg_color=_EDIT,
+            text_color=_T1, border_width=0,
+            scrollbar_button_color='#333',
+            scrollbar_button_hover_color='#444',
+            wrap='word', corner_radius=0,
+        )
+        self._tb.pack(fill='both', expand=True, padx=18, pady=(4, 4))
+        self._tb._textbox.configure(undo=True, maxundo=100)
+
+        self._ph = not bool(full_body)
+        self._ph_text  = _PH_BODY
+        self._ph_color = _PH_COLOR
+        if full_body:
+            self._tb.insert('1.0', full_body)
+            self._tb.configure(text_color=_T1)
+        else:
+            self._tb.insert('1.0', _PH_BODY)
+            self._tb.configure(text_color=_PH_COLOR)
+
+        # Configure task styling tags
+        self._tb._textbox.tag_configure('task_done', foreground=_T3)
+
+        # Apply checkbox visual styling to pre-loaded content
+        self.after(10, self._apply_all_task_tags)
+
+        self._tb._textbox.bind('<Key>',         self._ph_key)
+        self._tb._textbox.bind('<FocusOut>',    self._ph_out)
+        self._tb._textbox.bind('<KeyRelease>',  self._on_key)
+        self._tb._textbox.bind('<Control-v>',   self._on_ctrl_v)
+        self._tb._textbox.bind('<Control-V>',   self._on_ctrl_v)
+        self._tb._textbox.bind('<Return>',      self._on_return_key)
+        self._tb._textbox.bind('<Button-3>',    self._on_editor_right_click)
+        self._title_entry.bind('<Button-3>',    self._on_title_right_click)
+        outer.bind('<Button-3>', self._on_editor_right_click)
+        self._tb._textbox.bind('<Control-z>',   self._text_ctrl_z)
+        self._tb._textbox.bind('<Control-Z>',   self._text_ctrl_z)
+        self._tb._textbox.bind('<ButtonPress-1>',   self._swipe_press,   add='+')
+        self._tb._textbox.bind('<ButtonRelease-1>', self._swipe_release, add='+')
+        self._tb._textbox.bind('<ButtonPress-3>',   self._swipe_press,   add='+')
+        self._tb._textbox.bind('<ButtonRelease-3>', self._swipe_release, add='+')
+        # Click on □/✓ prefix to toggle checkbox
+        self._tb._textbox.bind('<Button-1>', self._on_body_click, add='+')
+
+        # Live spell-check (red underline + right-click suggestions)
+        try:
+            import spellcheck
+            spellcheck.attach(self._tb)
+        except Exception:
+            pass
+
+    def _ph_key(self, event=None) -> None:
+        """Clear placeholder on the first printable keystroke (not on focus)."""
+        if self._ph and event is not None:
+            ch = getattr(event, 'char', '')
+            if ch and (ch.isprintable() or ch in ('\r', '\n')):
+                self._tb.delete('1.0', 'end')
+                self._tb.configure(text_color=_T1)
+                self._ph = False
+
+    def _ph_out(self, _=None) -> None:
+        if not self._ph and not self._tb_text():
+            self._tb.delete('1.0', 'end')
+            self._tb.insert('1.0', self._ph_text)
+            self._tb.configure(text_color=self._ph_color)
+            self._ph = True
+
+    def _tb_text(self) -> str:
+        try:
+            return '' if self._ph else self._tb.get('1.0', 'end-1c').strip()
+        except Exception:
+            return ''
+
+    def _voice_tb_text(self) -> str:
+        # Voice is now inline in _tb; voice field unused in new notes
+        return ''
+
+    # ── Color chips ───────────────────────────────────────────────────────────
+
+    def _redraw_chips(self) -> None:
+        for c, (chip_clr, _, _) in zip(self._chip_canvases, NOTE_COLORS):
+            c.delete('all')
+            selected = (self._color == chip_clr)
+            if chip_clr is None:
+                c.create_oval(2, 2, 10, 10, outline='#555', fill='', width=1)
+            else:
+                c.create_oval(2, 2, 10, 10, fill=chip_clr, outline='', width=0)
+            if selected:
+                c.create_oval(1, 1, 11, 11, outline=_T1, fill='', width=1.5)
+
+    def _set_color(self, chip_clr) -> None:
+        self._color = chip_clr
+        self._redraw_chips()
+
+    # ── Pin ───────────────────────────────────────────────────────────────────
+
+    def _toggle_pin(self) -> None:
+        self._pinned = not self._pinned
+        self._pin_btn.configure(fg='#d4aa00' if self._pinned else _T3)
+
+    # ── Recording ─────────────────────────────────────────────────────────────
+
+    def _toggle_rec(self) -> None:
+        {'idle': self._start_rec, 'recording': self._stop_rec}.get(
+            self._rec_state, lambda: None)()
+
+    def _start_rec(self) -> None:
+        if self._mic_busy_fn and self._mic_busy_fn():
+            self._set_status('Mic busy — stop other recording first', _WARN_C)
+            self.after(2500, lambda: self._set_status(''))
+            return
+        try:
+            import sounddevice as sd
+        except ImportError:
+            self._set_status('sounddevice not available', _ERR)
+            return
+        self._rec_frames = []
+        self._rec_start  = time.time()
+        try:
+            self._rec_stream = sd.InputStream(
+                samplerate=SAMPLE_RATE, channels=1, dtype='float32',
+                callback=lambda d, f, t, s: self._rec_frames.append(d[:, 0].copy()),
+            )
+            self._rec_stream.start()
+        except Exception as e:
+            self._set_status(f'Mic error: {e}', _ERR)
+            return
+        self._rec_state = 'recording'
+        self._update_mic_ui('recording')
+        self._tick_rec()
+
+    def _tick_rec(self) -> None:
+        if self._rec_state != 'recording':
+            return
+        s = int(time.time() - self._rec_start)
+        if s >= _MAX_REC_S:
+            self._set_status(f'Max {_MAX_REC_S}s reached — stopping', _WARN_C)
+            try: self._voice_hint.configure(text=f'Max {_MAX_REC_S}s reached')
+            except Exception: pass
+            self.after(400, self._stop_rec)
+            return
+        remaining = _MAX_REC_S - s
+        self._set_status(f'● {s}s  ({remaining}s left)', _ERR)
+        try: self._voice_hint.configure(text=f'● Recording  {s}s')
+        except Exception: pass
+        self._pulse_job = self.after(500, self._tick_rec)
+
+    def _stop_rec(self) -> None:
+        if self._pulse_job:
+            try: self.after_cancel(self._pulse_job)
+            except Exception: pass
+            self._pulse_job = None
+        if self._rec_stream:
+            try:
+                self._rec_stream.stop()
+                self._rec_stream.close()
+            except Exception: pass
+            self._rec_stream = None
+        audio = (np.concatenate(self._rec_frames)
+                 if self._rec_frames else np.zeros(0, dtype='float32'))
+        self._rec_state  = 'idle'
+        self._pending_audio = audio
+        self._update_mic_ui('idle')
+        self._show_voice_decide()
+
+    def _update_mic_ui(self, state: str) -> None:
+        cfgs = {
+            'idle':         dict(text='🎙  Voice', fg_color='transparent', text_color=_T3),
+            'recording':    dict(text='⏹  Stop',   fg_color=_ERR,          text_color='#ffffff'),
+            'transcribing': dict(text='⏳  …',      fg_color='transparent', text_color=_BLUE),
+        }
+        try:
+            self._toolbar_mic.configure(**cfgs.get(state, cfgs['idle']))
+        except Exception:
+            pass
+
+    def _do_transcribe(self, audio: np.ndarray) -> None:
+        try:
+            text = self._transcribe_fn(audio) if self._transcribe_fn else ''
+        except Exception as e:
+            logger.warning(f'Notes transcription: {e}')
+            text = ''
+        self.after(0, lambda t=text: self._on_transcribed(t))
+
+    def _on_transcribed(self, text: str) -> None:
+        self._rec_state = 'idle'
+        self._update_mic_ui('idle')
+        if not text.strip():
+            self._set_status('Nothing heard', _WARN_C)
+            self.after(2500, lambda: self._set_status(''))
+            return
+        # Insert transcript inline at cursor position in body textbox
+        try:
+            tb = self._tb._textbox
+            if self._ph:
+                self._tb.delete('1.0', 'end')
+                self._tb.configure(text_color=_T1)
+                self._ph = False
+            idx      = tb.index('insert')
+            line_num = idx.split('.')[0]
+            line_txt = tb.get(f'{line_num}.0', f'{line_num}.end').strip()
+            prefix   = '' if not line_txt else '\n'
+            tb.insert('insert', prefix + text)
+            tb.see('insert')
+        except Exception:
+            pass
+        self._update_wcount()
+        self._set_status('✓ Transcribed', _OK_C)
+        self.after(2500, lambda: self._set_status(''))
+
+    # ── Word count / status ───────────────────────────────────────────────────
+
+    def _on_key(self, _=None) -> None:
+        self._update_wcount()
+
+    def _update_wcount(self) -> None:
+        try:
+            try:
+                title = '' if self._title_ph else self._title_var.get().strip()
+            except AttributeError:
+                title = ''
+            combined = (title + ' ' + self._tb_text()).strip()
+            self._wcount.configure(text=_word_count(combined))
+        except Exception:
+            pass
+
+    def _set_status(self, text: str, color: str = _T3) -> None:
+        try:
+            self._status.configure(text=text, fg=color)
+        except Exception:
+            pass
+
+    # ── Focus ─────────────────────────────────────────────────────────────────
+
+    def _focus_content(self) -> None:
+        try:
+            if self._title_ph:
+                self._title_entry.focus_set()
+            else:
+                self._tb._textbox.focus_set()
+        except Exception:
+            pass
+
+    # ── Flush ─────────────────────────────────────────────────────────────────
+
+    def _flush_current(self) -> None:
+        # Title
+        try:
+            title = '' if self._title_ph else self._title_var.get().strip()
+        except AttributeError:
+            title = ''
+
+        # Body — parse inline □/✓ checklist lines back into separate fields
+        body_raw = self._tb_text()
+        text_lines:  list[str]  = []
+        item_lines:  list[dict] = []
+        for line in body_raw.splitlines():
+            s = line.strip()
+            if s.startswith('□ ') or s.startswith('☐ '):
+                item_lines.append({'text': s[2:], 'checked': False})
+            elif s.startswith('✓ ') or s.startswith('☑ '):
+                item_lines.append({'text': s[2:], 'checked': True})
+            else:
+                text_lines.append(line)
+
+        text_body = '\n'.join(text_lines).strip()
+
+        if title and text_body:
+            self._text_content = title + '\n' + text_body
+        elif title:
+            self._text_content = title
+        else:
+            self._text_content = text_body
+
+        self._checklist_items = item_lines or [{'text': '', 'checked': False}]
+        # Voice transcript is embedded inline; keep field empty for new notes
+        self._voice_transcript = ''
+
+    # ── Save / close ──────────────────────────────────────────────────────────
+
+    def _get_note_data(self) -> dict | None:
+        """Return unified note data with all three content fields.
+        Returns None only if the note is completely empty."""
+        self._flush_current()
+        text  = self._text_content
+        items = [it for it in self._checklist_items if it.get('text', '').strip()]
+        voice = self._voice_transcript
+        if not text and not items and not voice:
+            return None
+        return {'text': text, 'items': items, 'voice': voice}
+
+    def _save_and_close(self, _=None) -> None:
+        if self._rec_state == 'recording':
+            self._stop_rec()
+            self.after(320, self._save_and_close)
+            return
+        data = self._get_note_data()
+        if data:
+            if self._editing_nid:
+                # Update existing note
+                notes = load_notes()
+                for n in notes:
+                    if n.get('id') == self._editing_nid:
+                        n['text']   = data['text']
+                        n['items']  = data['items']
+                        n['voice']  = data['voice']
+                        n['pinned'] = self._pinned
+                        break
+                self._invalidate_notes_cache()
+                save_notes(notes)
+                logger.info('Quick note updated')
+            else:
+                border_hex = None
+                for chip_clr, bdr_clr, _ in NOTE_COLORS:
+                    if self._color == chip_clr:
+                        border_hex = bdr_clr
+                        break
+                note = {
+                    'id':         str(uuid.uuid4()),
+                    'text':       data['text'],
+                    'items':      data['items'],
+                    'voice':      data['voice'],
+                    'color':      border_hex,
+                    'pinned':     self._pinned,
+                    'created_at': datetime.now().isoformat(timespec='seconds'),
+                }
+                notes = load_notes()
+                notes.append(note)
+                self._invalidate_notes_cache()
+                save_notes(notes)
+                logger.info('Quick note saved')
+
+        # Persist geometry so next open restores size/position
+        if self._on_geometry_change:
+            try:
+                self.update_idletasks()
+                geo = self.geometry()   # e.g. "1216x796+120+80"
+                self._on_geometry_change(geo)
+            except Exception:
+                pass
+        if self._on_close:
+            try: self._on_close()
+            except Exception: pass
+        try:
+            self.destroy()
+        except Exception: pass
+
+    # ── Drag ──────────────────────────────────────────────────────────────────
+
+    def _drag_start(self, e) -> None:
+        self._drag_ox = e.x_root - self.winfo_x()
+        self._drag_oy = e.y_root - self.winfo_y()
+
+    def _drag_move(self, e) -> None:
+        self.geometry(f'+{e.x_root - self._drag_ox}+{e.y_root - self._drag_oy}')
+
+    # ── Keys ──────────────────────────────────────────────────────────────────
+
+    def _bind_keys(self) -> None:
+        self.bind('<Escape>',    self._on_escape)
+        self.bind('<Control-s>', self._save_and_close)
+        self.bind('<Control-S>', self._save_and_close)
+        self.bind('<Control-m>', lambda _: self._toggle_rec())
+        self.bind('<Control-M>', lambda _: self._toggle_rec())
+        # Gesture undo at window level
+        self.bind('<Control-z>', self._gesture_ctrl_z)
+        self.bind('<Control-Z>', self._gesture_ctrl_z)
+        # Window-level Ctrl+V → paste as note when focus is in left panel.
+        # Unbind before add='+' to prevent handler accumulation on theme switch.
+        self.unbind('<Control-v>')
+        self.unbind('<Control-V>')
+        self.bind('<Control-v>', self._on_window_ctrl_v, add='+')
+        self.bind('<Control-V>', self._on_window_ctrl_v, add='+')
+        # Drag-and-drop release detection.
+        # Unbind before add='+' to prevent handler accumulation on theme switch.
+        self.unbind('<ButtonRelease-1>')
+        self.bind('<ButtonRelease-1>', self._on_window_mouse_release, add='+')
+
+    def _on_window_ctrl_v(self, event) -> str | None:
+        """Window-level Ctrl+V: paste as note unless focus is in the editor or search bar."""
+        try:
+            fw = self.focus_get()
+            # Let the text editor handle its own Ctrl+V
+            if hasattr(self, '_tb') and fw is self._tb._textbox:
+                return None
+            # Let the search bar handle its own Ctrl+V
+            if hasattr(self, '_srch_entry'):
+                try:
+                    if fw is self._srch_entry._entry:
+                        return None
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return self._paste_to_list(event)
+
+    def _on_escape(self, _=None) -> None:
+        """Esc: cancel staged OCR if pending, otherwise save & close."""
+        if self._ocr_staged_img is not None:
+            self._ocr_staged_img = None
+            self._ocr_hide_preview()
+            self._ocr_hide_status()
+            return
+        self._save_and_close()
+
+    # ── Maximize / restore ────────────────────────────────────────────────────
+
+    def _toggle_maximize(self) -> None:
+        if self._maximized:
+            if self._restore_geo:
+                self.geometry(self._restore_geo)
+            self._maximized = False
+            try: self._max_btn.configure(text='□')
+            except Exception: pass
+        else:
+            self._restore_geo = (
+                f'{self.winfo_width()}x{self.winfo_height()}'
+                f'+{self.winfo_x()}+{self.winfo_y()}'
+            )
+            try:
+                import ctypes, ctypes.wintypes as _wt
+                r = _wt.RECT()
+                ctypes.windll.user32.SystemParametersInfoW(48, 0, ctypes.byref(r), 0)
+                self.geometry(f'{r.right - r.left}x{r.bottom - r.top}+{r.left}+{r.top}')
+            except Exception:
+                sw = self.winfo_screenwidth()
+                sh = self.winfo_screenheight()
+                self.geometry(f'{sw}x{sh}+0+0')
+            self._maximized = True
+            try: self._max_btn.configure(text='⊡')
+            except Exception: pass
+
+    # ── All-sides resize ──────────────────────────────────────────────────────
+
+    def _enable_native_resize(self) -> None:
+        """Hook WM_NCHITTEST so Windows handles all-sides resize natively.
+
+        Uses SetWindowLongPtrW to subclass the top-level window procedure.
+        The OS resize loop is rock-solid — no Tkinter geometry calls needed.
+        """
+        try:
+            import ctypes, ctypes.wintypes as wt
+            GWL_WNDPROC  = -4
+            WM_NCHITTEST = 0x0084
+            HTCLIENT = 1
+            _HT = {'nw': 13, 'n': 12, 'ne': 14,
+                   'w':  10,           'e':  11,
+                   'sw': 16, 's': 15, 'se': 17}
+            EDGE = 8   # px from window edge for resize zone (8 is easier to grab)
+
+            # Must set argtypes/restype explicitly — on 64-bit Python the default
+            # c_int restype truncates the 64-bit procedure pointer to 32 bits.
+            user32 = ctypes.windll.user32
+            user32.GetWindowLongPtrW.restype  = ctypes.c_ssize_t
+            user32.GetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            user32.SetWindowLongPtrW.restype  = ctypes.c_ssize_t
+            user32.SetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+            user32.CallWindowProcW.restype    = ctypes.c_ssize_t
+            user32.CallWindowProcW.argtypes   = [
+                ctypes.c_ssize_t, ctypes.c_void_p,
+                ctypes.c_uint, ctypes.c_ssize_t, ctypes.c_ssize_t,
+            ]
+            user32.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(wt.RECT)]
+            user32.GetWindowRect.restype  = ctypes.c_bool
+            user32.GetAncestor.restype    = ctypes.c_void_p
+            user32.GetAncestor.argtypes   = [ctypes.c_void_p, ctypes.c_uint]
+
+            # winfo_id() on CTkToplevel may return a child-frame HWND, not the
+            # actual Win32 top-level.  WM_NCHITTEST is only sent to the top-level
+            # window, so subclassing a child frame has no effect.
+            # GetAncestor(GA_ROOT=2) walks up to the real root window.
+            child_hwnd = self.winfo_id()
+            hwnd       = user32.GetAncestor(child_hwnd, 2)  # GA_ROOT
+            if not hwnd:
+                hwnd = child_hwnd  # fallback if GetAncestor returns NULL
+
+            old_proc = user32.GetWindowLongPtrW(hwnd, GWL_WNDPROC)
+            if not old_proc:
+                logger.warning('Native resize: GetWindowLongPtrW returned 0 '
+                                f'(err={ctypes.GetLastError()}), skipping hook.')
+                return
+
+            WndProcType = ctypes.WINFUNCTYPE(
+                ctypes.c_ssize_t,
+                ctypes.c_void_p, ctypes.c_uint,
+                ctypes.c_ssize_t, ctypes.c_ssize_t,
+            )
+
+            @WndProcType
+            def _wndproc(hw, msg, wp, lp):
+                if msg == WM_NCHITTEST:
+                    rect = wt.RECT()
+                    user32.GetWindowRect(hw, ctypes.byref(rect))
+                    # Screen coords are packed as two signed 16-bit values in lp
+                    x = ctypes.c_short(lp & 0xFFFF).value
+                    y = ctypes.c_short((lp >> 16) & 0xFFFF).value
+                    L, T, R, B = rect.left, rect.top, rect.right, rect.bottom
+                    l = x < L + EDGE
+                    r = x > R - EDGE
+                    t = y < T + EDGE
+                    b = y > B - EDGE
+                    if t and l: return _HT['nw']
+                    if t and r: return _HT['ne']
+                    if b and l: return _HT['sw']
+                    if b and r: return _HT['se']
+                    if l:       return _HT['w']
+                    if r:       return _HT['e']
+                    if t:       return _HT['n']
+                    if b:       return _HT['s']
+                    return HTCLIENT
+                return user32.CallWindowProcW(old_proc, hw, msg, wp, lp)
+
+            set_result = user32.SetWindowLongPtrW(hwnd, GWL_WNDPROC, _wndproc)
+            if not set_result:
+                logger.warning('Native resize: SetWindowLongPtrW returned 0 '
+                                f'(err={ctypes.GetLastError()})')
+            else:
+                logger.info(f'Native resize hook installed: hwnd={hwnd:#010x} '
+                             f'(child={child_hwnd:#010x})')
+            # Keep a strong reference — ctypes callback is GC'd if not held
+            self._wndproc_ref = _wndproc
+        except Exception as e:
+            logger.warning(f'Native resize hook failed: {e}')
+
+    # ── Gesture undo ──────────────────────────────────────────────────────────
+
+    def _push_undo_state(self) -> None:
+        """Save full editor state to the gesture undo stack before a swipe."""
+        self._flush_current()
+        self._gesture_undo_stack.append({
+            'editing_nid':     self._editing_nid,
+            'prev_note_nid':   self._prev_note_nid,
+            'text_content':    self._text_content,
+            'checklist_items': [dict(it) for it in self._checklist_items],
+            'voice_transcript': self._voice_transcript,
+            'pinned':          self._pinned,
+        })
+        if len(self._gesture_undo_stack) > 20:
+            self._gesture_undo_stack.pop(0)
+
+    def _restore_gesture_state(self, state: dict) -> None:
+        """Restore editor state from a gesture undo snapshot."""
+        self._editing_nid      = state['editing_nid']
+        self._prev_note_nid    = state['prev_note_nid']
+        self._text_content     = state['text_content']
+        self._checklist_items  = state['checklist_items']
+        self._voice_transcript = state['voice_transcript']
+        self._pinned           = state['pinned']
+        try: self._pin_btn.configure(fg='#d4aa00' if self._pinned else _T3)
+        except Exception: pass
+        self._show_panel()
+        self._refresh_list()
+        self._set_status('↩ Gesture undone', _ACCENTL)
+        self.after(1500, lambda: self._set_status(''))
+        self.after(30, self._focus_content)
+
+    def _text_ctrl_z(self, event=None) -> str:
+        """Ctrl+Z handler bound directly to the body textbox.
+        Tries text undo; if stack is empty lets propagation continue to window
+        level so gesture undo can fire."""
+        try:
+            self._tb._textbox.edit_undo()
+            return 'break'   # undo succeeded — stop propagation
+        except Exception:
+            pass             # stack empty — fall through to window handler
+        return None          # allow window-level binding to fire
+
+    def _gesture_ctrl_z(self, event=None) -> str:
+        """Window-level Ctrl+Z: pops the gesture undo stack if available.
+        Fires when the textbox doesn't intercept (non-text modes, or text
+        undo stack exhausted)."""
+        if self._gesture_undo_stack:
+            state = self._gesture_undo_stack.pop()
+            self._restore_gesture_state(state)
+        return 'break'
+
+    # ── Inline task insertion ─────────────────────────────────────────────────
+
+    def _insert_task(self) -> None:
+        """Insert a □ checklist line at the current cursor position."""
+        try:
+            if self._ph:
+                self._tb.delete('1.0', 'end')
+                self._tb.configure(text_color=_T1)
+                self._ph = False
+            tb       = self._tb._textbox
+            idx      = tb.index('insert')
+            line_num = idx.split('.')[0]
+            line_end = f'{line_num}.end'
+            line_txt = tb.get(f'{line_num}.0', line_end).strip()
+            if line_txt:
+                # Non-empty line — insert new □ line below
+                tb.mark_set('insert', line_end)
+                tb.insert('insert', '\n□ ')
+            else:
+                # Empty line — just put □ here
+                tb.insert(f'{line_num}.0', '□ ')
+            tb.see('insert')
+            tb.focus_set()
+        except Exception:
+            pass
+
+    def _on_body_click(self, event) -> str | None:
+        """Toggle □ ↔ ✓ when clicking within the first 2 chars of a task line."""
+        try:
+            tb       = self._tb._textbox
+            idx      = tb.index(f'@{event.x},{event.y}')
+            line_num = int(idx.split('.')[0])
+            col      = int(idx.split('.')[1])
+            if col <= 2:
+                ls  = f'{line_num}.0'
+                txt = tb.get(ls, f'{line_num}.end')
+                if txt.startswith('□ '):
+                    tb.delete(ls, f'{ls}+2c')
+                    tb.insert(ls, '✓ ')
+                    self._apply_task_tag(line_num, done=True)
+                    return 'break'
+                elif txt.startswith('✓ '):
+                    tb.delete(ls, f'{ls}+2c')
+                    tb.insert(ls, '□ ')
+                    self._apply_task_tag(line_num, done=False)
+                    return 'break'
+        except Exception:
+            pass
+        return None
+
+    def _apply_task_tag(self, line_num: int, done: bool) -> None:
+        """Dim a completed task line, un-dim an active one."""
+        try:
+            tb = self._tb._textbox
+            ls = f'{line_num}.0'
+            le = f'{line_num}.end'
+            tb.tag_remove('task_done', ls, le)
+            if done:
+                tb.tag_add('task_done', ls, le)
+        except Exception:
+            pass
+
+    def _apply_all_task_tags(self) -> None:
+        """Apply visual styling to all □/✓ lines (called after content load)."""
+        try:
+            tb          = self._tb._textbox
+            total_lines = int(tb.index('end-1c').split('.')[0])
+            for i in range(1, total_lines + 1):
+                txt = tb.get(f'{i}.0', f'{i}.end')
+                if txt.startswith('✓ ') or txt.startswith('☑ '):
+                    self._apply_task_tag(i, done=True)
+        except Exception:
+            pass
+
+    # ── Voice decide bar (record → transcribe / discard) ──────────────────────
+
+    def _show_voice_decide(self) -> None:
+        """Floating confirm bar after recording: Transcribe | Discard."""
+        self._hide_voice_decide()
+        bar = tk.Frame(self._content_host, bg=_SURF2, height=38)
+        bar.place(x=0, rely=1.0, relwidth=1.0, height=38, anchor='sw')
+        bar.lift()
+        bar.pack_propagate(False)
+        # Top border line for visual separation
+        tk.Frame(bar, bg=_DIV, height=1).pack(side='top', fill='x')
+        self._voice_decide_bar = bar
+
+        tk.Label(bar, text='Voice ready:', bg=_SURF2, fg=_T2,
+                 font=(FONT_FAMILY, 10)).pack(side='left', padx=(10, 6))
+
+        ctk.CTkButton(
+            bar, text='📝 Transcribe & insert', width=150, height=26,
+            fg_color=_ACCENT, hover_color='#6d28d9',
+            text_color='#ffffff', font=(FONT_FAMILY, 10), corner_radius=4,
+            command=self._decide_transcribe,
+        ).pack(side='left', padx=(0, 6))
+
+        ctk.CTkButton(
+            bar, text='✕ Discard', width=70, height=26,
+            fg_color='transparent', hover_color=_HOVER,
+            text_color=_T2, font=(FONT_FAMILY, 10), corner_radius=4,
+            command=self._decide_discard,
+        ).pack(side='left')
+
+    def _hide_voice_decide(self) -> None:
+        bar = self._voice_decide_bar
+        if bar is not None:
+            try: bar.destroy()
+            except Exception: pass
+        self._voice_decide_bar = None
+
+    def _decide_transcribe(self) -> None:
+        audio = self._pending_audio
+        self._pending_audio = None
+        self._hide_voice_decide()
+        if audio is None or len(audio) == 0:
+            return
+        self._rec_state = 'transcribing'
+        self._update_mic_ui('transcribing')
+        self._set_status('Transcribing…', _BLUE)
+        threading.Thread(target=self._do_transcribe, args=(audio,), daemon=True).start()
+
+    def _decide_discard(self) -> None:
+        self._pending_audio = None
+        self._hide_voice_decide()
+        self._set_status('Recording discarded', _T3)
+        self.after(1500, lambda: self._set_status(''))
+
+    # ── Search debounce ───────────────────────────────────────────────────────
+
+    def _on_search_key(self, e=None) -> None:
+        """Debounce search: wait 150 ms after last keystroke before re-rendering."""
+        if self._search_job is not None:
+            try: self.after_cancel(self._search_job)
+            except Exception: pass
+        self._search_job = self.after(150, self._refresh_list)
+
+    # ── Theme ─────────────────────────────────────────────────────────────────
+
+    def _toggle_theme(self) -> None:
+        self._set_theme('light' if self._theme == 'dark' else 'dark')
+
+    def _set_theme(self, theme: str) -> None:
+        """Switch between dark and light palettes and rebuild the window."""
+        self._flush_current()
+        self._theme = theme
+        palette = _LIGHT_PALETTE if theme == 'light' else _DARK_PALETTE
+        _mod = sys.modules[__name__]
+        for k, v in palette.items():
+            setattr(_mod, k, v)
+        # Rebuild all widgets with new palette
+        for w in list(self.winfo_children()):
+            try: w.destroy()
+            except Exception: pass
+        self.configure(fg_color=_WIN)
+        self._build()
+        self._bind_keys()
+        if self._editing_nid:
+            self.after(30, self._show_panel)
+        self.after(60, self._focus_content)

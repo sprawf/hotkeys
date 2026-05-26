@@ -321,6 +321,14 @@ class ScreenshotOverlay:
             return None
         return x1, y1, x2, y2
 
+    def capture_for_ask(self) -> 'Image.Image | None':
+        """Return the selected region (with annotations) as a PIL Image, or None.
+
+        Safe to call from a background thread — only reads PIL data, no Tkinter.
+        Intended for Shift+F4 → OCR → answer-pill while overlay is still open.
+        """
+        return self._render()
+
     def _inside_sel(self, x, y) -> bool:
         s = self._sel()
         if not s:

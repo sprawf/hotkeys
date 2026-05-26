@@ -22,6 +22,10 @@ _MIN_MOUSE_DELTA = 5
 # Keys that are NEVER recorded — they are reserved for stopping
 _STOP_KEYS = {Key.esc, Key.delete}
 
+# Hard cap on events per recording — prevents runaway macros from filling RAM/disk.
+# 5,000 events ≈ 3-10 minutes of active use depending on mouse activity.
+_MAX_EVENTS = 5_000
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _key_to_str(key) -> str:
@@ -94,6 +98,7 @@ class MacroRecorder:
         self._stop_event = threading.Event()
         self._start_time: float = 0.0
         self._lock       = threading.Lock()
+        self._on_cap_reached = None   # optional callback: fired once when _MAX_EVENTS hit
 
         self._mouse_listener:    _mouse.Listener    | None = None
         self._keyboard_listener: _keyboard.Listener | None = None
@@ -118,13 +123,18 @@ class MacroRecorder:
 
     # ── Recording ─────────────────────────────────────────────────────────────
 
-    def start_recording(self) -> None:
-        """Begin capturing mouse + keyboard events."""
+    def start_recording(self, on_cap_reached=None) -> None:
+        """Begin capturing mouse + keyboard events.
+
+        on_cap_reached — optional callable fired once on the listener thread
+                         when the _MAX_EVENTS limit is hit.  Use to auto-stop.
+        """
         if self._recording or self._playing:
             return
         self._events    = []
         self._recording = True
         self._start_time = time.perf_counter()
+        self._on_cap_reached = on_cap_reached
 
         self._mouse_listener = _mouse.Listener(
             on_move=self._on_move,
@@ -187,10 +197,24 @@ class MacroRecorder:
     def _ts(self) -> float:
         return time.perf_counter() - self._start_time
 
+    def _check_cap(self) -> bool:
+        """Return True (and fire callback) if the event cap has been reached.
+        Must be called while self._lock is held."""
+        if len(self._events) >= _MAX_EVENTS:
+            self._recording = False
+            cb = self._on_cap_reached
+            if cb is not None:
+                self._on_cap_reached = None
+                threading.Thread(target=cb, daemon=True).start()
+            return True
+        return False
+
     def _on_move(self, x: int, y: int) -> None:
         if not self._recording:
             return
         with self._lock:
+            if self._check_cap():
+                return
             # Only record if moved meaningfully from the last recorded position
             last = next((e for e in reversed(self._events)
                          if e['type'] == 'mouse_move'), None)
@@ -203,6 +227,8 @@ class MacroRecorder:
         if not self._recording:
             return
         with self._lock:
+            if self._check_cap():
+                return
             self._events.append({
                 'type':    'mouse_click',
                 'x':       x,
@@ -216,6 +242,8 @@ class MacroRecorder:
         if not self._recording:
             return
         with self._lock:
+            if self._check_cap():
+                return
             self._events.append({
                 'type': 'mouse_scroll',
                 'x': x, 'y': y,
@@ -229,6 +257,8 @@ class MacroRecorder:
         if key in _STOP_KEYS:
             return           # never record stop keys
         with self._lock:
+            if self._check_cap():
+                return
             self._events.append({'type': 'key_press', 'key': _key_to_str(key), 't': self._ts()})
 
     def _on_key_release(self, key) -> None:
@@ -237,6 +267,8 @@ class MacroRecorder:
         if key in _STOP_KEYS:
             return
         with self._lock:
+            if self._check_cap():
+                return
             self._events.append({'type': 'key_release', 'key': _key_to_str(key), 't': self._ts()})
 
     # ── Playback ──────────────────────────────────────────────────────────────

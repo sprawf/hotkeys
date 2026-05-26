@@ -3,92 +3,108 @@
     "title": "Refine",
     "color": "#B2EBF2",
     "hotkey": "f1",
+    "description": "Fix grammar, spelling & clarity — keeps the same meaning",
     "prompt": "Fix grammar, spelling, and clarity. Improve the tone to sound natural and professional. Keep the same meaning and approximate length — do not add, remove, or expand ideas. Return only the corrected text."
   },
   {
     "title": "Improve and Expand",
     "color": "#E1BEE7",
     "hotkey": "f2",
-    "prompt": "Improve, Refine, Optimize, and Expand the User’s Prompt. Transform the original prompt into a more articulate, detailed, and intellectually rich version of itself. This refinement must: Clarify the user’s intent. Expand the scope where beneficial. Add precision, nuance, and contextual depth. Make the language more formal, expressive, and verbose. The result should read like a polished, high-level research or creative brief written by an expert. Return only the refined text, no commentary."
+    "description": "Expands your text into a detailed, articulate version",
+    "prompt": "Improve, Refine, Optimize, and Expand the User's Prompt. Transform the original prompt into a more articulate, detailed, and intellectually rich version of itself. This refinement must: Clarify the user's intent. Expand the scope where beneficial. Add precision, nuance, and contextual depth. Make the language more formal, expressive, and verbose. The result should read like a polished, high-level research or creative brief written by an expert. Return only the refined text, no commentary."
   },
   {
     "title": "Translate",
     "color": "#FFF9C4",
     "hotkey": "f3",
+    "description": "Translates selected text to Spanish",
     "prompt": "Translate the following text into Spanish. Return only the translated text — no explanation, no labels, no original text."
   },
   {
     "title": "System Prompt",
     "color": "#DCEDC8",
     "hotkey": "f4",
-    "prompt": "Recraft the input into a version optimized for use as a system prompt. Write in direct imperative tone addressed to the model using ‘you,’ stripped of all meta-language and self-reference, free of conversational hedging, and structured for immediate deployment at the top of a conversation. Every instruction must be actionable, unambiguous, and independently intelligible without external context. Return only the system prompt, no labels or commentary."
+    "description": "Turns your idea into a ready-to-use AI system prompt",
+    "prompt": "Recraft the input into a version optimized for use as a system prompt. Write in direct imperative tone addressed to the model using 'you,' stripped of all meta-language and self-reference, free of conversational hedging, and structured for immediate deployment at the top of a conversation. Every instruction must be actionable, unambiguous, and independently intelligible without external context. Return only the system prompt, no labels or commentary."
   },
   {
     "title": "Simplify",
     "color": "#F8BBD0",
     "hotkey": "f5",
+    "description": "Cuts jargon and complexity — makes any text easy to read",
     "prompt": "Rewrite the input to be as clear and concise as possible. Remove redundancy, jargon, and unnecessary complexity. Every sentence must be immediately understandable. Preserve all essential meaning. Return only the simplified text."
   },
   {
     "title": "Technical Depth",
     "color": "#FFE0B2",
     "hotkey": "f6",
+    "description": "Adds technical precision for engineers and domain experts",
     "prompt": "Rewrite the input with added technical precision and specificity. Replace vague terms with exact technical language, add relevant implementation detail, and clarify any ambiguous requirements. Assume the reader is a senior engineer or domain expert. Return only the rewritten text."
   },
   {
     "title": "Expand",
     "color": "#E1BEE7",
     "hotkey": "f7",
+    "description": "Adds context and detail without changing the topic",
     "prompt": "Expand the input into a detailed, comprehensive version. Add relevant context, elaborate on implied details, and develop underdeveloped ideas — staying strictly within the scope of what the original implies. Do not introduce new topics or goals. Return only the expanded text."
   },
   {
     "title": "Professional",
     "color": "#DCEDC8",
     "hotkey": "f8",
+    "description": "Rewrites in polished, business-appropriate language",
     "prompt": "Rewrite the input in polished, professional language. Keep the same meaning and approximate length — do not expand, summarize, or add new content. Return only the rewritten text."
   },
   {
     "title": "Ask Claude",
     "color": "#B2DFDB",
     "hotkey": "f9",
+    "description": "Turns vague ideas into a sharp, specific AI prompt",
     "prompt": "Rewrite the following as a clear, specific prompt for an AI assistant. Keep the same scope — do not add assumptions or expand beyond what is implied. Remove vagueness, fix grammar, and make the intent immediately actionable. Keep it concise. Do not answer it. Return only the rewritten prompt."
   },
   {
     "title": "Pirate",
     "color": "#BBDEFB",
     "hotkey": "f10",
+    "description": "Rewrites anything in dramatic pirate captain style",
     "prompt": "Rewrite the input in the style of a dramatic, eloquent pirate captain — nautical slang, theatrical flair, bold swagger. Make it entertaining while preserving the original meaning. Return only the rewritten text."
   },
   {
     "title": "ELI5",
     "color": "#FFF9C4",
     "hotkey": "f11",
+    "description": "Explains anything as if you're five years old",
     "prompt": "Explain the input as if the reader is five years old. Use simple words, short sentences, fun analogies, and zero jargon. Make it impossible not to understand. Return only the simplified explanation."
   },
   {
     "title": "Tweet",
     "color": "#F8BBD0",
     "hotkey": "f12",
+    "description": "Compresses your idea into a punchy tweet under 280 chars",
     "prompt": "Compress the input into a single punchy tweet under 280 characters. Keep the sharpest idea, cut everything else. No hashtags unless they add meaning. Return only the tweet text."
   },
   {
     "title": "Brutally Honest",
     "color": "#FFE0B2",
+    "description": "Strips politeness padding — says exactly what is meant",
     "prompt": "Rewrite the input with zero sugarcoating, hedging, or filler. Say exactly what is meant, directly and bluntly. Cut all politeness padding that dilutes the message. Return only the blunt version."
   },
   {
     "title": "Story Hook",
     "color": "#E1BEE7",
+    "description": "Turns your topic into an irresistible opening line",
     "prompt": "Transform the input into a single gripping opening line for a story or article — something that makes it impossible to stop reading. Create tension, mystery, or a vivid image. Return only the hook."
   },
   {
     "title": "Devil's Advocate",
     "color": "#D7CCC8",
+    "description": "Argues the exact opposite position with full conviction",
     "prompt": "Rewrite the input arguing the exact opposite position with equal conviction and logic. Do not acknowledge the original view — commit fully to the counter-argument. Return only the counter-argument."
   },
   {
     "title": "Haiku",
     "color": "#B2DFDB",
+    "description": "Distills any idea into a precise 5-7-5 haiku",
     "prompt": "Distill the core idea of the input into a haiku (5-7-5 syllables). Capture the essence with precision and imagery. Return only the haiku, no title or explanation."
   }
 ]

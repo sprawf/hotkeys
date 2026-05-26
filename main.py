@@ -27,6 +27,7 @@ from storage  import (
     load_config, save_config, load_prompts, save_prompts,
     appdata_dir, log_path, models_dir, assets_dir, history_path,
     save_history, load_history, make_whisper_cfg, _HISTORY_MAX_ENTRIES,
+    load_chains, save_chains,
 )
 from engine      import build_provider, LocalProvider, Provider, local_provider_available
 from overlay     import OverlayWindow
@@ -43,8 +44,10 @@ from screenshot       import take_screenshot, start_prtsc_listener
 from macros.recorder      import MacroRecorder
 from macros.library       import MacroLibrary
 from macros.save_prompt   import MacroSavePrompt
-from screen_recorder      import Recorder as ScreenRecorder, RecorderSetupDialog, show_save_dialog
-from gif_recorder         import GifRecorder, GifSetupDialog, show_gif_save_dialog
+from screen_recorder      import Recorder as ScreenRecorder, show_save_dialog
+from gif_recorder         import GifRecorder, GifSetupDialog, show_gif_save_dialog, add_to_gif_index
+from explain_pill         import AskPill
+from quicknotes           import QuickNotesWindow
 
 ctk.set_appearance_mode('dark')
 ctk.set_default_color_theme('dark-blue')
@@ -62,125 +65,222 @@ logger = logging.getLogger('main')
 
 VERSION = '1.0.0'
 
+# Sentinel passed to _do_ask when image OCR finds no text
+_ASK_NO_TEXT = '\x00IMAGE_NO_TEXT'
+
+# Phrases the vision model returns when an image has no readable text
+_NO_TEXT_PHRASES = (
+    'there is no text',
+    'no text found',
+    'no text detected',
+    'no text visible',
+    'no text in this image',
+    'image contains no text',
+    'does not contain text',
+    'i cannot find any text',
+    'there are no words',
+    'no readable text',
+    'cannot extract text',
+    'no text to extract',
+)
+
+
+def _ocr_is_no_text(text: str) -> bool:
+    """Return True if the OCR result indicates no text was found in the image."""
+    if not text or not text.strip():
+        return True
+    t = text.lower()
+    return any(phrase in t for phrase in _NO_TEXT_PHRASES)
+
 
 # ── App ───────────────────────────────────────────────────────────────────────
 
 # ── Splash screen ────────────────────────────────────────────────────────────
 
 class SplashScreen:
-    """Startup progress window — shows what the app is doing, closes when ready."""
+    """Startup pill — bolt logo + spinning ring, same aesthetic as overlay pills."""
 
-    _SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+    _TRANSP  = '#010101'   # Windows transparentcolor
+    _RADIUS  = 22
+    _H       = 52
+    _W       = 360
+    _ICO     = 32          # bolt icon size (px)
+    _ICON_CX = 30          # icon centre x
 
     def __init__(self, root: ctk.CTk, provider_label: str) -> None:
-        self._root    = root
-        self._closed  = False
-        self._done    = {'app': True, 'whisper': False, 'provider': False}
-        self._spin_i  = 0
-        self._rows: dict[str, tuple[ctk.CTkLabel, ctk.CTkLabel]] = {}
+        from theme import SURFACE, ACCENT, OK, ERR, TEXT_P, TEXT_S, FONT_FAMILY
+        self._root           = root
+        self._closed         = False
+        self._done           = {'app': True, 'whisper': False, 'provider': False}
+        self._has_error      = False
+        self._provider_label = provider_label
+        self._font_family    = FONT_FAMILY
+        self._c_surface      = SURFACE
+        self._c_accent       = ACCENT
+        self._c_ok           = OK
+        self._c_err          = ERR
+        self._c_text         = TEXT_P
+        self._c_sub          = TEXT_S
+        self._text_id        = None
+        self._sub_id         = None
+        self._icon_img       = None     # keep PhotoImage ref alive
 
-        steps = [
-            ('app',      'App started'),
-            ('whisper',  'Loading Whisper model'),
-            ('provider', provider_label),
-        ]
-
-        win = ctk.CTkToplevel(root)
-        win.title('')
+        win = tk.Toplevel(root)
         win.overrideredirect(True)
         win.attributes('-topmost', True)
-        win.configure(fg_color='#111111')
+        win.attributes('-transparentcolor', self._TRANSP)
+        win.configure(bg=self._TRANSP)
         win.resizable(False, False)
-
-        card = ctk.CTkFrame(win, fg_color='#1c1c1c', corner_radius=16,
-                            border_width=1, border_color='#2e2e2e')
-        card.pack(padx=1, pady=1, ipadx=4, ipady=4)
-
-        # Header
-        hdr = ctk.CTkFrame(card, fg_color='transparent')
-        hdr.pack(fill='x', padx=26, pady=(18, 10))
-        ctk.CTkLabel(hdr, text='⚡  Hotkeys',
-                     font=('Segoe UI', 17, 'bold'),
-                     text_color='#9090e0').pack(side='left')
-        self._status_lbl = ctk.CTkLabel(hdr, text='Starting…',
-                                         font=('Segoe UI', 11),
-                                         text_color='#505050')
-        self._status_lbl.pack(side='right')
-
-        # Divider
-        ctk.CTkFrame(card, fg_color='#2a2a2a', height=1,
-                     corner_radius=0).pack(fill='x', padx=22, pady=(0, 4))
-
-        # Step rows
-        body = ctk.CTkFrame(card, fg_color='transparent')
-        body.pack(fill='x', padx=26, pady=(8, 20))
-
-        for key, label in steps:
-            done = self._done[key]
-            row  = ctk.CTkFrame(body, fg_color='transparent')
-            row.pack(fill='x', pady=3)
-
-            icon_lbl = ctk.CTkLabel(row,
-                                     text='✓' if done else '⠋',
-                                     font=('Consolas', 13), width=20,
-                                     text_color='#4ec94e' if done else '#505050')
-            icon_lbl.pack(side='left')
-
-            text_lbl = ctk.CTkLabel(row, text=label,
-                                     font=('Segoe UI', 13),
-                                     text_color='#d0d0d0' if done else '#777777',
-                                     anchor='w')
-            text_lbl.pack(side='left', padx=(8, 0))
-
-            self._rows[key] = (icon_lbl, text_lbl)
-
-        # Position: center screen
-        win.update_idletasks()
-        rw = win.winfo_reqwidth() + 2
-        rh = win.winfo_reqheight() + 2
-        sw = win.winfo_screenwidth()
-        sh = win.winfo_screenheight()
-        win.geometry(f'{rw}x{rh}+{(sw - rw) // 2}+{(sh - rh) // 2}')
-
         self._win = win
-        self._animate()   # start spinner
 
-    # ── Public API (call from main thread via _q) ─────────────────────────────
+        self._canvas = tk.Canvas(
+            win, width=self._W, height=self._H,
+            bg=self._TRANSP, highlightthickness=0,
+        )
+        self._canvas.pack()
+
+        self._build_pill(self._c_accent)
+        self._build_icon()
+        self._build_text('Loading Whisper…', self._c_sub)
+
+        win.update_idletasks()
+        sw = win.winfo_screenwidth()
+        win.geometry(f'{self._W}x{self._H}+{sw - self._W - 20}+20')
+
+        self._animate()
+
+    # ── Build helpers (called once; ring/text updated in place) ───────────────
+
+    def _build_pill(self, accent: str) -> None:
+        c = self._canvas
+        W, H, R = self._W, self._H, self._RADIUS
+        pts = [
+            R, 0,   W-R, 0,
+            W, 0,   W,   R,
+            W, H-R, W,   H,
+            W-R, H, R,   H,
+            0,   H, 0,   H-R,
+            0,   R, 0,   0,
+        ]
+        c.create_polygon(pts, smooth=True,
+                         fill=self._c_surface, outline=accent, width=1,
+                         tags='pill')
+
+    def _build_icon(self) -> None:
+        """Render the bolt logo (same as tray icon) as a PhotoImage on the canvas."""
+        from PIL import Image as _Img, ImageDraw as _IDraw, ImageFilter as _IF, ImageTk
+        S = 4
+        B = self._ICO * S
+
+        def _hex(h):
+            h = h.lstrip('#')
+            return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+
+        def _grad_mask(mask, c1, c2):
+            r1,g1,b1 = _hex(c1); r2,g2,b2 = _hex(c2)
+            grad = _Img.new('RGBA', (B, B))
+            dg   = _IDraw.Draw(grad)
+            for y in range(B):
+                t = y / (B - 1)
+                dg.line([(0,y),(B,y)], fill=(
+                    int(r1+(r2-r1)*t), int(g1+(g2-g1)*t), int(b1+(b2-b1)*t), 255))
+            out = _Img.new('RGBA', (B, B), (0,0,0,0))
+            out.paste(grad, mask=mask.split()[0])
+            return out
+
+        base = _Img.new('RGBA', (B, B), (0,0,0,0))
+        d    = _IDraw.Draw(base)
+        d.rounded_rectangle([0,0,B-1,B-1], radius=13*S//2, fill='#7c3aed')
+        d.rounded_rectangle([3*S//2,3*S//2,B-1-3*S//2,B-1-3*S//2], radius=11*S//2, fill='#080f1a')
+
+        BOLT = [(x*S//2, y*S//2) for x,y in [(42,4),(10,34),(28,34),(22,60),(52,26),(36,26)]]
+        bolt_mask = _Img.new('RGBA', (B, B), (0,0,0,0))
+        _IDraw.Draw(bolt_mask).polygon(BOLT, fill='white')
+
+        glow = _grad_mask(bolt_mask.filter(_IF.GaussianBlur(6)), '#7dd3fc', '#1e40af')
+        base = _Img.alpha_composite(base, glow)
+        base = _Img.alpha_composite(base, _grad_mask(bolt_mask, '#bae6fd', '#0f2a6e'))
+        base = base.resize((self._ICO, self._ICO), _Img.LANCZOS)
+
+        self._icon_img = ImageTk.PhotoImage(base)
+        cx = self._icon_cx()
+        cy = self._H // 2
+        self._canvas.create_image(cx, cy, image=self._icon_img, anchor='center', tags='icon')
+
+    def _build_text(self, sub: str, sub_color: str) -> None:
+        tx = self._ICON_CX + self._ICO // 2 + 14
+        cy = self._H // 2
+        self._text_id = self._canvas.create_text(
+            tx, cy - 7,
+            text='Hotkeys', anchor='w',
+            font=(self._font_family, 13, 'bold'),
+            fill=self._c_text,
+        )
+        self._sub_id = self._canvas.create_text(
+            tx, cy + 8,
+            text=sub, anchor='w',
+            font=(self._font_family, 10),
+            fill=sub_color,
+        )
+
+    def _icon_cx(self) -> int:
+        return self._ICON_CX
+
+    # ── Public API ────────────────────────────────────────────────────────────
 
     def mark_done(self, step: str) -> None:
         if self._closed:
             return
         self._done[step] = True
-        icon_lbl, text_lbl = self._rows[step]
-        icon_lbl.configure(text='✓', text_color='#4ec94e')
-        text_lbl.configure(text_color='#e0e0e0')
         if all(self._done.values()):
-            self._status_lbl.configure(text='Ready ✓', text_color='#4ec94e')
-            self._root.after(1200, self._close)
+            try:
+                self._canvas.itemconfigure('pill', outline=self._c_ok)
+                self._canvas.itemconfigure(self._sub_id,
+                                           text='Ready  ✓', fill=self._c_ok)
+            except Exception:
+                pass
+            try:
+                play_start()
+            except Exception:
+                pass
+            self._root.after(1400, self._close)
+        else:
+            self._refresh_sub()
 
     def mark_error(self, step: str) -> None:
         if self._closed:
             return
-        self._done[step] = True   # treat as done so we don't block forever
-        icon_lbl, text_lbl = self._rows[step]
-        icon_lbl.configure(text='✗', text_color='#e05050')
-        text_lbl.configure(text_color='#cc8888')
+        self._done[step] = True
+        self._has_error = True
+        try:
+            self._canvas.itemconfigure('pill', outline=self._c_err)
+            self._canvas.itemconfigure(self._sub_id,
+                                       text='Error — check log', fill=self._c_err)
+        except Exception:
+            pass
         if all(self._done.values()):
-            self._status_lbl.configure(text='Error', text_color='#e05050')
-            self._root.after(2500, self._close)
+            self._root.after(2800, self._close)
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
+    def _refresh_sub(self) -> None:
+        if self._has_error or self._closed:
+            return
+        pending = [k for k, v in self._done.items() if not v]
+        if not pending:
+            return
+        step = pending[0]
+        msg = 'Loading Whisper…' if step == 'whisper' else f'{self._provider_label}…'
+        try:
+            self._canvas.itemconfigure(self._sub_id, text=msg)
+        except Exception:
+            pass
+
     def _animate(self) -> None:
-        """Rotate spinner on all pending steps every 80 ms."""
         if self._closed:
             return
-        self._spin_i = (self._spin_i + 1) % len(self._SPINNER)
-        ch = self._SPINNER[self._spin_i]
-        for key, (icon_lbl, _) in self._rows.items():
-            if not self._done.get(key):
-                icon_lbl.configure(text=ch)
-        self._root.after(80, self._animate)
+        self._refresh_sub()
+        self._root.after(120, self._animate)
 
     def _close(self) -> None:
         if self._closed:
@@ -273,12 +373,24 @@ class App:
         self.macro_overlay     = OverlayWindow(self.root, slot=2)
         self.recorder_overlay  = OverlayWindow(self.root, slot=3)
         self.gif_overlay       = OverlayWindow(self.root, slot=4)
+        self.chain_overlay     = OverlayWindow(self.root, slot=5)
+
+        # ── Chains ────────────────────────────────────────────────────────────
+        self.chains: list = load_chains()
+        self._chain_saved_hks: list = []
+
+        # ── Quick Notes ───────────────────────────────────────────────────────
+        self._notes_win: QuickNotesWindow | None = None
+
+        # ── AskPill tracking ──────────────────────────────────────────────────
+        # Keeps weak refs to open pills so _hk_escape can close them and
+        # _do_ask can replace a stale pill instead of stacking indefinitely.
+        self._ask_pills: list = []
 
         # ── Screen recorder ───────────────────────────────────────────────────
         self._screen_recorder: ScreenRecorder | None = None
         self._recorder_state  = 'idle'   # 'idle' | 'recording' | 'stopping'
         self._recorder_t0     = 0.0
-        self._recorder_setup_dlg = None   # open RecorderSetupDialog, if any
 
         # ── GIF recorder ──────────────────────────────────────────────────────
         self._gif_recorder: GifRecorder | None = None
@@ -304,7 +416,9 @@ class App:
                                       vision_extractor=self._vision_extractor,
                                       macro_library=self._macro_library,
                                       on_macro_play=self._on_library_macro_play,
-                                      on_macro_hotkeys_changed=self._register_macro_saved_hotkeys)
+                                      on_macro_hotkeys_changed=self._register_macro_saved_hotkeys,
+                                      on_feature_hotkey_changed=self._on_feature_hotkey_changed,
+                                      on_chains_changed=self._on_chains_changed_cb)
         # Wire the library's recorder tab toggle button → main.py handler
         self.library._on_recorder_toggle = lambda: self._q.put(('recorder:toggle', None))
         # Wire the library's macros tab right-click record → same queue event as Shift+F1
@@ -313,8 +427,13 @@ class App:
         self.library._on_macro_reset     = lambda: self._q.put(('macro:reset',     None))
         # Wire the library's GIF tab toggle button → main.py handler
         self.library._on_gif_toggle      = lambda: self._q.put(('gif:toggle',      None))
+        # Wire the library's Ask tab text input → ask handler
+        self.library._on_ask             = lambda text: self._q.put(('ask', text))
+        # Wire the library's Notes tab "New Note" button → open QuickNotesWindow
+        self.library._on_new_note        = self._do_open_notes
         self.settings = SettingsWindow(self.root, self.config,
-                                       on_save=self._on_settings_saved)
+                                       on_save=self._on_settings_saved,
+                                       on_restore=lambda: self._q.put(('restore_all_defaults', None)))
         self.history_win = HistoryWindow(self.root,
                                          on_history_cleared=self._on_history_cleared)
 
@@ -361,7 +480,7 @@ class App:
             'whisper:start':    lambda _: self._whisper_start_recording(),
             'whisper:stop':     lambda _: self._whisper_stop_recording(),
             'whisper:cancel':   lambda _: self._whisper_cancel_recording(),
-            'restore_defaults':  lambda _: self._do_restore_defaults(),
+            'restore_all_defaults': lambda _: self._do_restore_all_defaults(),
             'reload_hotkeys':   lambda _: self._reload_hotkeys_manual(),
             'prompt_hotkey':    self._on_prompt_hotkey,
             'whisper:status':   self._on_transcriber_status_event,
@@ -369,6 +488,7 @@ class App:
             'whisper:error':    self._on_whisper_error,
             'macro:hotkey':       self._on_macro_hotkey,
             'macro:stop':         self._on_macro_emergency_stop,
+            'macro:cap':          lambda _: self._on_macro_cap(),
             'macro:reset':        lambda _: self._macro_reset(),
             'macro:play_saved':   self._on_library_macro_play,
             'screenshot:cancel':  lambda _: self._do_cancel_screenshot(),
@@ -379,13 +499,23 @@ class App:
             'gif:cap':            lambda _: self._on_gif_cap(),
             'gif:done':           self._on_gif_done,
             'gif:error':          self._on_gif_error,
+            'ask':                self._do_ask,
+            'ask:close_all':      lambda _: self._close_all_ask_pills(),
+            'web':                lambda _: self._do_web(),
+            'chain':              self._do_chain,
+            'chain_named':        self._do_chain_named,
+            'notes':              lambda _: self._do_open_notes(),
         }
 
         self._register_hotkeys()
         self._register_macro_saved_hotkeys()
+        self._register_chain_hotkeys()
         self.root.after(2000, self._hotkey_watchdog)
         start_prtsc_listener(self._hk_screenshot)
         self._start_tray()
+
+        if not self.config.get('first_run_done'):
+            self.root.after(3000, self._show_first_run_tip)
 
         if isinstance(self.provider, LocalProvider):
             threading.Thread(target=self._load_model, daemon=True).start()
@@ -465,6 +595,14 @@ class App:
                                 lambda: self._q.put(('recorder:toggle', None)), suppress=False)
             keyboard.add_hotkey(hk.get('gif_record',   'shift+f3'),
                                 lambda: self._q.put(('gif:toggle',      None)), suppress=False)
+            keyboard.add_hotkey(hk.get('ask',          'shift+f4'),
+                                self._hk_ask,                                   suppress=False)
+            keyboard.add_hotkey(hk.get('web',          'shift+f5'),
+                                lambda: self._q.put(('web', None)),             suppress=False)
+            keyboard.add_hotkey(hk.get('chain',        'shift+f6'),
+                                self._hk_chain,                                 suppress=False)
+            keyboard.add_hotkey(hk.get('notes',        'shift+f7'),
+                                lambda: self._q.put(('notes', None)),           suppress=False)
 
             if ptt:
                 whisper_hk = hk.get('whisper', 'ctrl+enter')
@@ -588,38 +726,143 @@ class App:
             pass
         self.root.after(2000, self._hotkey_watchdog)
 
+    def _show_first_run_tip(self) -> None:
+        if self.config.get('first_run_done'):
+            return
+        self.config['first_run_done'] = True
+        threading.Thread(target=save_config, args=(self.config,), daemon=True).start()
+        try:
+            hk = self._hotkey_cfg()
+            refine_hk = hk.get('refine', 'alt+shift+w').upper()
+            lib_hk    = hk.get('library', 'alt+shift+e').upper()
+            self._tray.notify(
+                f'Select text → press {refine_hk} to refine with AI\n'
+                f'Press {lib_hk} to open the Prompt Library.',
+                'Hotkeys is running ⚡',
+            )
+        except Exception:
+            pass
+
     def _reload_hotkeys_manual(self) -> None:
         """Full reset from tray menu — cancels anything stuck, re-registers hotkeys."""
         logger.info('Manual reload requested from tray.')
-        # Close any open recorder/gif setup dialogs that may be stuck
-        # (e.g. triggered with library closed → parent withdrawn → dialog invisible)
-        for attr in ('_recorder_setup_dlg', '_gif_setup_dlg'):
-            dlg = getattr(self, attr, None)
-            if dlg is not None:
-                try:
-                    dlg.win.grab_release()
-                    dlg.win.destroy()
-                except Exception:
-                    pass
-                setattr(self, attr, None)
-        # Cancel any stuck recording
+
+        # ── 1. Reload config from disk so hotkeys reflect the latest saved values ──
+        try:
+            fresh = load_config()
+            self.config.update(fresh)
+            logger.info('Config reloaded from disk for hotkey reset.')
+        except Exception as e:
+            logger.warning(f'Config reload failed during manual reset: {e}')
+
+        # ── 2. Close any open GIF setup dialog that may be stuck ──────────────────
+        dlg = getattr(self, '_gif_setup_dlg', None)
+        if dlg is not None:
+            try:
+                dlg.win.grab_release()
+                dlg.win.destroy()
+            except Exception:
+                pass
+            self._gif_setup_dlg = None
+
+        # ── 3. Close any floating AskPill windows that grabbed the pointer ────────
+        # Build a set of permanent app windows to skip — destroying these would
+        # corrupt self.library / self.settings with no recovery path.
+        _permanent = set()
+        for _attr in ('library', 'settings'):
+            try:
+                _w = getattr(self, _attr, None)
+                if _w is not None:
+                    _permanent.add(getattr(_w, 'win', None))
+            except Exception:
+                pass
+        for widget in self.root.winfo_children():
+            try:
+                if widget in _permanent:
+                    continue
+                if widget.winfo_class() == 'Toplevel':
+                    widget.grab_release()
+                    widget.destroy()
+            except Exception:
+                pass
+
+        # ── 4. Cancel any stuck whisper recording ─────────────────────────────────
         try:
             if self._whisper_recording:
                 self._whisper_cancel_recording()
         except Exception:
             pass
-        # Cancel any stuck refine
+
+        # ── 4b. Abort macro recording / playback ──────────────────────────────────
         try:
-            self.refine_overlay.hide()
+            if self._macro_state in ('recording', 'playing'):
+                self._macro.force_stop()
+                self._macro.clear()
+                self._macro_unregister_stop_keys()
+                self._set_macro_state('idle')
+                logger.info('Reload: macro recording/playback aborted')
         except Exception:
             pass
-        # Hide all overlays
+
+        # ── 4c. Stop active screen recording ──────────────────────────────────────
         try:
-            self.whisper_overlay.hide()
+            if self._recorder_state == 'recording' and self._screen_recorder is not None:
+                rec = self._screen_recorder
+                self._screen_recorder = None
+                self._recorder_state  = 'idle'
+                self._update_library_recorder_state()
+                threading.Thread(target=rec.stop, daemon=True).start()
+                logger.info('Reload: screen recording force-stopped')
         except Exception:
             pass
-        # Re-register hotkeys cleanly
+
+        # ── 4d. Stop active GIF recording ─────────────────────────────────────────
+        try:
+            if self._gif_state in ('recording', 'encoding') and self._gif_recorder is not None:
+                rec = self._gif_recorder
+                self._gif_recorder = None
+                self._gif_state    = 'idle'
+                self._update_library_gif_state()
+                threading.Thread(target=rec.force_stop, daemon=True).start()
+                logger.info('Reload: GIF recording force-stopped')
+        except Exception:
+            pass
+
+        # ── 4e. Close Quick Notes (save pending content first) ────────────────────
+        try:
+            if self._notes_win is not None:
+                win = self._notes_win
+                self._notes_win = None
+                try:
+                    win._save_and_close()
+                except Exception:
+                    try:
+                        win.destroy()
+                    except Exception:
+                        pass
+                logger.info('Reload: Quick Notes window closed')
+        except Exception:
+            pass
+
+        # ── 4f. Close any floating AskPills ──────────────────────────────────────
+        try:
+            self._close_all_ask_pills()
+        except Exception:
+            pass
+
+        # ── 5. Hide all overlays ──────────────────────────────────────────────────
+        for ov in (self.refine_overlay, self.whisper_overlay,
+                   self.macro_overlay, self.recorder_overlay, self.gif_overlay,
+                   self.chain_overlay):
+            try:
+                ov.hide()
+            except Exception:
+                pass
+
+        # ── 6. Re-register all hotkeys (global + per-prompt + saved macros) ───────
         self._register_hotkeys()
+        self._register_macro_saved_hotkeys()
+        self._register_chain_hotkeys()
         self._notify('Hotkeys reset ⚡', 'All hotkeys reloaded and ready.')
 
     def _schedule_rereg(self, delay_ms: int = 80) -> None:
@@ -694,6 +937,433 @@ class App:
         logger.info(f'Captured text ({len(captured)} chars): {captured[:80]!r}')
         self._q.put(('refine', captured))
 
+    def _hk_ask(self) -> None:
+        """Shift+F4 — capture selected text and show answer pill."""
+        threading.Thread(target=self._capture_and_queue_ask, daemon=True).start()
+
+    def _capture_and_queue_ask(self) -> None:
+        """Capture question for Shift+F4.
+
+        Priority:
+          0. Screenshot overlay with an active drag selection → crop + OCR.
+          1. Image in clipboard → OCR it, use extracted text as the question.
+          2. Selected text → copy and use as the question.
+        """
+        # ── Priority 0: screenshot overlay with active selection ─────────────
+        # Check BEFORE the Shift-release wait so the overlay closes immediately.
+        from screenshot import _overlay_active, _pending_overlay
+        if _overlay_active[0]:
+            ov = _pending_overlay[0]
+            if ov is not None:
+                img = ov.capture_for_ask()
+                if img is not None:
+                    logger.info('Ask: capturing from screenshot overlay selection')
+                    self.root.after(0, ov._close)   # close overlay on main thread
+                    try:
+                        extractor = self._vision_extractor
+                        captured  = extractor(img).strip()
+                        logger.info(
+                            f'Ask: overlay OCR gave ({len(captured)} chars): {captured[:80]!r}')
+                        if _ocr_is_no_text(captured):
+                            self._q.put(('ask', _ASK_NO_TEXT))
+                        else:
+                            self._q.put(('ask', captured))
+                        return
+                    except Exception as exc:
+                        logger.warning(f'Ask: overlay OCR failed ({exc}) — falling back')
+
+        # Wait for Shift to release before doing anything with the clipboard
+        if sys.platform == 'win32':
+            _u32 = ctypes.windll.user32
+            _deadline = time.time() + 0.5
+            while time.time() < _deadline:
+                if not _u32.GetAsyncKeyState(0x10) & 0x8000:   # VK_SHIFT
+                    break
+                time.sleep(0.015)
+        time.sleep(0.04)
+
+        # ── Priority 1: image in clipboard → OCR → use as question ──────────
+        try:
+            from vision import get_clipboard_image
+            img, err = get_clipboard_image()
+            if img is not None:
+                logger.info('Ask: image in clipboard — OCR-ing before answering')
+                try:
+                    extractor = self._vision_extractor
+                    captured  = extractor(img).strip()
+                    logger.info(f'Ask: OCR gave ({len(captured)} chars): {captured[:80]!r}')
+                    if _ocr_is_no_text(captured):
+                        self._q.put(('ask', _ASK_NO_TEXT))
+                    else:
+                        self._q.put(('ask', captured))
+                    return
+                except Exception as exc:
+                    logger.warning(f'Ask: OCR failed ({exc}) — falling back to selection')
+            elif err:
+                logger.warning(f'Ask: clipboard image error: {err}')
+        except Exception as exc:
+            logger.warning(f'Ask: clipboard check failed: {exc}')
+
+        # ── Priority 2: selected text ─────────────────────────────────────────
+        try:
+            prev = pyperclip.paste()
+        except Exception:
+            prev = ''
+        try:
+            pyperclip.copy('')
+        except Exception:
+            pass
+        copy_selection()
+        captured = ''
+        for _ in range(25):
+            time.sleep(0.03)
+            try:
+                current = pyperclip.paste()
+            except Exception:
+                continue
+            if current and current.strip():
+                captured = current
+                break
+        if not captured:
+            try:
+                pyperclip.copy(prev)
+            except Exception:
+                pass
+        logger.info(f'Ask: captured ({len(captured)} chars): {captured[:80]!r}')
+        self._q.put(('ask', captured))
+
+    def _close_all_ask_pills(self) -> None:
+        """Close every tracked AskPill. Safe to call from main thread."""
+        for pill in list(self._ask_pills):
+            try:
+                pill._close()
+            except Exception:
+                pass
+        self._ask_pills.clear()
+
+    def _do_ask(self, text: str) -> None:
+        """Main-thread handler — open the answer pill."""
+        # Close any existing pill before opening a new one — prevents stacking.
+        self._close_all_ask_pills()
+
+        def _on_pill_close(pill_ref):
+            try:
+                self._ask_pills.remove(pill_ref)
+            except ValueError:
+                pass
+
+        if not text or not text.strip():
+            pill = AskPill(self.root, '', self.provider,
+                           static='Select text first — or type below')
+            pill._on_close = lambda p=pill: _on_pill_close(p)
+            self._ask_pills.append(pill)
+            threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
+            return
+        if text == _ASK_NO_TEXT:
+            # Image had no readable text — show status pill, no API call
+            pill = AskPill(self.root, '', self.provider,
+                           static='No text found in image')
+            pill._on_close = lambda p=pill: _on_pill_close(p)
+            self._ask_pills.append(pill)
+            threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
+            return
+        if not self.provider.ready:
+            self.refine_overlay.show_error('API key required — open Settings')
+            threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
+            return
+        pill = AskPill(self.root, text.strip(), self.provider)
+        pill._on_close = lambda p=pill: _on_pill_close(p)
+        self._ask_pills.append(pill)
+        threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
+
+    def _do_web(self) -> None:
+        """Open the active bookmark in the default browser."""
+        import webbrowser
+        from storage import get_active_bookmark
+        bm = get_active_bookmark()
+        if not bm:
+            self.refine_overlay.show_error('No bookmark set — open Web tab to add one')
+            return
+        url = bm['url']
+        if not url.startswith(('http://', 'https://')):
+            url = 'https://' + url
+        threading.Thread(target=lambda: webbrowser.open(url), daemon=True).start()
+
+    # ── Quick Notes ───────────────────────────────────────────────────────────
+
+    def _do_open_notes(self) -> None:
+        """Shift+F7 — toggle / restore the Quick Notes overlay."""
+        if self._notes_win is not None:
+            try:
+                if self._notes_win.winfo_exists():
+                    # If minimized (withdrawn), restore it
+                    if not self._notes_win.winfo_viewable():
+                        self._notes_win.deiconify()
+                        self._notes_win.lift()
+                        return
+                    # If visible, close+save it
+                    self._notes_win._save_and_close()
+                    return
+            except Exception:
+                pass
+            self._notes_win = None
+
+        def _on_close():
+            self._notes_win = None
+            threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
+            # Refresh Notes tab in library if it's currently visible
+            try:
+                if (self.library and
+                        getattr(self.library, '_active_tab', None) == 'notes' and
+                        self.library.win.winfo_viewable()):
+                    self.root.after(0, self.library._render_notes_tab)
+            except Exception:
+                pass
+
+        def _mic_busy() -> bool:
+            """Returns True when any other feature is actively using the microphone."""
+            return bool(self._whisper_recording)
+
+        def _on_geometry_change(geo: str) -> None:
+            self.config['notes_geometry'] = geo
+            threading.Thread(target=save_config, args=(self.config,), daemon=True).start()
+
+        self._notes_win = QuickNotesWindow(
+            self.root,
+            transcribe_fn=self._transcriber.transcribe_for_notes,
+            on_close=_on_close,
+            mic_busy_fn=_mic_busy,
+            vision_extractor=self._vision_extractor,
+            provider=self.provider,
+            initial_geometry=self.config.get('notes_geometry', ''),
+            on_geometry_change=_on_geometry_change,
+        )
+
+    # ── Chain hotkey ─────────────────────────────────────────────────────────
+
+    def _hk_chain(self) -> None:
+        """Shift+F6 (or per-chain hotkey) — capture text and run active chain."""
+        logger.info('Chain hotkey fired.')
+        threading.Thread(target=self._capture_and_queue_chain, daemon=True).start()
+
+    def _capture_and_queue_chain(self) -> None:
+        """Same modifier-release wait + Ctrl+C logic as _capture_and_queue."""
+        if sys.platform == 'win32':
+            _u32 = ctypes.windll.user32
+            _deadline = time.time() + 0.5
+            while time.time() < _deadline:
+                if not (_u32.GetAsyncKeyState(0x10) & 0x8000 or   # VK_SHIFT
+                        _u32.GetAsyncKeyState(0x12) & 0x8000):    # VK_MENU (Alt)
+                    break
+                time.sleep(0.015)
+        else:
+            try:
+                import keyboard as _kb
+                _deadline = time.time() + 0.5
+                while time.time() < _deadline:
+                    if not (_kb.is_pressed('shift') or _kb.is_pressed('alt')):
+                        break
+                    time.sleep(0.015)
+            except Exception:
+                pass
+        time.sleep(0.04)
+        try:
+            prev = pyperclip.paste()
+        except Exception:
+            prev = ''
+        try:
+            pyperclip.copy('')
+        except Exception:
+            pass
+        copy_selection()
+        captured = ''
+        for _ in range(25):
+            time.sleep(0.03)
+            try:
+                current = pyperclip.paste()
+            except Exception:
+                continue
+            if current and current.strip():
+                captured = current
+                break
+        if not captured:
+            try:
+                pyperclip.copy(prev)
+            except Exception:
+                pass
+        logger.info(f'Chain: captured text ({len(captured)} chars): {captured[:80]!r}')
+        self._q.put(('chain', captured))
+
+    def _do_chain(self, text: str) -> None:
+        """Main-thread handler — find active chain and start runner thread."""
+        if self._refine_in_progress:
+            self.chain_overlay.show_error('Refine in progress — wait for it to finish')
+            threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
+            return
+        if self._whisper_recording:
+            self.chain_overlay.show_error('Recording in progress — stop first')
+            threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
+            return
+        self.chains = load_chains()
+        active_chain = next((c for c in self.chains if c.get('active')), None)
+        if not self.chains or active_chain is None:
+            self.chain_overlay.show_error('No active chain — open Chains tab to set one')
+            threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
+            return
+        if not text or not text.strip():
+            self.chain_overlay.show_no_selection()
+            threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
+            return
+        if not self.provider.ready:
+            self.chain_overlay.show_error('API key required — open Settings')
+            threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
+            return
+        threading.Thread(
+            target=self._run_chain,
+            args=(active_chain, text.strip()),
+            daemon=True,
+        ).start()
+
+    def _run_chain(self, chain: dict, text: str) -> None:
+        """Background thread — execute all steps sequentially."""
+        steps = chain.get('steps', [])
+        if not steps:
+            self.root.after(0, lambda: self.chain_overlay.show_error('Chain has no steps'))
+            return
+        current_text = text
+        try:
+            for i, step in enumerate(steps):
+                lbl = step.get('label', f'Step {i + 1}')
+                self.root.after(
+                    0,
+                    lambda i=i, lbl=lbl: self.chain_overlay.show_chain_step(
+                        i + 1, len(steps), lbl
+                    ),
+                )
+                result = self.provider.refine(current_text, step['prompt'])
+                if not result or not result.strip():
+                    raise RuntimeError(f'Step {i + 1} ({lbl}) returned empty response')
+                current_text = result.strip()
+            # All steps done — paste result
+            name = chain.get('name', 'Chain')
+            self.root.after(0, lambda: self.chain_overlay.show_chain_done(name))
+            pyperclip.copy(current_text)
+            self.root.after(40, paste_from_clipboard)
+            self.root.after(150, self._reregister_after_action)
+            logger.info(f'Chain "{name}" complete — {len(steps)} steps')
+        except Exception as ex:
+            logger.error(f'Chain error: {ex}')
+            err_msg = str(ex)
+            if '429' in err_msg or 'rate' in err_msg.lower() or 'quota' in err_msg.lower():
+                err_msg = 'Rate limit reached — try again later'
+            elif 'api key' in err_msg.lower() or '401' in err_msg:
+                err_msg = 'Invalid API key — check Settings'
+            short = (err_msg[:48] + '…') if len(err_msg) > 48 else err_msg
+            self.root.after(0, lambda e=short: self.chain_overlay.show_error(f'Chain error: {e}'))
+            self.root.after(0, self._reregister_after_action)
+
+    def _do_chain_named(self, chain: dict) -> None:
+        """Main-thread handler for per-chain hotkeys — captures text then runs that chain."""
+        # Reuse the same capture flow but run a specific chain
+        threading.Thread(
+            target=self._capture_and_queue_chain_named,
+            args=(chain,),
+            daemon=True,
+        ).start()
+
+    def _capture_and_queue_chain_named(self, chain: dict) -> None:
+        """Same as _capture_and_queue_chain but dispatches to run a specific chain."""
+        if sys.platform == 'win32':
+            _u32 = ctypes.windll.user32
+            _deadline = time.time() + 0.5
+            while time.time() < _deadline:
+                if not (_u32.GetAsyncKeyState(0x10) & 0x8000 or
+                        _u32.GetAsyncKeyState(0x12) & 0x8000):
+                    break
+                time.sleep(0.015)
+        else:
+            try:
+                import keyboard as _kb
+                _deadline = time.time() + 0.5
+                while time.time() < _deadline:
+                    if not (_kb.is_pressed('shift') or _kb.is_pressed('alt')):
+                        break
+                    time.sleep(0.015)
+            except Exception:
+                pass
+        time.sleep(0.04)
+        try:
+            prev = pyperclip.paste()
+        except Exception:
+            prev = ''
+        try:
+            pyperclip.copy('')
+        except Exception:
+            pass
+        copy_selection()
+        captured = ''
+        for _ in range(25):
+            time.sleep(0.03)
+            try:
+                current = pyperclip.paste()
+            except Exception:
+                continue
+            if current and current.strip():
+                captured = current
+                break
+        if not captured:
+            try:
+                pyperclip.copy(prev)
+            except Exception:
+                pass
+        if not captured or not captured.strip():
+            self.root.after(0, lambda: self.chain_overlay.show_no_selection())
+            self.root.after(0, lambda: threading.Thread(
+                target=self._register_hotkeys_bg, daemon=True).start())
+            return
+        if not self.provider.ready:
+            self.root.after(0, lambda: self.chain_overlay.show_error(
+                'API key required — open Settings'))
+            self.root.after(0, lambda: threading.Thread(
+                target=self._register_hotkeys_bg, daemon=True).start())
+            return
+        threading.Thread(
+            target=self._run_chain,
+            args=(chain, captured.strip()),
+            daemon=True,
+        ).start()
+
+    def _on_chains_changed_cb(self) -> None:
+        """Called by LibraryWindow when a chain is added/edited/deleted.
+        Reloads chain data and re-registers per-chain hotkeys."""
+        self.chains = load_chains()
+        self._register_chain_hotkeys()
+
+    def _register_chain_hotkeys(self) -> None:
+        """Re-register per-chain playback hotkeys (chains with a hotkey field set)."""
+        for hk in self._chain_saved_hks:
+            try:
+                keyboard.remove_hotkey(hk)
+            except Exception:
+                pass
+        self._chain_saved_hks = []
+        self.chains = load_chains()
+        for chain in self.chains:
+            hk = chain.get('hotkey', '').strip()
+            if not hk:
+                continue
+            cname = chain.get('name', 'Chain')
+            try:
+                handle = keyboard.add_hotkey(
+                    hk,
+                    lambda c=chain: self._q.put(('chain_named', c)),
+                    suppress=False,
+                )
+                self._chain_saved_hks.append(handle)
+                logger.info(f'Chain hotkey registered: {hk!r} -> "{cname}"')
+            except Exception as e:
+                logger.warning(f'Could not register chain hotkey {hk!r}: {e}')
+
     def _hk_undo_refine(self) -> None:
         self._q.put(('undo_refine', None))
 
@@ -731,6 +1401,12 @@ class App:
             return
         if self._whisper_recording:
             self._q.put(('whisper:cancel', None))
+            return
+        # Nothing active — close any floating AskPills.
+        # (Pills no longer register their own global escape hook because
+        # keyboard.unhook_all() inside _register_hotkeys would nuke them.)
+        if self._ask_pills:
+            self._q.put(('ask:close_all', None))
 
     # ── Per-prompt hotkey handler ─────────────────────────────────────────────
 
@@ -861,11 +1537,21 @@ class App:
                 self._register_hotkeys()
                 if not self._hk_reg_pending:
                     break   # nothing changed while we were registering
-            # Always re-register saved-macro hotkeys after _register_hotkeys()
+            # Always re-register saved-macro and chain hotkeys after _register_hotkeys()
             # because unhook_all() inside it wipes them out.
             self._register_macro_saved_hotkeys()
+            self._register_chain_hotkeys()
         finally:
             self._hk_reg_lock.release()
+
+    def _on_feature_hotkey_changed(self, cfg_key: str, combo: str) -> None:
+        """Called when user right-click-rebinds a feature hotkey from a library tab."""
+        if 'hotkeys' not in self.config:
+            self.config['hotkeys'] = {}
+        self.config['hotkeys'][cfg_key] = combo
+        threading.Thread(target=save_config, args=(self.config,), daemon=True).start()
+        threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
+        logger.info(f'Feature hotkey rebound: {cfg_key!r} → {combo!r}')
 
     def _on_settings_saved(self, new_config: dict) -> None:
         if self._whisper_recording:
@@ -1068,34 +1754,79 @@ class App:
             for c, d in zip(current, defaults)
         )
 
-    def _do_restore_defaults(self) -> None:
-        """Restore the 16 bundled default prompts (called from tray menu)."""
+    def _do_restore_all_defaults(self) -> None:
+        """Restore prompts, hotkeys, bookmarks, and window sizes to factory defaults."""
         from dialogs import confirm
+        from storage import DEFAULT_CONFIG, _DEFAULT_BOOKMARKS, save_bookmarks, resource_path
+        import copy, json
         if not confirm(self.root,
-                       'Restore Default Prompts',
-                       'This will permanently delete all your existing prompts\n'
-                       'and restore the 16 default prompts.\n\n'
+                       'Restore to Default',
+                       'This will reset everything back to factory settings:\n'
+                       '  • Prompts → bundled defaults\n'
+                       '  • Hotkeys → factory defaults\n'
+                       '  • Web bookmarks → 6 default sites\n'
+                       '  • Quick Notes window → default size\n\n'
                        'This cannot be undone.'):
             return
+
+        # ── Prompts ───────────────────────────────────────────────────────────
+        # Prefer in-memory cache; fall back to reading the bundled file directly
         defaults = getattr(self, '_bundled_defaults', [])
         if not defaults:
-            logger.error('Restore defaults: bundled defaults not cached')
-            return
-        # Update app state
-        self.prompts = list(defaults)
-        self.active_prompt = self.prompts[0]
-        self._at_default_prompts = True
-        # Update library UI
-        self.library.prompts = list(defaults)
-        self.library._render_cards()
-        self.library._select(0)
-        # Save to disk and re-register hotkeys
-        threading.Thread(target=save_prompts, args=(self.prompts,), daemon=True).start()
+            try:
+                with open(resource_path('prompts.json'), encoding='utf-8') as f:
+                    defaults = json.load(f)
+                logger.info('Restore: loaded bundled prompts from disk.')
+            except Exception as e:
+                logger.error(f'Restore: could not load bundled prompts: {e}')
+        if defaults:
+            self.prompts             = list(defaults)
+            self.active_prompt       = self.prompts[0]
+            self._at_default_prompts = True
+            self.library.prompts     = list(defaults)
+            self.library._render_cards()
+            self.library._select(0)
+            threading.Thread(target=save_prompts, args=(self.prompts,), daemon=True).start()
+            logger.info(f'Restore: {len(defaults)} prompts written.')
+
+        # ── Hotkeys ───────────────────────────────────────────────────────────
+        self.config['hotkeys'] = dict(DEFAULT_CONFIG['hotkeys'])
+        threading.Thread(target=save_config, args=(self.config,), daemon=True).start()
+        try:
+            self.library.hotkey_cfg = self.config['hotkeys']
+        except Exception:
+            pass
         threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
-        # Rebuild tray menu so Restore item becomes greyed again
+        logger.info('Restore: hotkeys reset.')
+
+        # ── Bookmarks ─────────────────────────────────────────────────────────
+        bm_defaults = copy.deepcopy(_DEFAULT_BOOKMARKS)
+        threading.Thread(target=lambda: save_bookmarks(bm_defaults), daemon=True).start()
+        try:
+            if self.library._active_tab == 'web':
+                self.library._render_web_tab()
+        except Exception:
+            pass
+        logger.info('Restore: bookmarks reset.')
+
+        # ── Quick Notes window geometry ───────────────────────────────────────
+        self.config['notes_geometry'] = ''
+        threading.Thread(target=save_config, args=(self.config,), daemon=True).start()
+        if self._notes_win is not None:
+            try:
+                from quicknotes import _W, _H
+                sw = self._notes_win.winfo_screenwidth()
+                sh = self._notes_win.winfo_screenheight()
+                x  = (sw - _W) // 2
+                y  = max(40, (sh - _H) // 2)
+                self._notes_win.geometry(f'{_W}x{_H}+{x}+{y}')
+            except Exception:
+                pass
+        logger.info('Restore: Notes geometry reset.')
+
         self._update_tray()
-        self._notify('Hotkeys', 'Default prompts restored.')
-        logger.info('Default prompts restored.')
+        self._notify('Defaults restored ✓', 'Prompts, hotkeys, bookmarks, and window sizes reset.')
+        logger.info('All defaults restored successfully.')
 
     def _on_refine_timeout(self, gen: int) -> None:
         if gen != self._refine_gen:
@@ -1246,6 +1977,7 @@ class App:
         """Set macro state on both main.py and the library window (for right-click menu labels)."""
         self._macro_state = state
         self.library._macro_state = state
+        self.library._sync_hint_bar()
 
     def _macro_reset(self) -> None:
         """Abort any active recording/playback and return to idle — called from Library reset button."""
@@ -1259,7 +1991,9 @@ class App:
 
     def _macro_start_recording(self) -> None:
         self._set_macro_state('recording')
-        self._macro.start_recording()
+        self._macro.start_recording(
+            on_cap_reached=lambda: self._q.put(('macro:cap', None))
+        )
         self._macro_register_stop_keys()
         self.macro_overlay.show_macro_recording()
         logger.info('Macro recording started')
@@ -1275,6 +2009,20 @@ class App:
         else:
             self.macro_overlay._close()
             logger.info('Macro recording stopped — no events captured')
+
+    def _on_macro_cap(self) -> None:
+        """5 000-event hard cap reached — auto-stop recording and notify user."""
+        from macros.recorder import _MAX_EVENTS
+        logger.warning(f'Macro recording capped at {_MAX_EVENTS} events — auto-stopped')
+        self._macro.stop_recording()
+        n = self._macro.event_count
+        self._set_macro_state('ready' if n > 0 else 'idle')
+        self._macro_unregister_stop_keys()
+        self.macro_overlay.show_macro_ready(n)
+        self._notify(
+            'Macro recording capped ⚠',
+            f'Reached the {_MAX_EVENTS:,}-event limit — recording stopped automatically.',
+        )
 
     def _macro_start_playback(self) -> None:
         if not self._macro.event_count:
@@ -1422,37 +2170,18 @@ class App:
     def _on_recorder_toggle(self) -> None:
         """Shift+F2 or Library tab button — starts or stops screen recording."""
         if self._recorder_state == 'idle':
-            self._recorder_start_setup()
+            self._recorder_start()
         elif self._recorder_state == 'recording':
             self._recorder_stop()
 
-    def _recorder_start_setup(self) -> None:
-        """Show pre-recording options dialog then start recording."""
-        # Parent to library window if it's mapped, else root.
-        # RecorderSetupDialog handles the withdrawn-parent case internally
-        # (no transient, deiconify, screen-centre) so we can always pass root.
-        try:
-            parent = self.library.win if self.library.win.winfo_ismapped() else self.root
-        except Exception:
-            parent = self.root
-        try:
-            dlg = RecorderSetupDialog(parent)
-        except Exception as exc:
-            logger.exception(f'RecorderSetupDialog creation failed: {exc}')
-            return
-        self._recorder_setup_dlg = dlg
-        parent.wait_window(dlg.win)
-        self._recorder_setup_dlg = None
-        if dlg.result is None:
-            return   # user cancelled
-
-        cfg = dlg.result
+    def _recorder_start(self) -> None:
+        """Start recording immediately (full screen, no mic, 30 fps) — no setup dialog."""
         self._screen_recorder = ScreenRecorder(
-            hwnd=cfg['hwnd'],
-            mon=cfg.get('mon'),
-            mic=cfg['mic'],
-            mic_device=cfg.get('mic_device'),
-            fps=cfg['fps'],
+            hwnd=0,
+            mon=None,
+            mic=False,
+            mic_device=None,
+            fps=30,
             on_size_update=lambda b: self._q.put(('recorder:size', b)),
             on_cap_reached=lambda: self._q.put(('recorder:cap', None)),
         )
@@ -1561,6 +2290,8 @@ class App:
 
     def _on_gif_toggle(self) -> None:
         """Shift+F3 / button press — start or stop GIF recording."""
+        if self._gif_setup_dlg is not None:
+            return  # setup dialog already open — ignore duplicate presses
         if self._gif_state == 'idle':
             self._gif_start()
         elif self._gif_state == 'recording':
@@ -1569,6 +2300,7 @@ class App:
 
     def _gif_start(self) -> None:
         """Show setup dialog, then begin capturing."""
+        self._gif_setup_dlg = True   # sentinel — set before Toplevel creation
         try:
             mapped = self.library.win.winfo_ismapped()
             parent = self.library.win if mapped else self.root
@@ -1579,6 +2311,7 @@ class App:
             dlg = GifSetupDialog(parent)
         except Exception as exc:
             logger.exception(f'GIF setup dialog creation failed: {exc}')
+            self._gif_setup_dlg = None
             return
         self._gif_setup_dlg = dlg
         parent.wait_window(dlg.win)
@@ -1645,6 +2378,11 @@ class App:
         dest = show_gif_save_dialog(parent, tmp_path, dur)
         if dest:
             logger.info(f'GIF saved: {dest}')
+            # Track path in index so it shows in the list regardless of save location
+            try:
+                add_to_gif_index(dest)
+            except Exception:
+                pass
             # Refresh library GIF tab
             try:
                 self.library.update_gif_state('idle')
@@ -1769,35 +2507,88 @@ class App:
         hk = self._hotkey_cfg()
         w_state = '🔴 Recording...' if self._whisper_recording else '🎙 Whisper'
 
+        lib_hk      = hk.get('library',      'alt+shift+e').upper()
+        notes_hk    = hk.get('notes',         'shift+f7').upper()
+        whisper_hk  = hk.get('whisper',       'ctrl+enter').upper()
+        refine_hk   = hk.get('refine',        'alt+shift+w').upper()
+        recorder_hk = hk.get('recorder',      'shift+f2').upper()
+        gif_hk      = hk.get('gif_record',    'shift+f3').upper()
+        macro_hk    = hk.get('macro_record',  'shift+f1').upper()
+        ask_hk      = hk.get('ask',           'shift+f4').upper()
+        web_hk      = hk.get('web',           'shift+f5').upper()
+        chain_hk    = hk.get('chain',         'shift+f6').upper()
+
         return pystray.Menu(
             pystray.MenuItem(f'Hotkeys  v{VERSION}', None, enabled=False),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem('Take a screenshot', lambda: self._hk_screenshot()),
+            # ── Quick actions ─────────────────────────────────────────────────
+            pystray.MenuItem(
+                f'📝  Quick Notes  ({notes_hk})',
+                lambda: self._q.put(('notes', None)),
+            ),
+            pystray.MenuItem(
+                f'📚  Library  ({lib_hk})',
+                lambda: self._q.put(('library', None)),
+            ),
+            pystray.MenuItem(
+                f'✨  Refine selection  ({refine_hk})',
+                self._hk_refine,
+            ),
+            pystray.MenuItem(
+                f'💬  Explain  ({ask_hk})',
+                lambda: self._q.put(('ask', '')),
+            ),
+            pystray.MenuItem(
+                f'🌐  Open bookmark  ({web_hk})',
+                lambda: self._q.put(('web', None)),
+            ),
+            pystray.MenuItem(
+                f'🔗  Run chain  ({chain_hk})',
+                lambda: self._q.put(('chain', None)),
+            ),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem('Provider', pystray.Menu(
+            # ── Recording shortcuts ───────────────────────────────────────────
+            pystray.MenuItem('🎬  Recordings', pystray.Menu(
+                pystray.MenuItem(
+                    f'{w_state}  ({whisper_hk})',
+                    lambda: self._q.put(('whisper:start', None) if not self._whisper_recording
+                                        else ('whisper:stop', None)),
+                ),
+                pystray.MenuItem(
+                    'Push-to-talk mode',
+                    self._toggle_ptt,
+                    checked=lambda item: self.config.get('push_to_talk', False),
+                ),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem(
+                    f'⏺  Screen record  ({recorder_hk})',
+                    lambda: self._q.put(('recorder:toggle', None)),
+                ),
+                pystray.MenuItem(
+                    f'🎞  GIF record  ({gif_hk})',
+                    lambda: self._q.put(('gif:toggle', None)),
+                ),
+                pystray.MenuItem(
+                    f'⚡  Macro record  ({macro_hk})',
+                    lambda: self._q.put(('macro:hotkey', None)),
+                ),
+            )),
+            pystray.Menu.SEPARATOR,
+            # ── App ───────────────────────────────────────────────────────────
+            pystray.MenuItem('AI Engine', pystray.Menu(
                 *([prov_item('local', 'Qwen 2.5 1.5B (Local · Free)')] if local_provider_available() else []),
                 prov_item('groq',     'Groq'),
                 prov_item('cerebras', 'Cerebras'),
             )),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem(
-                f'Prompt Library  ({hk.get("library", "alt+shift+e").upper()})',
-                lambda: self._q.put(('library', None)),
-            ),
-            pystray.MenuItem('History', lambda: self._q.put(('history', None))),
+            pystray.MenuItem('History',  lambda: self._q.put(('history', None))),
             pystray.MenuItem('Settings', lambda: self._q.put(('settings', None))),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem(w_state, None, enabled=False),
-            pystray.MenuItem(
-                'Push-to-talk mode',
-                self._toggle_ptt,
-                checked=lambda item: self.config.get('push_to_talk', False),
-            ),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem('Restore Default Prompts',
-                             lambda: self._q.put(('restore_defaults', None)),
-                             enabled=lambda _: not self._at_default_prompts),
-            pystray.MenuItem('↺  Reload hotkeys', lambda: self._q.put(('reload_hotkeys', None))),
+            pystray.MenuItem('⚙  Advanced', pystray.Menu(
+                pystray.MenuItem('↺  Restore All Defaults',
+                                 lambda: self._q.put(('restore_all_defaults', None))),
+                pystray.MenuItem('↺  Reload hotkeys',
+                                 lambda: self._q.put(('reload_hotkeys', None))),
+            )),
             pystray.MenuItem('Quit', self._quit),
         )
 

@@ -66,6 +66,7 @@ hiddenimports = [
     'PIL.Image',
     'PIL.ImageDraw',
     'PIL.ImageFont',
+    'PIL.ImageTk',
 
     # Whisper / transcription
     'ctranslate2',
@@ -115,6 +116,7 @@ hiddenimports = [
     'cerebras.cloud.sdk',
     'httpx',
     'certifi',
+    'truststore',
 
     # Hotkeys / clipboard
     'keyboard',
@@ -158,12 +160,16 @@ hiddenimports = [
     # New feature modules
     'screenshot',
     'vision',
+    'explain_pill',
     'screen_recorder',
     'gif_recorder',
     'macros',
     'macros.recorder',
     'macros.library',
     'macros.save_prompt',
+
+    # Quick Notes
+    'quicknotes',
 ]
 
 # Collect all submodules of heavy packages so nothing gets missed

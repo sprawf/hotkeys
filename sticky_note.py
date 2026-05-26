@@ -1,13 +1,16 @@
 """Floating sticky-note window for a single prompt — editable, auto-saves on close."""
+import logging
 import threading
 import tkinter as tk
 from typing import Callable
+
+logger = logging.getLogger(__name__)
 
 import spellcheck
 from dialogs import alert, confirm, Tooltip, PopupMenu
 from theme import (
     FONT_FAMILY, CARD_TEXT, CARD_TEXT_S,
-    ACCENT, _darken,
+    ACCENT, OK, WARN, _darken,
 )
 
 
@@ -52,9 +55,14 @@ class PromptStickyNote:
         self._inner = tk.Frame(self.win, bg=self._color)
         self._inner.pack(fill='both', expand=True, padx=2, pady=2)
 
+        self._ocr_staged_img = None   # image waiting for Enter confirmation
+
         self._build()
         self._place()
-        self.win.bind('<Escape>', lambda e: self.close())
+        self.win.bind('<Escape>', self._on_escape)
+        self.win.bind('<Return>',  self._on_return_key, add='+')
+        self._text.bind('<Return>', self._on_return_key, add='+')
+        self._text.focus_set()
 
     # ── Build ──────────────────────────────────────────────────────────────────
 
@@ -127,26 +135,35 @@ class PromptStickyNote:
         self._text.pack(fill='both', expand=True)
         spellcheck.attach(self._text)
 
-        # Ctrl+V: intercept if clipboard holds an image, otherwise normal paste
-        self._text.bind('<Control-v>', self._on_ctrl_v, add='+')
-        # Right-click: standard Cut/Copy/Paste + Paste Image
+        # Ctrl+V: intercept at window level so it fires regardless of which
+        # widget inside the note has focus.  add='+' keeps default paste intact.
+        self.win.bind('<Control-v>', self._on_ctrl_v, add='+')
+        # Right-click: standard Cut/Copy/Paste + image-aware smart paste
         self._text.bind('<Button-3>', self._show_text_context_menu, add='+')
 
-        # ── OCR status strip — shown during/after image extraction ───────────
+        # ── OCR status strip — overlaid via place(), pinned to inner bottom ────
         self._ocr_status_frame = tk.Frame(self._inner, bg=self._darkest)
         self._ocr_status_lbl = tk.Label(
-            self._ocr_status_frame, text='', bg=self._darkest, fg=CARD_TEXT,
+            self._ocr_status_frame, text='', bg=self._darkest, fg='#ffffff',
             font=(FONT_FAMILY, 10), anchor='w', padx=10,
         )
         self._ocr_status_lbl.pack(side='left', fill='x', expand=True)
         self._ocr_dismiss_btn = tk.Button(
-            self._ocr_status_frame, text='✕', bg=self._darkest, fg=CARD_TEXT,
+            self._ocr_status_frame, text='✕', bg=self._darkest, fg='#ffffff',
             activebackground=self._color, activeforeground=CARD_TEXT,
             relief='flat', font=(FONT_FAMILY, 9), bd=0, cursor='arrow',
             padx=6, pady=0, command=self._ocr_hide_status,
         )
         # dismiss button packed on demand (errors only)
         self._ocr_status_visible = False
+
+        # ── OCR image preview — overlaid via place(), sits above status strip ───
+        self._ocr_preview_frame   = tk.Frame(self._inner, bg=self._color)
+        self._ocr_thumb_ref       = None   # keep PhotoImage alive (GC guard)
+        self._ocr_preview_lbl     = tk.Label(self._ocr_preview_frame,
+                                             bg=self._color, anchor='w')
+        self._ocr_preview_lbl.pack(side='left', padx=10)
+        self._ocr_preview_visible = False
 
         # ── Resize grip — floated over bottom-right corner, no strip needed ───
         grip_rsz = tk.Label(self._inner, text='◢',
@@ -162,58 +179,139 @@ class PromptStickyNote:
         """Right-click context menu on the text area."""
         w       = event.widget
         has_sel = bool(w.tag_ranges('sel'))
+        def _smart_paste():
+            """Paste text normally, or stage image for OCR confirmation."""
+            from vision import get_clipboard_image
+            logger.info('sticky_note: right-click Paste — checking clipboard')
+            img, err = get_clipboard_image()
+            logger.info('sticky_note: clipboard → img=%s err=%s', img is not None, err)
+            if err:
+                self._ocr_show_status(f'⚠  {err}', WARN, dismissable=True)
+                return
+            if img is not None:
+                self._ocr_stage(img)
+            else:
+                w.event_generate('<<Paste>>')
+
         (PopupMenu(self.win)
-            .add('Cut',          lambda: w.event_generate('<<Cut>>'),   enabled=has_sel)
-            .add('Copy',         lambda: w.event_generate('<<Copy>>'),  enabled=has_sel)
-            .add('Paste',        lambda: w.event_generate('<<Paste>>'))
-            .separator()
-            .add('Paste Image',  self._ocr_start)
+            .add('Cut',    lambda: w.event_generate('<<Cut>>'),  enabled=has_sel)
+            .add('Copy',   lambda: w.event_generate('<<Copy>>'), enabled=has_sel)
+            .add('Paste',  _smart_paste)
             .show(event.x_root, event.y_root)
         )
 
     # ── OCR ───────────────────────────────────────────────────────────────────
 
+    def _ocr_stage(self, img) -> None:
+        """Show thumbnail and wait for Enter before running OCR."""
+        self._ocr_staged_img = img
+        self._ocr_show_preview(img)
+        self._ocr_show_status('↵ Enter to extract · Esc to cancel', CARD_TEXT, dismissable=True)
+        logger.info('sticky_note: staged — preview_visible=%s status_visible=%s',
+                    self._ocr_preview_visible, self._ocr_status_visible)
+
+    # Status strip and preview use place() so they overlay at the bottom of
+    # self._inner without fighting the text widget's expand=True packing.
+    _STATUS_H  = 26   # px — height of the status strip
+    _PREVIEW_H = 72   # px — max height of the thumbnail preview strip
+
+    def _ocr_show_preview(self, img) -> None:
+        """Show a small thumbnail of the image being sent for extraction."""
+        try:
+            from PIL import Image, ImageTk
+            w, h  = img.size
+            max_h = self._PREVIEW_H - 8   # leave a little padding
+            if h > max_h:
+                scale = max_h / h
+                img   = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+            self._ocr_thumb_ref = ImageTk.PhotoImage(img)
+            self._ocr_preview_lbl.configure(image=self._ocr_thumb_ref)
+            if not self._ocr_preview_visible:
+                # Overlay: pin to bottom of inner frame, above the status strip
+                status_offset = self._STATUS_H if self._ocr_status_visible else 0
+                self._ocr_preview_frame.place(
+                    x=0, rely=1.0, relwidth=1.0,
+                    height=self._PREVIEW_H, anchor='sw',
+                    y=-status_offset,
+                )
+                self._ocr_preview_frame.lift()
+                self._ocr_preview_visible = True
+        except Exception:
+            pass
+
+    def _ocr_hide_preview(self) -> None:
+        try:
+            if self._ocr_preview_visible:
+                self._ocr_preview_frame.place_forget()
+                self._ocr_preview_visible = False
+        except Exception:
+            pass
+
     def _ocr_show_status(self, text: str, color: str,
                          dismissable: bool = False) -> None:
-        """Show or update the status strip at the bottom of the note."""
+        """Show or update the status strip pinned to the bottom of the note."""
         try:
             self._ocr_status_lbl.configure(text=text, fg=color)
-            self._ocr_status_frame.configure(bg=self._darkest)
-            self._ocr_status_lbl.configure(bg=self._darkest)
             if dismissable:
                 self._ocr_dismiss_btn.pack(side='right', padx=(0, 4))
             else:
                 self._ocr_dismiss_btn.pack_forget()
             if not self._ocr_status_visible:
-                self._ocr_status_frame.pack(fill='x')
+                # Overlay: pin to very bottom of inner frame
+                self._ocr_status_frame.place(
+                    x=0, rely=1.0, relwidth=1.0,
+                    height=self._STATUS_H, anchor='sw',
+                )
+                self._ocr_status_frame.lift()   # ensure it renders above the text widget
                 self._ocr_status_visible = True
-        except Exception:
-            pass
+                # If preview is already showing, nudge it up by STATUS_H
+                if self._ocr_preview_visible:
+                    self._ocr_preview_frame.place_configure(y=-self._STATUS_H)
+        except Exception as e:
+            logger.error('sticky_note: _ocr_show_status failed: %s', e, exc_info=True)
 
     def _ocr_hide_status(self) -> None:
+        self._ocr_staged_img = None   # cancel any pending confirmation
+        self._ocr_hide_preview()
         try:
-            self._ocr_status_frame.pack_forget()
+            self._ocr_status_frame.place_forget()
             self._ocr_status_visible = False
         except Exception:
             pass
 
     def _on_ctrl_v(self, event) -> None:
-        """Intercept Ctrl+V: if clipboard holds an image, run OCR instead of paste."""
+        """Intercept Ctrl+V: stage image for confirmation, or fall through to text paste."""
         from vision import get_clipboard_image
+        logger.info('sticky_note: Ctrl+V — checking clipboard')
         img, err = get_clipboard_image()
+        logger.info('sticky_note: clipboard → img=%s err=%s', img is not None, err)
         if err:
-            # Something went wrong reading the clipboard — show why
-            self._ocr_show_status(f'⚠  {err}', '#f59e0b', dismissable=True)
+            self._ocr_show_status(f'⚠  {err}', WARN, dismissable=True)
             return 'break'
         if img is None:
-            # No image on clipboard — fall through to normal text paste,
-            # but show a brief hint so the user knows we checked
-            self._ocr_show_status(
-                'ℹ  No image in clipboard — press PrtSc and Copy first', '#6b7280')
-            self.win.after(3000, self._ocr_hide_status)
-            return None   # let normal paste proceed
-        self._ocr_start(img=img)
+            return None   # no image — let default Ctrl+V paste text
+        self._ocr_stage(img)
         return 'break'
+
+    def _on_return_key(self, event) -> str | None:
+        """Enter: confirm staged image → run OCR. Otherwise insert newline normally."""
+        if self._ocr_staged_img is not None:
+            img = self._ocr_staged_img
+            self._ocr_staged_img = None
+            self._ocr_hide_preview()
+            self._ocr_hide_status()
+            self._ocr_start(img=img)
+            return 'break'
+        return None   # normal Enter → newline in text widget
+
+    def _on_escape(self, event) -> None:
+        """Esc: cancel staged image if one is waiting, otherwise close the note."""
+        if self._ocr_staged_img is not None:
+            self._ocr_staged_img = None
+            self._ocr_hide_preview()
+            self._ocr_hide_status()
+            return
+        self.close()
 
     def _ocr_start(self, img=None) -> None:
         if self._ocr_pending:
@@ -226,7 +324,7 @@ class PromptStickyNote:
             from vision import get_clipboard_image
             img, err = get_clipboard_image()
             if err:
-                self._ocr_show_status(f'⚠  {err}', '#f59e0b', dismissable=True)
+                self._ocr_show_status(f'⚠  {err}', WARN, dismissable=True)
                 return
             if img is None:
                 alert(self.win, 'No image found',
@@ -234,13 +332,14 @@ class PromptStickyNote:
                 return
 
         self._ocr_pending = True
-        # Visual: button dims, status strip appears
+        # Show thumbnail + dim button + status strip
+        self._ocr_show_preview(img)
         try:
             self._ocr_hdr_btn.configure(state='disabled',
                                         bg=self._darkest, fg=_darken(CARD_TEXT, 0.5))
         except Exception:
             pass
-        self._ocr_show_status('⏳  Extracting text from image…', CARD_TEXT, dismissable=False)
+        self._ocr_show_status('⏳ Extracting…', CARD_TEXT, dismissable=False)
 
         _img       = img
         _extractor = self._vision_extractor
@@ -254,8 +353,43 @@ class PromptStickyNote:
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    # ── OCR quality detection ─────────────────────────────────────────────────
+
+    _OCR_REFUSAL_PATTERNS = (
+        'no text', 'no readable', 'no visible', 'cannot extract',
+        'unable to extract', 'does not contain', 'no text found',
+        'there is no text', 'i cannot', "i can't", 'no legible',
+        'no written', 'no words', 'this image does not', 'image contains no',
+    )
+    _OCR_SHORT_THRESHOLD = 15   # chars — below this we warn about sparse extraction
+
+    @classmethod
+    def _ocr_quality_issue(cls, text: str) -> str | None:
+        """Return an amber warning string if the OCR result looks low-quality, else None."""
+        stripped = text.strip()
+        lower    = stripped.lower()
+        n        = len(stripped)
+
+        # Empty result
+        if n == 0:
+            return 'No text found'
+
+        # Model returned a refusal/no-text response (short replies only —
+        # a real document could legitimately contain these words in passing)
+        if n < 200:
+            for pat in cls._OCR_REFUSAL_PATTERNS:
+                if pat in lower:
+                    return 'No text detected'
+
+        # Very short result that isn't a refusal — probably partial
+        if n < cls._OCR_SHORT_THRESHOLD:
+            return f'Only {n} char{"s" if n != 1 else ""} extracted'
+
+        return None
+
     def _ocr_done(self, text: str) -> None:
         self._ocr_pending = False
+        self._ocr_hide_preview()
         # Restore button
         try:
             self._ocr_hdr_btn.configure(state='normal',
@@ -276,19 +410,28 @@ class PromptStickyNote:
                 self._ocr_hide_status()
                 return
 
+        # Quality check first — refusals ("No text detected", "No text found") are
+        # not inserted at all; only genuinely short results get inserted with a warning.
+        issue = self._ocr_quality_issue(text)
+        if issue in ('No text found', 'No text detected'):
+            self._ocr_show_status(f'⚠ {issue}', WARN, dismissable=True)
+            return
+
         try:
             pos = self._text.index('insert')
         except Exception:
             pos = 'end'
         self._text.insert(pos, text)
 
-        # Brief success strip then hide
-        n = len(text)
-        self._ocr_show_status(f'✓  {n} char{"s" if n != 1 else ""} inserted', '#22c55e')
-        self.win.after(2500, self._ocr_hide_status)
+        if issue:
+            self._ocr_show_status(f'⚠ {issue}', WARN, dismissable=True)
+        else:
+            self._ocr_show_status('✓', OK, dismissable=False)
+            self.win.after(1200, self._ocr_hide_status)
 
     def _ocr_error(self, message: str) -> None:
         self._ocr_pending = False
+        self._ocr_hide_preview()
         try:
             self._ocr_hdr_btn.configure(state='normal',
                                         bg=self._dark, fg=CARD_TEXT)
@@ -302,26 +445,25 @@ class PromptStickyNote:
         # Map raw error to a friendly one-liner + optional detail for dialog
         m = message.lower()
         if 'api key' in m or ('invalid' in m and 'key' in m):
-            friendly = 'No API key — add Groq key in Settings'
+            friendly = 'No API key'
             detail   = None
         elif 'rate limit' in m or '429' in m or 'quota' in m:
-            friendly = 'Rate limit reached — wait a moment and try again'
+            friendly = 'Rate limit — try again'
             detail   = None
         elif 'network' in m or 'connect' in m or 'timeout' in m:
-            friendly = 'Network error — check your connection'
+            friendly = 'Network error'
             detail   = message
         elif 'no image' in m or 'clipboard' in m:
-            friendly = 'No image in clipboard — copy an image first'
+            friendly = 'No image in clipboard'
             detail   = None
         elif 'access denied' in m or 'antivirus' in m or 'blocked' in m:
-            friendly = 'Clipboard blocked — antivirus may be interfering'
+            friendly = 'Clipboard blocked'
             detail   = message
         else:
-            friendly = message.split('\n')[0][:70]
-            detail   = message if len(message) > 70 else None
+            friendly = message.split('\n')[0][:40]
+            detail   = message if len(message) > 40 else None
 
-        # Always show the persistent status strip so the user sees something
-        self._ocr_show_status(f'✕  {friendly}', '#ef4444', dismissable=True)
+        self._ocr_show_status(f'✕ {friendly}', '#fca5a5', dismissable=True)
 
         # For unexpected errors (network, AV blocking, unknown) also pop a dialog
         # so the full reason is visible even if the status strip is easy to miss
@@ -389,14 +531,13 @@ class PromptStickyNote:
 
     def _flash_applied(self) -> None:
         """Show a brief green 'Applied ✓' badge for 550 ms, then destroy."""
-        _OK = '#22c55e'
         try:
-            self.win.configure(bg=_OK)          # swap border from purple → green
-            overlay = tk.Frame(self._inner, bg=_OK)
+            self.win.configure(bg=OK)           # swap border from purple → green
+            overlay = tk.Frame(self._inner, bg=OK)
             overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
             tk.Label(
                 overlay, text='✓   Applied',
-                bg=_OK, fg='#ffffff',
+                bg=OK, fg=CARD_TEXT,
                 font=(FONT_FAMILY, 18, 'bold'),
             ).place(relx=0.5, rely=0.5, anchor='center')
         except Exception:

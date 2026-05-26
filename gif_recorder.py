@@ -410,7 +410,7 @@ class GifSetupDialog:
 
         self._start_btn = ctk.CTkButton(
             btn_row, text='▶  Start Recording', width=160,
-            fg_color=ACCENT, hover_color=ACCENTL, text_color='#ffffff',
+            fg_color=ACCENT, hover_color=ACCENTL, text_color=TEXT_P,
             corner_radius=RADIUS_SM, font=(FONT_FAMILY, 13, 'bold'),
             command=self._start,
         )
@@ -548,11 +548,14 @@ def show_gif_save_dialog(
         dlg.destroy()
 
     def _save():
-        import datetime
-        default_name = f'recording_{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}.gif'
         # Default to gifs folder under AppData so the file shows in the library
         gif_dir = Path(appdata_dir()) / 'gifs'
         gif_dir.mkdir(parents=True, exist_ok=True)
+        existing = {Path(f).stem for f in gif_dir.glob('*.gif')}
+        n = 1
+        while str(n) in existing:
+            n += 1
+        default_name = f'{n}.gif'
         dest = fd.asksaveasfilename(
             parent=dlg,
             title='Save GIF as…',
@@ -582,7 +585,7 @@ def show_gif_save_dialog(
 
     ctk.CTkButton(
         btn_row, text='💾  Save As…', width=120,
-        fg_color=ACCENT, hover_color=ACCENTL, text_color='#ffffff',
+        fg_color=ACCENT, hover_color=ACCENTL, text_color=TEXT_P,
         corner_radius=RADIUS_SM, font=(FONT_FAMILY, 13, 'bold'),
         command=_save,
     ).pack(side='left')
@@ -601,3 +604,114 @@ def show_gif_save_dialog(
 
     parent.wait_window(dlg)
     return result[0]
+
+
+# ── GIF index (tracks files saved outside the default folder) ─────────────────
+
+_gif_index_lock = threading.Lock()
+
+
+def _gif_index_path() -> Path:
+    return Path(appdata_dir()) / 'gifs_index.json'
+
+
+def _write_gif_index_atomic(idx_file: Path, entries: list) -> None:
+    import json
+    tmp = idx_file.with_suffix('.tmp')
+    try:
+        tmp.write_text(json.dumps(entries, indent=2), encoding='utf-8')
+        os.replace(str(tmp), str(idx_file))
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def add_to_gif_index(path: str) -> None:
+    """Persist a saved GIF path so it appears in the list regardless of save location."""
+    import json
+    idx_file = _gif_index_path()
+    path = str(Path(path).resolve())
+    with _gif_index_lock:
+        try:
+            entries: list = json.loads(idx_file.read_text(encoding='utf-8')) if idx_file.exists() else []
+        except Exception:
+            entries = []
+        if path not in entries:
+            entries.append(path)
+            _write_gif_index_atomic(idx_file, entries)
+
+
+def remove_from_gif_index(path: str) -> None:
+    """Remove a path from the GIF index (e.g. after deleting the file)."""
+    import json
+    idx_file = _gif_index_path()
+    if not idx_file.exists():
+        return
+    key = str(Path(path).resolve())
+    with _gif_index_lock:
+        try:
+            entries: list = json.loads(idx_file.read_text(encoding='utf-8'))
+        except Exception:
+            return
+        new_entries = [e for e in entries if str(Path(e).resolve()) != key]
+        if len(new_entries) != len(entries):
+            _write_gif_index_atomic(idx_file, new_entries)
+
+
+def _load_gif_index_entries() -> list[str]:
+    """Return all indexed GIF paths, pruning entries for deleted files."""
+    import json
+    idx_file = _gif_index_path()
+    if not idx_file.exists():
+        return []
+    with _gif_index_lock:
+        try:
+            entries: list = json.loads(idx_file.read_text(encoding='utf-8'))
+        except Exception:
+            return []
+        live = [p for p in entries if Path(p).exists()]
+        if len(live) != len(entries):
+            _write_gif_index_atomic(idx_file, live)
+    return live
+
+
+def list_gifs(gif_dir: str) -> list[dict]:
+    """
+    Return a list of dicts for every known .gif, sorted newest-first.
+    Sources: the default gif_dir (scanned for *.gif) plus any paths
+    persisted in the GIF index (files saved to arbitrary locations).
+    Each dict has: path, name, size_kb, mtime.
+    """
+    seen: set[str] = set()
+    candidates: list[Path] = []
+
+    p = Path(gif_dir)
+    if p.exists():
+        for f in p.glob('*.gif'):
+            key = str(f.resolve())
+            if key not in seen:
+                seen.add(key)
+                candidates.append(f)
+
+    for raw in _load_gif_index_entries():
+        key = str(Path(raw).resolve())
+        if key not in seen:
+            seen.add(key)
+            candidates.append(Path(raw))
+
+    result = []
+    for f in candidates:
+        try:
+            st = f.stat()
+            result.append({
+                'path':    str(f),
+                'name':    f.name,
+                'size_kb': st.st_size / 1024,
+                'mtime':   st.st_mtime,
+            })
+        except Exception:
+            pass
+    result.sort(key=lambda d: d['mtime'], reverse=True)
+    return result
