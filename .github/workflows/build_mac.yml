@@ -9,6 +9,11 @@ jobs:
   build:
     runs-on: macos-latest
     timeout-minutes: 60
+    # Default repo permissions are read-only on newer GitHub setups, which
+    # causes the final "Publish to GitHub Release" step to fail with HTTP
+    # 403. Grant write access to release assets explicitly.
+    permissions:
+      contents: write
 
     steps:
       # ── 1. Checkout ─────────────────────────────────────────────────────────
