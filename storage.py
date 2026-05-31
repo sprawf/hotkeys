@@ -16,9 +16,9 @@ VERSION  = '1.0.0'
 def appdata_dir() -> str:
     """Return the directory used for all user data (config, prompts, logs, history).
 
-    Frozen (dist) build  — stores data in a `data` folder next to Hotkeys.exe
+    Frozen (dist) build , stores data in a `data` folder next to Hotkeys.exe
                            so the install is fully self-contained and portable.
-    Source (dev) build   — stores data in the OS roaming AppData folder so the
+    Source (dev) build  , stores data in the OS roaming AppData folder so the
                            developer's working copy is isolated from dist builds.
     """
     if getattr(sys, 'frozen', False):
@@ -36,7 +36,28 @@ def appdata_dir() -> str:
     else:
         path = os.path.join(os.environ.get('XDG_CONFIG_HOME',
                             os.path.join(os.path.expanduser('~'), '.config')), APP_NAME)
-    os.makedirs(path, exist_ok=True)
+    try:
+        os.makedirs(path, exist_ok=True)
+        # Verify we can actually write there
+        _test = os.path.join(path, '.write_test')
+        with open(_test, 'w') as _f:
+            _f.write('ok')
+        os.remove(_test)
+    except Exception as e:
+        logger.error(f'Data folder not writable ({path}): {e}')
+        # Fall back to a writable temp location so the app can still run
+        import tempfile
+        fallback = os.path.join(tempfile.gettempdir(), APP_NAME)
+        os.makedirs(fallback, exist_ok=True)
+        logger.warning(f'Using fallback data dir: {fallback}')
+        # Store the warning so main.py can surface it to the user once at startup
+        appdata_dir._permission_warning = (
+            f'Hotkeys cannot write to its data folder:\n{path}\n\n'
+            f'Move the Hotkeys folder out of Program Files or any read-only location.\n\n'
+            f'Using temporary storage for now, your settings will not be saved.'
+        )
+        return fallback
+    appdata_dir._permission_warning = None
     return path
 
 
@@ -72,6 +93,10 @@ def notes_path() -> str:
     return os.path.join(appdata_dir(), 'notes.json')
 
 
+def whiteboard_path() -> str:
+    return os.path.join(appdata_dir(), 'whiteboard.json')
+
+
 def load_notes() -> list:
     try:
         with open(notes_path(), encoding='utf-8') as f:
@@ -84,7 +109,7 @@ def load_notes() -> list:
         return []
 
 
-_MAX_NOTES = 500   # hard cap — oldest unpinned trimmed first, then oldest pinned
+_MAX_NOTES = 500   # hard cap, oldest unpinned trimmed first, then oldest pinned
 
 
 def save_notes(notes: list) -> None:
@@ -103,6 +128,76 @@ def save_notes(notes: list) -> None:
             json.dump(notes, f, ensure_ascii=False, indent=2)
     except Exception:
         logger.warning('Failed to save notes')
+
+
+def transcripts_dir() -> str:
+    """Folder where TranscriptJob JSON dumps live (one file per job).
+    Lazy-created on first access."""
+    d = os.path.join(appdata_dir(), 'transcripts')
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+_MAX_TRANSCRIPTS = 200   # hard cap, oldest deleted first when exceeded
+
+
+def load_transcripts() -> list:
+    """Return all saved TranscriptJob dicts, newest first.  Each file is one
+    job; corrupt files are skipped silently so a single bad write can't
+    poison the entire list."""
+    d = transcripts_dir()
+    out: list = []
+    try:
+        for name in os.listdir(d):
+            if not name.endswith('.json'):
+                continue
+            try:
+                with open(os.path.join(d, name), encoding='utf-8') as f:
+                    out.append(json.load(f))
+            except Exception:
+                continue
+    except FileNotFoundError:
+        return []
+    out.sort(key=lambda j: j.get('created_at', 0), reverse=True)
+    return out
+
+
+def save_transcript(job: dict) -> None:
+    """Write one TranscriptJob dict to <id>.json. Caller passes the
+    JSON-serializable dict (TranscriptJob.to_dict()).  Trims oldest if over
+    the cap so the folder doesn't grow unbounded."""
+    d = transcripts_dir()
+    jid = job.get('id', '')
+    if not jid:
+        return
+    try:
+        path = os.path.join(d, f'{jid}.json')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(job, f, ensure_ascii=False, indent=2)
+    except Exception:
+        logger.warning('Failed to save transcript')
+        return
+    # Trim oldest when over cap
+    try:
+        files = sorted(
+            (f for f in os.listdir(d) if f.endswith('.json')),
+            key=lambda f: os.path.getmtime(os.path.join(d, f)),
+        )
+        for old in files[:-_MAX_TRANSCRIPTS]:
+            try: os.remove(os.path.join(d, old))
+            except Exception: pass
+    except Exception:
+        pass
+
+
+def delete_transcript(job_id: str) -> None:
+    """Remove the saved JSON for a job id; silent no-op if missing."""
+    try:
+        os.remove(os.path.join(transcripts_dir(), f'{job_id}.json'))
+    except FileNotFoundError:
+        pass
+    except Exception:
+        logger.warning(f'Failed to delete transcript {job_id}')
 
 
 def models_dir() -> str:
@@ -124,9 +219,15 @@ def assets_dir() -> str:
 DEFAULT_CONFIG: dict = {
     'version':         VERSION,
     'active_provider': 'cerebras',   # fastest out of the box
-    'autostart':       True,
+    # Portable dist gets shared as a zip — autostart=True writes the
+    # extract path into the Run registry key. If the user later moves
+    # or deletes the folder, that registry entry points at a missing
+    # file and Windows nags every login. Default off; users can flip
+    # it in Settings once they decide on a permanent install location.
+    'autostart':       False,
     'push_to_talk':    False,
-    'notes_geometry':  '',           # saved geometry for Quick Notes window (WxH+X+Y)
+    'notes_geometry':       '',       # saved geometry for Quick Notes window (WxH+X+Y)
+    'notes_theme':          'light',  # 'light' or 'dark', persisted across sessions
     'hotkeys': {
         'refine':       'alt+shift+w',
         'library':      'alt+shift+e',
@@ -139,6 +240,13 @@ DEFAULT_CONFIG: dict = {
         'web':          'shift+f5',
         'chain':        'shift+f6',
         'notes':        'shift+f7',
+        'whiteboard':   'shift+f8',
+        # File/URL transcription pipeline (faster-whisper + pyannote diarization
+        # + AI summary + multi-format export). See transcribe/ package.
+        'transcribe':   'shift+f9',
+        # Bundled audio editor (Tenacity portable, relabeled to "Audio
+        # Editor" at the window-title layer). See audio_editor.py.
+        'audio_editor': 'shift+f10',
     },
     'providers': {
         'local':    {'model_id': 'Qwen/Qwen2.5-1.5B-Instruct-GGUF'},
@@ -149,13 +257,28 @@ DEFAULT_CONFIG: dict = {
     'whisper': {
         'model': {
             'gpu_model':    'large-v3-turbo',
-            'cpu_model':    'small',
+            # Default to `base` on CPU: ~2 s for short dictation on a 6-core
+            # consumer CPU vs ~6 s with `small`. Quality is good enough for
+            # most dictation use cases. Users who want highest local
+            # accuracy can flip to `small` in Settings → Audio → CPU model.
+            'cpu_model':    'base',
             'device':       'auto',
             'compute_type': 'auto',
         },
         'audio': {
             'input_device_index': None,
             'noise_reduction':    True,
+            # Hybrid transcription: when True and online, dictation goes to
+            # Groq's hosted Whisper (large-v3-turbo, ~13× faster than local
+            # CPU small). If the cloud call fails or times out, the local
+            # CPU model is the transparent fallback, the user always gets
+            # a result. Set False to force local-only.
+            'cloud_enabled':      True,
+            # How long to wait for Groq before giving up and using local.
+            # Keep tight, 3 s covers 99 % of successful cloud calls; longer
+            # waits just delay the eventual local fallback for the unlucky
+            # 1 %.
+            'cloud_timeout_s':    3.0,
         },
         'vad': {
             'safety_silence_s': 60,
@@ -220,7 +343,7 @@ def load_config() -> dict:
         save_config(DEFAULT_CONFIG)
         return copy.deepcopy(DEFAULT_CONFIG)
     except Exception as e:
-        logger.error(f'Config load error: {e} — using defaults')
+        logger.error(f'Config load error: {e}, using defaults')
         return copy.deepcopy(DEFAULT_CONFIG)
 
 
@@ -259,7 +382,7 @@ def load_prompts() -> list:
     bundled   = resource_path('prompts.json')
 
     if not os.path.exists(user_path):
-        # Fresh install — copy the bundled default set to AppData
+        # Fresh install, copy the bundled default set to AppData
         try:
             shutil.copy2(bundled, user_path)
             logger.info('Default prompts copied to AppData.')
@@ -289,7 +412,7 @@ def save_prompts(prompts: list) -> None:
     data = json.dumps(prompts, indent=2, ensure_ascii=False)
     # Write only to the user's AppData copy.
     # The source prompts.json is the shipped defaults and must never be
-    # overwritten by user edits — otherwise Restore Default Prompts would
+    # overwritten by user edits, otherwise Restore Default Prompts would
     # restore whatever the user last saved, not the real defaults.
     for path in [prompts_path()]:
         try:

@@ -1,5 +1,5 @@
 """
-Shared design tokens — single source of truth for all UI files.
+Shared design tokens, single source of truth for all UI files.
 Inspired by Linear / Raycast / Vercel design systems.
 """
 
@@ -16,8 +16,13 @@ ACCENTL  = '#9f67fa'   # light purple
 ACCENTS  = '#4c1d95'   # dark purple
 
 TEXT_P   = '#f0f0f0'   # primary text
-TEXT_S   = '#909090'   # secondary / muted  (was #6b6b6b — too dark on dark bg)
-TEXT_D   = '#606060'   # disabled           (was #404040 — nearly invisible)
+# TEXT_S is the colour used for hint text, descriptions, captions, and
+# secondary labels across the entire app. It was #909090, which read as
+# washed-out grey on the dark surfaces and made splash cards / op
+# descriptions hard to scan. #c8c8c8 keeps it visibly secondary (still
+# clearly weaker than TEXT_P) while staying readable on any dark surface.
+TEXT_S   = '#c8c8c8'   # secondary / muted
+TEXT_D   = '#7a7a7a'   # disabled
 
 OK       = '#22c55e'   # success green
 WARN     = '#f59e0b'   # amber

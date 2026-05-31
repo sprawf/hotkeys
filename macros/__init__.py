@@ -1,1 +1,1 @@
-# Hotkeys — Macros package
+# Hotkeys, Macros package

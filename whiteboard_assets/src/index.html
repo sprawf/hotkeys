@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Whiteboard</title>
+<link rel="stylesheet" href="./app.css" />
+<style>
+  html, body, #root { margin:0; padding:0; width:100%; height:100%; overflow:hidden; background:#fff; }
+  /* Purple accent border to match the Shift+F7 Notes window's visual
+     style. #7c3aed is the same brand purple used in quicknotes.py
+     (_ACCENT). On Win11 22H2+ the native title bar is also recolored
+     to the same purple via DWMWA_CAPTION_COLOR (see
+     whiteboard.py); on Win10 the title bar stays the OS
+     default and only the client-area border shows — the body border
+     wraps all four sides of the document either way. */
+  body { border: 3px solid #7c3aed; box-sizing: border-box; }
+
+  /* Top-right "Reset the canvas" button. Pinned with fixed positioning
+     so it always sits where the Library trigger used to live, regardless
+     of whiteboard's internal layout. Styled to look like a hamburger-
+     menu row (icon + label, same font / size / colour, larger trash
+     icon) so the visual matches what users saw inside the hamburger. */
+  .hk-reset-trigger {
+    position: fixed !important;
+    top: 22px !important;
+    right: 18px !important;
+    z-index: 5;
+    display: inline-flex !important;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 14px;
+    border-radius: var(--border-radius-md, 8px);
+    background: var(--color-surface-low, #ececf4);
+    color: var(--color-on-surface, #1b1b1f);
+    border: none;
+    cursor: pointer;
+    /* Use whiteboard's own UI font stack so the label matches the
+       hamburger menu / toolbar tooltips. The fallback chain is
+       defensive in case the CSS variable name changes in a future
+       whiteboard release. */
+    font-family: var(--ui-font, var(--font-family, Assistant, "Helvetica Neue", Helvetica, Arial, sans-serif));
+    font-size: var(--ui-font-size, 0.875rem);
+    font-weight: 400;
+    line-height: 1.25;
+    letter-spacing: normal;
+    transition: background-color 80ms;
+  }
+  .hk-reset-trigger:hover {
+    background: var(--color-surface-mid, #e0e0e8);
+  }
+  .hk-reset-icon {
+    width: 18px; height: 18px;
+    display: inline-flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+  }
+  .hk-reset-icon svg { width: 18px; height: 18px; }
+  .hk-reset-label { white-space: nowrap; }
+
+  /* Shared styled tooltip for every custom-injected control (Reset,
+     Frame, Laser, future ones). Applied via `data-tooltip="<text>"`.
+     Dark pill, white text, fades in on hover after a small delay —
+     matches whiteboard's visual language. */
+  [data-tooltip] {
+    position: relative;   /* anchor for the ::after pill */
+  }
+  /* Reset button uses fixed positioning at the page level — override
+     the anchor so the pill sticks to the button itself. */
+  .hk-reset-trigger[data-tooltip] { position: fixed; }
+  [data-tooltip]::after {
+    content: attr(data-tooltip);
+    position: absolute;
+    top: calc(100% + 6px);
+    left: 50%;
+    transform: translate(-50%, -4px);
+    background: #1b1b1f;
+    color: #fff;
+    font-family: var(--ui-font, Assistant, sans-serif);
+    font-size: 12px;
+    font-weight: 400;
+    line-height: 1.3;
+    padding: 5px 9px;
+    border-radius: 5px;
+    white-space: nowrap;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 100ms 200ms, transform 100ms 200ms;
+    z-index: 1000;
+  }
+  /* Right-aligned variant for elements pinned to the right edge so the
+     tooltip doesn't overflow the window. */
+  .hk-reset-trigger[data-tooltip]::after {
+    left: auto; right: 0;
+    transform: translate(0, -4px);
+  }
+  [data-tooltip]:hover::after {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+  .hk-reset-trigger[data-tooltip]:hover::after {
+    transform: translate(0, 0);
+  }
+
+  /* Hide the now-duplicate "Reset the canvas" row INSIDE the hamburger
+     menu — the user's only entry point is the top-right button which
+     programmatically clicks this hidden row to inherit whiteboard's
+     native confirm dialog. Match the row by aria-label. */
+  .dropdown-menu-item[aria-label*="Reset the canvas"i] {
+    display: none !important;
+  }
+  /* Belt-and-braces: hide anything in the bundled component that points
+     at whiteboard.com features (collab, share, the +product, sign-in,
+     socials, and the canvas-onboarding hint that mentions those). */
+  .layer-ui__wrapper__top-right .CollabButton,
+  button[aria-label*="ive collaboration" i],
+  button[aria-label*="hare" i],
+  button[aria-label*="sign in" i],
+  button[aria-label*="sign up" i],
+  a[href*="plus.excalidraw" i],
+  a[href*="github.com/excalidraw" i],
+  a[href*="discord" i],
+  a[href*="twitter.com" i],
+  a[href*="x.com/excalidraw" i],
+  /* Help dialog — strip everything that doesn't apply locally:
+     • The "Help" h2 title — the dialog opens straight into "Keyboard
+       shortcuts" instead, which is the only thing the user came for.
+     • The entire row of branded external links (Documentation, blog,
+       GitHub issue tracker, YouTube channel).
+     • Below: JS hides "Create a flowchart" / "Navigate a flowchart"
+       (whiteboard AI features that need an API key — not shipped). */
+  .HelpDialog .Dialog__title,
+  .HelpDialog__btn,
+  .HelpDialog__brand,
+  a[href*="excalidraw.com" i],
+  a[href*="docs.excalidraw" i],
+  a[href*="youtube.com" i],
+  a[href*="youtu.be" i],
+  [aria-label*="YouTube" i],
+  [data-testid*="youtube" i],
+  /* Library — community-shape sharing, irrelevant locally. */
+  .layer-ui__library,
+  .library-menu-items-container,
+  .library-trigger,
+  .default-sidebar-trigger,
+  button[aria-label="Library"i],
+  button[aria-label*="library"i],
+  .sidebar-tab[data-tabid="library"i],
+  .dropdown-menu-item[aria-label*="library"i],
+  /* Right-click context-menu entries (Add to library, etc.) */
+  li[aria-label*="library"i],
+  .context-menu-item[aria-label*="library"i],
+  .context-menu li:has([aria-label*="library"i]),
+  button.context-menu-item[title*="library"i],
+  /* Web Embed — for embedding live web pages inside the canvas.
+     Doesn't fit a local sketching tool. */
+  [aria-label*="Web Embed"i],
+  [aria-label*="web embed"i],
+  [data-testid*="embed"i],
+  /* "Mermaid to Whiteboard" (was "Mermaid to whiteboard") — converts
+     Mermaid diagram syntax to shapes. Niche; not relevant here. */
+  [aria-label*="Mermaid"i],
+  [data-testid*="mermaid"i],
+  /* The "Generate" section in the shape-picker dropdown / command palette
+     becomes empty after Mermaid is hidden. Collapse the whole group so
+     no orphan section header is left. whiteboard uses a few different
+     containers depending on the dropdown — match all of them via :has. */
+  .command-palette__group:has([aria-label*="Mermaid"i]),
+  .dropdown-menu-group:has([aria-label*="Mermaid"i]),
+  .dropdown-menu-group:has([data-testid*="mermaid"i]),
+  .Island:has(> [aria-label*="Mermaid"i]),
+  [data-testid="shape-picker"i] [class*="group"i]:has([aria-label*="Mermaid"i]),
+  /* Belt-and-braces: any group label that is sibling to a Mermaid item */
+  .dropdown-menu-item-label:has(+ [aria-label*="Mermaid"i]),
+  /* "More tools" dropdown trigger — empty after we move Frame + Laser
+     inline and hide Web Embed + Mermaid. Real selectors per the DOM:
+       • title="More tools"
+       • class="App-toolbar__extra-tools-trigger" */
+  button[title="More tools"i],
+  .App-toolbar__extra-tools-trigger,
+  button.dropdown-menu-button.App-toolbar__extra-tools-trigger,
+  .dropdown-menu-item-base[href*="plus.excalidraw" i],
+  .HelpDialog__plus,
+  .welcome-screen-menu-item__text:has(a[href*="plus" i]) { display:none !important; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="module" src="./app.js"></script>
+</body>
+</html>

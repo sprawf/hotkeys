@@ -1,4 +1,4 @@
-"""Floating sticky-note window for a single prompt — editable, auto-saves on close."""
+"""Floating sticky-note window for a single prompt, editable, auto-saves on close."""
 import logging
 import threading
 import tkinter as tk
@@ -15,7 +15,7 @@ from theme import (
 
 
 class PromptStickyNote:
-    """Small floating window showing one prompt — title and text both editable.
+    """Small floating window showing one prompt, title and text both editable.
 
     When closed (✕ button or Escape), saves any edits back via on_save().
     Draggable via the header bar.
@@ -37,7 +37,7 @@ class PromptStickyNote:
         self._vision_extractor  = vision_extractor
         self._ocr_pending       = False
         self._color    = prompt.get('color', '#FFF9C4')
-        # Resize state — initialised here so _resize_move is safe even if a
+        # Resize state, initialised here so _resize_move is safe even if a
         # spurious B1-Motion arrives before the first ButtonPress-1 event.
         self._rsz_x = self._rsz_y = self._rsz_w = self._rsz_h = 0
         self._dark     = _darken(self._color, 0.82)
@@ -51,7 +51,7 @@ class PromptStickyNote:
         # content by 2 px so a purple border peeks around the edge.
         self.win.configure(bg=ACCENT)
 
-        # Inner container inset 2 px — the 2 px gap shows as an ACCENT border
+        # Inner container inset 2 px, the 2 px gap shows as an ACCENT border
         self._inner = tk.Frame(self.win, bg=self._color)
         self._inner.pack(fill='both', expand=True, padx=2, pady=2)
 
@@ -72,7 +72,7 @@ class PromptStickyNote:
         hdr.pack(fill='x')
         hdr.pack_propagate(False)
 
-        # Drag grip — explicit handle so Entry/Button don't block dragging
+        # Drag grip, explicit handle so Entry/Button don't block dragging
         grip = tk.Label(hdr, text='⠿', bg=self._dark,
                         fg=_darken(self._color, 0.55),
                         font=(FONT_FAMILY, 13), cursor='fleur', padx=4)
@@ -80,7 +80,7 @@ class PromptStickyNote:
         grip.bind('<ButtonPress-1>', self._drag_start)
         grip.bind('<B1-Motion>',     self._drag_move)
 
-        # Hotkey badge — also draggable
+        # Hotkey badge, also draggable
         hk = self._prompt.get('hotkey', '')
         if hk:
             badge = tk.Label(hdr, text=f'  ⌨ {hk.upper()}  ', bg=self._darkest,
@@ -90,14 +90,14 @@ class PromptStickyNote:
             badge.bind('<ButtonPress-1>', self._drag_start)
             badge.bind('<B1-Motion>',     self._drag_move)
 
-        # Close button — pinned right
+        # Close button, pinned right
         tk.Button(hdr, text='✕', bg=self._dark, fg=CARD_TEXT,
                   activebackground=self._darkest, activeforeground=CARD_TEXT,
                   relief='flat', font=(FONT_FAMILY, 11), width=2,
                   bd=0, cursor='arrow',
                   command=self.close).pack(side='right', padx=4)
 
-        # OCR button — sits just left of close button
+        # OCR button, sits just left of close button
         self._ocr_hdr_btn = tk.Button(
             hdr, text='📷', bg=self._dark, fg=CARD_TEXT,
             activebackground=self._darkest, activeforeground=CARD_TEXT,
@@ -121,7 +121,7 @@ class PromptStickyNote:
         # ── Separator ──────────────────────────────────────────────────────────
         tk.Frame(self._inner, bg=self._darkest, height=1).pack(fill='x')
 
-        # ── Prompt text area — fills all remaining space ──────────────────────
+        # ── Prompt text area, fills all remaining space ──────────────────────
         self._text = tk.Text(
             self._inner, wrap='word',
             bg=self._color, fg=CARD_TEXT,
@@ -141,7 +141,7 @@ class PromptStickyNote:
         # Right-click: standard Cut/Copy/Paste + image-aware smart paste
         self._text.bind('<Button-3>', self._show_text_context_menu, add='+')
 
-        # ── OCR status strip — overlaid via place(), pinned to inner bottom ────
+        # ── OCR status strip, overlaid via place(), pinned to inner bottom ────
         self._ocr_status_frame = tk.Frame(self._inner, bg=self._darkest)
         self._ocr_status_lbl = tk.Label(
             self._ocr_status_frame, text='', bg=self._darkest, fg='#ffffff',
@@ -157,7 +157,7 @@ class PromptStickyNote:
         # dismiss button packed on demand (errors only)
         self._ocr_status_visible = False
 
-        # ── OCR image preview — overlaid via place(), sits above status strip ───
+        # ── OCR image preview, overlaid via place(), sits above status strip ───
         self._ocr_preview_frame   = tk.Frame(self._inner, bg=self._color)
         self._ocr_thumb_ref       = None   # keep PhotoImage alive (GC guard)
         self._ocr_preview_lbl     = tk.Label(self._ocr_preview_frame,
@@ -165,7 +165,7 @@ class PromptStickyNote:
         self._ocr_preview_lbl.pack(side='left', padx=10)
         self._ocr_preview_visible = False
 
-        # ── Resize grip — floated over bottom-right corner, no strip needed ───
+        # ── Resize grip, floated over bottom-right corner, no strip needed ───
         grip_rsz = tk.Label(self._inner, text='◢',
                             bg=self._color, fg=_darken(self._color, 0.45),
                             font=(FONT_FAMILY, 11), cursor='size_nw_se')
@@ -182,7 +182,7 @@ class PromptStickyNote:
         def _smart_paste():
             """Paste text normally, or stage image for OCR confirmation."""
             from vision import get_clipboard_image
-            logger.info('sticky_note: right-click Paste — checking clipboard')
+            logger.info('sticky_note: right-click Paste, checking clipboard')
             img, err = get_clipboard_image()
             logger.info('sticky_note: clipboard → img=%s err=%s', img is not None, err)
             if err:
@@ -207,13 +207,13 @@ class PromptStickyNote:
         self._ocr_staged_img = img
         self._ocr_show_preview(img)
         self._ocr_show_status('↵ Enter to extract · Esc to cancel', CARD_TEXT, dismissable=True)
-        logger.info('sticky_note: staged — preview_visible=%s status_visible=%s',
+        logger.info('sticky_note: staged, preview_visible=%s status_visible=%s',
                     self._ocr_preview_visible, self._ocr_status_visible)
 
     # Status strip and preview use place() so they overlay at the bottom of
     # self._inner without fighting the text widget's expand=True packing.
-    _STATUS_H  = 26   # px — height of the status strip
-    _PREVIEW_H = 72   # px — max height of the thumbnail preview strip
+    _STATUS_H  = 26   # px, height of the status strip
+    _PREVIEW_H = 72   # px, max height of the thumbnail preview strip
 
     def _ocr_show_preview(self, img) -> None:
         """Show a small thumbnail of the image being sent for extraction."""
@@ -282,14 +282,14 @@ class PromptStickyNote:
     def _on_ctrl_v(self, event) -> None:
         """Intercept Ctrl+V: stage image for confirmation, or fall through to text paste."""
         from vision import get_clipboard_image
-        logger.info('sticky_note: Ctrl+V — checking clipboard')
+        logger.info('sticky_note: Ctrl+V, checking clipboard')
         img, err = get_clipboard_image()
         logger.info('sticky_note: clipboard → img=%s err=%s', img is not None, err)
         if err:
             self._ocr_show_status(f'⚠  {err}', WARN, dismissable=True)
             return 'break'
         if img is None:
-            return None   # no image — let default Ctrl+V paste text
+            return None   # no image, let default Ctrl+V paste text
         self._ocr_stage(img)
         return 'break'
 
@@ -317,7 +317,10 @@ class PromptStickyNote:
         if self._ocr_pending:
             return
         if self._vision_extractor is None:
-            alert(self.win, 'OCR unavailable', 'No vision extractor configured.')
+            alert(self.win, 'OCR needs a vision provider',
+                  'Reading text from images needs an AI provider that can '
+                  '"see". Open Settings → AI providers and add an OpenAI, '
+                  'Anthropic, Gemini, or Groq key.')
             return
 
         if img is None:
@@ -361,7 +364,7 @@ class PromptStickyNote:
         'there is no text', 'i cannot', "i can't", 'no legible',
         'no written', 'no words', 'this image does not', 'image contains no',
     )
-    _OCR_SHORT_THRESHOLD = 15   # chars — below this we warn about sparse extraction
+    _OCR_SHORT_THRESHOLD = 15   # chars, below this we warn about sparse extraction
 
     @classmethod
     def _ocr_quality_issue(cls, text: str) -> str | None:
@@ -374,14 +377,14 @@ class PromptStickyNote:
         if n == 0:
             return 'No text found'
 
-        # Model returned a refusal/no-text response (short replies only —
+        # Model returned a refusal/no-text response (short replies only,
         # a real document could legitimately contain these words in passing)
         if n < 200:
             for pat in cls._OCR_REFUSAL_PATTERNS:
                 if pat in lower:
                     return 'No text detected'
 
-        # Very short result that isn't a refusal — probably partial
+        # Very short result that isn't a refusal, probably partial
         if n < cls._OCR_SHORT_THRESHOLD:
             return f'Only {n} char{"s" if n != 1 else ""} extracted'
 
@@ -410,7 +413,7 @@ class PromptStickyNote:
                 self._ocr_hide_status()
                 return
 
-        # Quality check first — refusals ("No text detected", "No text found") are
+        # Quality check first, refusals ("No text detected", "No text found") are
         # not inserted at all; only genuinely short results get inserted with a warning.
         issue = self._ocr_quality_issue(text)
         if issue in ('No text found', 'No text detected'):
@@ -448,7 +451,7 @@ class PromptStickyNote:
             friendly = 'No API key'
             detail   = None
         elif 'rate limit' in m or '429' in m or 'quota' in m:
-            friendly = 'Rate limit — try again'
+            friendly = 'Rate limit, try again'
             detail   = None
         elif 'network' in m or 'connect' in m or 'timeout' in m:
             friendly = 'Network error'
@@ -525,7 +528,7 @@ class PromptStickyNote:
             if updated['title'] != self._prompt.get('title') or \
                updated['prompt'] != self._prompt.get('prompt'):
                 self._on_save(updated)
-        # Flash 'Applied ✓' before closing — gives the user clear confirmation
+        # Flash 'Applied ✓' before closing, gives the user clear confirmation
         # that this prompt is now the active one.
         self._flash_applied()
 

@@ -1,11 +1,11 @@
 """
-build_dist.py — one-shot build script for Hotkeys dist
+build_dist.py, one-shot build script for Hotkeys dist
 Usage:  E:\Hotkeys\venv\Scripts\python.exe build_dist.py
 
 Steps:
   1. Run PyInstaller with hotkeys.spec
   2. Copy pywin32_system32 DLLs into dist root  (pywintypes*.dll, pythoncom*.dll)
-  3. Copy macros/ package into dist root         (plain .py — PyInstaller can miss subpackages)
+  3. Copy macros/ package into dist root         (plain .py, PyInstaller can miss subpackages)
   4. Verify critical files are present
   5. Print final dist size
 
@@ -30,16 +30,18 @@ import subprocess
 import sys
 from pathlib import Path
 
-ROOT      = Path(__file__).parent
-VENV      = ROOT / 'venv'
-PYTHON    = VENV / 'Scripts' / 'python.exe'
-PYINST    = VENV / 'Scripts' / 'pyinstaller.exe'
-SPEC      = ROOT / 'hotkeys.spec'
-DIST_ROOT = ROOT / 'dist'
-DIST      = DIST_ROOT / 'Hotkeys'
-INTERNAL  = DIST / '_internal'   # PyInstaller 6.x puts data/libs here
-BUILD_DIR = ROOT / 'build'
-SITE      = VENV / 'Lib' / 'site-packages'
+ROOT       = Path(__file__).parent
+VENV       = ROOT / 'venv'
+PYTHON     = VENV / 'Scripts' / 'python.exe'
+PYINST     = VENV / 'Scripts' / 'pyinstaller.exe'
+SPEC       = ROOT / 'hotkeys.spec'
+DIARSPEC   = ROOT / 'hotkeys_diarize.spec'
+DIST_ROOT  = ROOT / 'dist'
+DIST       = DIST_ROOT / 'Hotkeys'
+INTERNAL   = DIST / '_internal'   # PyInstaller 6.x puts data/libs here
+BUILD_DIR  = ROOT / 'build'
+SITE       = VENV / 'Lib' / 'site-packages'
+DIAR_DIST  = DIST_ROOT / 'diarize'  # temporary, contents merged into DIST/diarize/
 
 def run(cmd, **kw):
     print(f'\n>>> {" ".join(str(c) for c in cmd)}')
@@ -61,13 +63,13 @@ run([
 # ── 2. pywin32 system DLLs ────────────────────────────────────────────────────
 # pywintypes3XX.dll and pythoncom3XX.dll must sit in the dist root alongside
 # the exe so win32ui / win32gui / win32clipboard can load them at runtime.
-# They must NOT only be in _internal — Windows searches beside the exe first.
+# They must NOT only be in _internal, Windows searches beside the exe first.
 print('\n' + '=' * 60)
 print('Step 2: Copy pywin32_system32 DLLs')
 print('=' * 60)
 pw32_dir = SITE / 'pywin32_system32'
 if not pw32_dir.exists():
-    print(f'WARNING: {pw32_dir} not found — skipping')
+    print(f'WARNING: {pw32_dir} not found, skipping')
 else:
     for dll in pw32_dir.glob('*.dll'):
         dest = DIST / dll.name
@@ -87,8 +89,34 @@ if macros_dst.exists():
 shutil.copytree(macros_src, macros_dst)
 print(f'  copied macros/ ({len(list(macros_dst.rglob("*.py")))} .py files)')
 
+# ── 3b. Build out-of-process diarization worker ──────────────────────────────
+# Separate exe so torch + pyannote load in their own process heap — no MKL /
+# OpenMP runtime collisions with the main Hotkeys.exe bundle. The worker lands
+# at <DIST>/diarize/diarize.exe alongside its own _internal/.
+print('\n' + '=' * 60)
+print('Step 3b: PyInstaller — diarization worker')
+print('=' * 60)
+if not DIARSPEC.exists():
+    print(f'  WARNING: {DIARSPEC} missing, skipping diarize worker build')
+else:
+    run([
+        str(PYINST), str(DIARSPEC), '--noconfirm',
+        '--distpath', str(DIST),         # land inside the main dist folder
+        '--workpath', str(BUILD_DIR / 'diarize'),
+    ])
+    # PyInstaller created <DIST>/diarize/diarize.exe + _internal next to it.
+    diar_exe = DIST / 'diarize' / 'diarize.exe'
+    if diar_exe.exists():
+        size_mb = sum(
+            f.stat().st_size for f in (DIST / 'diarize').rglob('*') if f.is_file()
+        ) / 1024 / 1024
+        print(f'  [OK] diarize worker built ({size_mb:.0f} MB)')
+    else:
+        print(f'  [WARN] diarize.exe not produced — speaker labels will be unavailable')
+
+
 # ── 4. Verify critical files ──────────────────────────────────────────────────
-# PyInstaller 6.x places almost everything under _internal/ — check both
+# PyInstaller 6.x places almost everything under _internal/, check both
 # the dist root (exe + pywin32 DLLs) and _internal/ (libraries + data).
 print('\n' + '=' * 60)
 print('Step 4: Verify critical files')
@@ -113,6 +141,16 @@ internal_checks = [
     INTERNAL / 'models' / 'base',
     INTERNAL / 'models' / 'small',
     INTERNAL / 'pynput',
+    # Bundled audio editor (Shift+F10). audio_editor.py spawns the
+    # tenacity.exe inside this folder via subprocess.
+    INTERNAL / 'audio_editor_assets' / 'tenacity' / 'tenacity.exe',
+    # Spell-check dictionary — without this the background _get_checker
+    # thread crashes and (before the v3.2 fixes) silently killed the exe.
+    INTERNAL / 'spellchecker' / 'resources' / 'en.json.gz',
+    # tkinterdnd2 native helper for drag-and-drop (Library + Transcribe).
+    INTERNAL / 'tkinterdnd2',
+    # Out-of-process diarization worker (Shift+F9 speaker labels).
+    DIST / 'diarize' / 'diarize.exe',
 ]
 
 all_ok = True
@@ -152,13 +190,16 @@ print(f'  Total: {total / 1024 / 1024:.0f} MB  ({DIST})')
 
 print('\n' + '=' * 60)
 if all_ok:
-    print('BUILD COMPLETE — dist/Hotkeys/ is ready to zip and ship')
+    print('BUILD COMPLETE, dist/Hotkeys/ is ready to zip and ship')
     print()
     print('Distribution notes:')
     print('  • Zip the entire dist/Hotkeys/ folder and share it')
-    print('  • Recipient: extract anywhere, run Hotkeys.exe — no install needed')
+    print('  • Recipient: extract anywhere, run Hotkeys.exe, no install needed')
     print('  • User data (config, logs, prompts) stored in dist/Hotkeys/data/')
     print('  • User must add their own API keys via the tray icon > Settings')
+    print('=' * 60)
 else:
-    print('BUILD COMPLETE WITH WARNINGS — check missing files above')
-print('=' * 60)
+    print('BUILD FAILED — one or more critical files are MISSING.')
+    print('Do NOT ship this dist. Fix the spec, then re-run build_dist.py.')
+    print('=' * 60)
+    sys.exit(1)

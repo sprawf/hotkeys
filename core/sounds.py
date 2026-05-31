@@ -6,7 +6,7 @@ SAMPLE_RATE = 44100
 
 
 def _vibration(freq: float, duration: float, amplitude: float = 0.15) -> np.ndarray:
-    """Soft buzz/vibration feel — low sine with rapid tremolo and smooth fade-in/out."""
+    """Soft buzz/vibration feel, low sine with rapid tremolo and smooth fade-in/out."""
     t = np.linspace(0, duration, int(SAMPLE_RATE * duration), endpoint=False)
     # Tremolo: amplitude modulated at ~28 Hz gives a tactile vibration feel
     tremolo = 0.5 + 0.5 * np.sin(2 * np.pi * 28 * t)
@@ -29,14 +29,14 @@ def _play_async(wave: np.ndarray):
 
 
 def play_start():
-    """Soft double-pulse vibration — signals recording has started."""
+    """Soft double-pulse vibration, signals recording has started."""
     pulse = _vibration(120.0, 0.10, amplitude=0.28)
     silence = np.zeros(int(SAMPLE_RATE * 0.06), dtype=np.float32)
     _play_async(np.concatenate([pulse, silence, pulse]))
 
 
 def play_stop():
-    """Single longer soft vibration — signals recording has ended."""
+    """Single longer soft vibration, signals recording has ended."""
     pulse = _vibration(90.0, 0.18, amplitude=0.24)
     _play_async(pulse)
 
@@ -44,8 +44,8 @@ def play_stop():
 def play_flip(reverse: bool = False) -> None:
     """Crisp paper page-flip whoosh.
 
-    forward (default) — high → mid frequency sweep, feels like turning a page ahead.
-    reverse           — mid → high frequency sweep, feels like going back.
+    forward (default), high → mid frequency sweep, feels like turning a page ahead.
+    reverse          , mid → high frequency sweep, feels like going back.
     """
     duration = 0.11
     n = int(SAMPLE_RATE * duration)

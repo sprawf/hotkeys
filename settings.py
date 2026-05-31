@@ -1,4 +1,4 @@
-"""Settings window — General / Providers / Whisper tabs, sidebar layout."""
+"""Settings window, General / Providers / Whisper tabs, sidebar layout."""
 import subprocess
 import threading
 import tkinter as tk
@@ -7,7 +7,7 @@ from typing import Callable
 import customtkinter as ctk
 
 from dialogs import alert
-from engine  import (PROVIDER_KEYS, GROQ_MODELS, CEREBRAS_MODELS,
+from engine  import (PROVIDER_KEYS, GROQ_MODELS, CEREBRAS_MODELS, provider_available,
                      OPENAI_MODELS, ANTHROPIC_MODELS, GEMINI_MODELS,
                      local_provider_available)
 import os
@@ -48,7 +48,7 @@ class SettingsWindow:
 
     def _build(self) -> None:
         self.win = ctk.CTkToplevel(self.root)
-        self.win.title('Settings — Hotkeys')
+        self.win.title('Settings, Hotkeys')
         self.win.configure(fg_color=BG)
         self.win.resizable(False, False)
         self.win.withdraw()
@@ -82,8 +82,8 @@ class SettingsWindow:
 
         nav_items = [
             ('general',   '⚙  General'),
-            ('providers', '🔌  Providers'),
-            ('whisper',   '🎙  Whisper'),
+            ('providers', '🔌  AI providers'),
+            ('whisper',   '🎙  Audio & dictation'),
         ]
         for key, label in nav_items:
             btn = ctk.CTkButton(
@@ -105,7 +105,7 @@ class SettingsWindow:
                       text_color=TEXT_P, font=(FONT_FAMILY, 10), corner_radius=RADIUS_SM,
                       command=self.hide).pack(side='right', pady=PAD_SM)
         if self.on_restore:
-            ctk.CTkButton(foot, text='↺  Restore to Default', width=160, height=34,
+            ctk.CTkButton(foot, text='↺  Reset everything…', width=160, height=34,
                           fg_color=SURF2, hover_color=ERR,
                           text_color=TEXT_S, font=(FONT_FAMILY, 10), corner_radius=RADIUS_SM,
                           command=self.on_restore).pack(side='left', padx=PAD, pady=PAD_SM)
@@ -143,8 +143,8 @@ class SettingsWindow:
 
         hk_actions = [
             ('refine',       'Refine selected text'),
-            ('library',      'Open Prompt Library'),
-            ('whisper',      'Toggle speech-to-text'),
+            ('library',      'Open Library'),
+            ('whisper',      'Start / stop dictation'),
             ('undo_refine',  'Undo last refinement'),
             ('macro_record', 'Record / stop / play macro'),
             ('recorder',     'Toggle screen recording'),
@@ -159,9 +159,11 @@ class SettingsWindow:
                          text_color=TEXT_P, anchor='w', width=200).pack(side='left')
             var = tk.StringVar(value=hk_cfg.get(action, HK_DEFAULTS.get(action, '')))
             self._hotkey_vars[action] = var
-            ctk.CTkLabel(row, textvariable=var, font=(FONT_FAMILY, 9, 'bold'),
+            badge = ctk.CTkLabel(row, textvariable=var, font=(FONT_FAMILY, 9, 'bold'),
                          text_color=ACCENT, fg_color=SURF2, corner_radius=RADIUS_SM,
-                         padx=10, pady=3, width=130).pack(side='left', padx=(0, 6))
+                         padx=10, pady=3, width=130, cursor='hand2')
+            badge.pack(side='left', padx=(0, 6))
+            badge.bind('<Button-1>', lambda e, a=action, v=var: self._record_hotkey(a, v))
             ctk.CTkButton(
                 row, text='Record', width=64, height=26, font=(FONT_FAMILY, 9),
                 fg_color=SURF3, hover_color=SURF2, text_color=TEXT_P, corner_radius=RADIUS_SM,
@@ -178,7 +180,6 @@ class SettingsWindow:
         macro_shortcuts = [
             ('Esc  /  Del',     'Abort macro recording or playback immediately'),
             ('Ctrl+F1 … F12',   'Play a saved macro (assign hotkey in Library → Macros)'),
-            ('Ctrl+Scroll ↑',   'Refine selected text (same as main hotkey)'),
         ]
         for keys, desc in macro_shortcuts:
             row = ctk.CTkFrame(frame, fg_color='transparent')
@@ -221,7 +222,7 @@ class SettingsWindow:
             ctk.CTkLabel(pf, text=path, font=(FONT_FAMILY, 9),
                          text_color=TEXT_S, anchor='w').pack(side='left', padx=(0, 4), pady=6)
             ctk.CTkButton(
-                pf, text='Open', width=52, height=22,
+                pf, text='📁  Open', width=82, height=22,
                 font=(FONT_FAMILY, 9), corner_radius=RADIUS_SM,
                 fg_color=SURF3, hover_color=BORDER2, text_color=TEXT_P,
                 command=lambda p=path: _open_folder(p),
@@ -287,7 +288,12 @@ class SettingsWindow:
             'gemini':    'Free tier',
             'custom':    'Any endpoint',
         }
-        visible_keys = [k for k in PROVIDER_KEYS if k != 'local' or local_provider_available()]
+        # Hide providers whose SDK is not bundled in this build.
+        # local needs llama_cpp; openai/anthropic/gemini each need
+        # their own SDK. In dist (frozen exe) users can't pip install
+        # missing packages, so a disabled option that raises "pip
+        # install X" on use is hostile — filter it instead.
+        visible_keys = [k for k in PROVIDER_KEYS if provider_available(k)]
 
         N_COLS = 3
         for col_i in range(N_COLS):
@@ -358,6 +364,7 @@ class SettingsWindow:
             test_btn.configure(
                 command=lambda k=key, v=key_var, b=test_btn: self._test_api_key(k, v, b)
             )
+            entry.bind('<Return>', lambda e, k=key, v=key_var, b=test_btn: self._test_api_key(k, v, b))
             self._api_widgets[key]['api_key'] = key_var
 
             ctk.CTkLabel(cframe, text='Model', font=FONT_SM_BOLD,
@@ -387,7 +394,7 @@ class SettingsWindow:
                      corner_radius=RADIUS_SM).pack(fill='x', pady=(0, PAD_SM))
         self._api_widgets['custom']['base_url'] = url_var
 
-        ctk.CTkLabel(cframe, text='API Key  (optional — leave blank for local servers)',
+        ctk.CTkLabel(cframe, text='API Key  (optional, leave blank for local servers)',
                      font=FONT_SM_BOLD, text_color=TEXT_S).pack(anchor='w', pady=(0, 2))
         ckey_row = ctk.CTkFrame(cframe, fg_color='transparent')
         ckey_row.pack(fill='x', pady=(0, PAD_SM))
@@ -413,6 +420,8 @@ class SettingsWindow:
             command=lambda v=ckey_var, u=url_var, b=ctest_btn: self._test_api_key(
                 'custom', v, b, extra={'base_url': u.get()})
         )
+        centry.bind('<Return>', lambda e, v=ckey_var, u=url_var, b=ctest_btn: self._test_api_key(
+            'custom', v, b, extra={'base_url': u.get()}))
         self._api_widgets['custom']['api_key'] = ckey_var
 
         ctk.CTkLabel(cframe, text='Model Name',
@@ -468,56 +477,93 @@ class SettingsWindow:
                             state='readonly', corner_radius=RADIUS_SM).pack(side='left')
             return r
 
-        # ── Model ──────────────────────────────────────────────────────────────
-        section('MODEL')
+        # ── Speech recognition model ──────────────────────────────────────────
+        section('SPEECH RECOGNITION')
         model_cfg = wcfg.get('model', {})
 
-        self._w_cpu_model = tk.StringVar(value=model_cfg.get('cpu_model', 'small'))
-        row_combo(scroll, 'CPU model (no GPU)', self._w_cpu_model, WHISPER_CPU_MODELS)
+        # Default changed to 'base' for snappy local fallback. Users
+        # who want higher accuracy can pick 'small' (~3× slower).
+        self._w_cpu_model = tk.StringVar(value=model_cfg.get('cpu_model', 'base'))
+        row_combo(scroll,
+                  'Local model (base = ~2s fast / small = ~6s accurate)',
+                  self._w_cpu_model, WHISPER_CPU_MODELS)
 
         self._w_gpu_model = tk.StringVar(value=model_cfg.get('gpu_model', 'large-v3-turbo'))
-        row_combo(scroll, 'GPU model (CUDA)', self._w_gpu_model, WHISPER_GPU_MODELS)
+        row_combo(scroll, 'NVIDIA GPU model (if available)',
+                  self._w_gpu_model, WHISPER_GPU_MODELS)
 
         device_vals = ['auto', 'cpu', 'cuda']
         self._w_device = tk.StringVar(value=model_cfg.get('device', 'auto'))
-        row_combo(scroll, 'Device', self._w_device, device_vals, width=120)
+        row_combo(scroll,
+                  'Run on (auto picks GPU when available, else CPU)',
+                  self._w_device, device_vals, width=120)
 
         compute_vals = ['auto', 'int8', 'float16', 'float32']
         self._w_compute = tk.StringVar(value=model_cfg.get('compute_type', 'auto'))
-        row_combo(scroll, 'Compute type', self._w_compute, compute_vals, width=120)
+        row_combo(scroll,
+                  'Precision (auto balances speed and quality)',
+                  self._w_compute, compute_vals, width=120)
 
         divider()
 
-        # ── Audio ──────────────────────────────────────────────────────────────
-        section('AUDIO')
+        # ── Microphone & recording ────────────────────────────────────────────
+        section('MICROPHONE')
         audio_cfg = wcfg.get('audio', {})
 
         self._w_noise_reduction = tk.BooleanVar(value=audio_cfg.get('noise_reduction', True))
-        row_switch(scroll, 'Noise reduction', self._w_noise_reduction)
+        row_switch(scroll,
+                   'Clean up background noise (auto, only when needed)',
+                   self._w_noise_reduction)
 
-        # Input device selector
+        # Cloud transcription toggle, ~13× faster when online (Groq's hosted
+        # Whisper large-v3-turbo). Falls back to local automatically if
+        # offline, rate-limited, or slow.
+        self._w_cloud_enabled = tk.BooleanVar(value=audio_cfg.get('cloud_enabled', True))
+        row_switch(scroll,
+                   'Use cloud for speed (~500ms with internet, falls back to local)',
+                   self._w_cloud_enabled)
+
+        # Input device selector, show ONLY real microphones by default.
+        # Most users see this dropdown and pick wrong (e.g. Stereo Mix, MIDI,
+        # virtual DroidCam). We use the same heuristic the runtime uses to
+        # auto-detect a physical mic, hiding everything else behind a
+        # "Show all" expander (added below).
         import sounddevice as sd
+        from core.audio import is_virtual_mic
         try:
-            devices    = sd.query_devices()
-            in_devices = [f'{i}: {d["name"]}' for i, d in enumerate(devices)
-                          if d['max_input_channels'] > 0]
+            devices = sd.query_devices()
+            in_devices_all = [
+                (i, d['name']) for i, d in enumerate(devices)
+                if d.get('max_input_channels', 0) > 0
+            ]
         except Exception:
-            in_devices = []
+            in_devices_all = []
+        # Default view: physical mics only. If the saved device is virtual,
+        # include it too so the user can see what they currently have set.
+        saved_dev_for_filter = audio_cfg.get('input_device_index')
+        in_devices = [
+            f'{i}: {n}' for i, n in in_devices_all
+            if (not is_virtual_mic(n)) or i == saved_dev_for_filter
+        ]
 
         r = ctk.CTkFrame(scroll, fg_color='transparent')
         r.pack(fill='x', padx=PAD, pady=3)
-        ctk.CTkLabel(r, text='Input device', font=(FONT_FAMILY, 10),
+        ctk.CTkLabel(r, text='Microphone', font=(FONT_FAMILY, 10),
                      text_color=TEXT_P, width=200).pack(side='left')
         saved_dev = audio_cfg.get('input_device_index')
-        default_dev = f'{saved_dev}: ...' if saved_dev is not None and in_devices else 'Default'
+        # "Auto detect" is what the user picks to mean "let the app use the
+        # Windows default mic, and self-heal if it disappears later".
+        # Internally it maps to input_device_index=None.
+        AUTO_LABEL = 'Auto detect (recommended)'
+        default_dev = f'{saved_dev}: ...' if saved_dev is not None and in_devices else AUTO_LABEL
         # Find matching entry
         if saved_dev is not None:
             for d in in_devices:
                 if d.startswith(f'{saved_dev}:'):
                     default_dev = d
                     break
-        self._w_input_device = tk.StringVar(value=default_dev if in_devices else 'Default')
-        dev_values = ['Default'] + in_devices
+        self._w_input_device = tk.StringVar(value=default_dev if in_devices else AUTO_LABEL)
+        dev_values = [AUTO_LABEL] + in_devices
         ctk.CTkComboBox(r, values=dev_values, variable=self._w_input_device, width=260,
                         fg_color=SURF2, border_color=BORDER2, border_width=1,
                         text_color=TEXT_P, button_color=SURF3,
@@ -526,25 +572,27 @@ class SettingsWindow:
 
         divider()
 
-        # ── Transcription ─────────────────────────────────────────────────────
-        section('TRANSCRIPTION')
+        # ── Language ──────────────────────────────────────────────────────────
+        section('LANGUAGE')
         trans_cfg = wcfg.get('transcription', {})
 
         saved_lang = trans_cfg.get('language') or 'auto'
         self._w_language = tk.StringVar(value=saved_lang if saved_lang in WHISPER_LANGS else 'auto')
-        row_combo(scroll, 'Language', self._w_language, WHISPER_LANGS, width=120)
+        row_combo(scroll,
+                  'Spoken language (auto detects from speech)',
+                  self._w_language, WHISPER_LANGS, width=120)
 
         divider()
 
-        # ── Output ────────────────────────────────────────────────────────────
-        section('OUTPUT')
+        # ── What happens after recognition ────────────────────────────────────
+        section('AFTER DICTATION')
         out_cfg = wcfg.get('output', {})
 
         self._w_type_text = tk.BooleanVar(value=out_cfg.get('type_text', True))
-        row_switch(scroll, 'Auto-type transcription (Ctrl+V)', self._w_type_text)
+        row_switch(scroll, 'Type the result into the focused app', self._w_type_text)
 
         self._w_trailing_space = tk.BooleanVar(value=out_cfg.get('add_trailing_space', True))
-        row_switch(scroll, 'Add trailing space', self._w_trailing_space)
+        row_switch(scroll, 'Add a space at the end', self._w_trailing_space)
 
         return frame
 
@@ -683,24 +731,74 @@ class SettingsWindow:
         _PLACEHOLDER = '… press keys …'
         for action, var in self._hotkey_vars.items():
             if var.get().strip() == _PLACEHOLDER:
-                alert(self.win, 'Hotkey Not Set',
-                      'A hotkey field is still in recording mode.\n'
-                      'Press a key combination, or click Record again to cancel.')
+                alert(self.win, 'Hotkey not finished',
+                      'One of the hotkey fields is still listening for a '
+                      'key.\nPress the keys you want, or click the field '
+                      'again to cancel.')
                 return
 
-        # Check for duplicate hotkeys
-        hk_values = [v.get().strip().lower() for v in self._hotkey_vars.values() if v.get().strip()]
-        if len(hk_values) != len(set(hk_values)):
-            alert(self.win, 'Duplicate Hotkey',
-                  'Two or more actions share the same hotkey.\nPlease assign unique hotkeys.')
-            return
+        # Full conflict check, duplicates, OS-reserved, syntax errors,
+        # collisions with per-prompt / per-chain / per-macro hotkeys.
+        # Warnings (whiteboard clashes, risky pickings like Ctrl+W) are
+        # surfaced as a confirmation prompt; the user can proceed if they
+        # know what they're doing.
+        try:
+            from hotkey_validator import (
+                validate_batch, collect_app_hotkeys, ERROR, WARN)
+            proposed = {k: v.get().strip()
+                        for k, v in self._hotkey_vars.items()}
+            others = collect_app_hotkeys(
+                self.config,
+                prompts=getattr(self, 'prompts', None),
+                chains=getattr(self, 'chains', None),
+                macros=getattr(self, 'macros', None),
+            )
+            # Treat the Settings-controlled keys as being replaced,
+            # don't compare each new binding against its own current value.
+            for k in proposed: others.pop(k, None)
+            diags = validate_batch(proposed, other_assignments=others)
+            blockers = [d for d in diags if d.severity == ERROR]
+            warnings = [d for d in diags if d.severity == WARN]
+            if blockers:
+                msg = '\n\n'.join(
+                    f'• {d.action}: {d.message}' for d in blockers)
+                # Some blockers are real two-action conflicts; others are
+                # "Windows owns this combo, no app can ever capture it".
+                # Split the title so the user knows which it is.
+                only_reserved = all(
+                    ('reserved by' in d.message) or ('Pick something else' in d.message)
+                    for d in blockers
+                )
+                title = 'Hotkey not allowed' if only_reserved else 'Hotkey conflict'
+                alert(self.win, title,
+                      'Cannot save, fix these first:\n\n' + msg)
+                return
+            if warnings:
+                from dialogs import confirm
+                msg = '\n\n'.join(
+                    f'• {d.action}: {d.message}' for d in warnings)
+                if not confirm(self.win, 'Conflicts with common shortcuts',
+                               'Heads up, these combos are also used by '
+                               'other apps:\n\n' + msg + '\n\nThe app will '
+                               'still receive them, but other windows may '
+                               'also react. Save anyway?'):
+                    return
+        except ImportError:
+            # validator module missing, fall back to the old duplicate-only check
+            hk_values = [v.get().strip().lower()
+                         for v in self._hotkey_vars.values() if v.get().strip()]
+            if len(hk_values) != len(set(hk_values)):
+                alert(self.win, 'Duplicate Hotkey',
+                      'Two or more actions share the same hotkey.\n'
+                      'Please assign unique hotkeys.')
+                return
 
         # General
         cfg['active_provider'] = self._provider_var.get()
         cfg['autostart']       = self._autostart_var.get()
         cfg['hotkeys']         = {k: v.get().strip() for k, v in self._hotkey_vars.items()}
 
-        # Providers — standard (API key + model)
+        # Providers, standard (API key + model)
         cfg.setdefault('providers', {})
         for key in ['groq', 'cerebras', 'openai', 'anthropic', 'gemini']:
             if key not in self._api_widgets:
@@ -728,15 +826,16 @@ class SettingsWindow:
 
         cfg['whisper'].setdefault('audio', {})
         cfg['whisper']['audio']['noise_reduction'] = self._w_noise_reduction.get()
-        # Parse device index from "0: Microphone" format
+        cfg['whisper']['audio']['cloud_enabled']   = self._w_cloud_enabled.get()
+        # Parse device index from "0: Microphone" format. Any non-numeric
+        # label (Auto detect (recommended), legacy 'Default', empty, etc.)
+        # maps to None, which means "use Windows default" and triggers the
+        # self-healing fallback in core/audio.py if that default disappears.
         dev_str = self._w_input_device.get()
-        if dev_str == 'Default' or not dev_str:
+        try:
+            cfg['whisper']['audio']['input_device_index'] = int(dev_str.split(':')[0])
+        except Exception:
             cfg['whisper']['audio']['input_device_index'] = None
-        else:
-            try:
-                cfg['whisper']['audio']['input_device_index'] = int(dev_str.split(':')[0])
-            except Exception:
-                cfg['whisper']['audio']['input_device_index'] = None
 
         cfg['whisper'].setdefault('transcription', {})
         lang = self._w_language.get()

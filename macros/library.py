@@ -1,5 +1,5 @@
 """
-MacroLibrary — persists recorded macros to disk.
+MacroLibrary, persists recorded macros to disk.
 
 Storage: C:\\Users\\User\\AppData\\Roaming\\Hotkeys\\macros\\
 Each macro is a single JSON file: {id}.json
@@ -11,7 +11,7 @@ from pathlib import Path
 
 from macros.recorder import MacroRecorder
 
-# Hard cap on how many macros can be saved — keeps the library manageable and
+# Hard cap on how many macros can be saved, keeps the library manageable and
 # prevents the macros/ folder from growing without bound.
 _MAX_SAVED_MACROS = 50
 
@@ -22,18 +22,18 @@ class MacroLibrary:
     def __init__(self, folder: Path) -> None:
         self._folder = Path(folder)
         self._folder.mkdir(parents=True, exist_ok=True)
-        self._macros: list[dict] = []   # metadata only — no 'events' key
+        self._macros: list[dict] = []   # metadata only, no 'events' key
         self._load()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
     @property
     def macros(self) -> list[dict]:
-        """Returns list of metadata dicts (no 'events' key — kept on disk only)."""
+        """Returns list of metadata dicts (no 'events' key, kept on disk only)."""
         return list(self._macros)
 
     def next_default_name(self) -> str:
-        """Returns 'Macro 1', 'Macro 2', etc. — first unused name."""
+        """Returns 'Macro 1', 'Macro 2', etc., first unused name."""
         existing = {m['name'] for m in self._macros}
         n = 1
         while True:

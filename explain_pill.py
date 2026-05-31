@@ -1,4 +1,4 @@
-"""Floating answer pill — Shift+F4 fires the selected text as a question.
+"""Floating answer pill, Shift+F4 fires the selected text as a question.
 
 Uses the same visual language as OverlayWindow: true pill shape via
 Canvas + Windows transparentcolor, left accent bar, dark palette.
@@ -20,11 +20,11 @@ from theme import ACCENT, WARN, ERR, OK, FONT_FAMILY, SURFACE, BORDER, TEXT_P, T
 logger = logging.getLogger(__name__)
 
 # ── Visual constants (match overlay.py) ───────────────────────────────────────
-_PILL_BG  = SURFACE    # '#141414' — dark surface for pill background
-_BORDER   = BORDER     # '#2a2a2a' — subtle separator border
-_TEXT_CLR = TEXT_P     # '#f0f0f0' — primary text
-_MUTED    = TEXT_S     # '#909090' — muted/secondary text
-_GREEN    = OK         # '#22c55e' — success green
+_PILL_BG  = SURFACE    # '#141414', dark surface for pill background
+_BORDER   = BORDER     # '#2a2a2a', subtle separator border
+_TEXT_CLR = TEXT_P     # '#f0f0f0', primary text
+_MUTED    = TEXT_S     # '#909090', muted/secondary text
+_GREEN    = OK         # '#22c55e', success green
 _TRANSP   = '#010101'  # Windows transparentcolor (near-black = transparent)
 _RADIUS   = 20
 _PAD_X    = 22           # horizontal pad inside pill
@@ -39,7 +39,7 @@ _WIDTH    = 400          # answer pill width
 _SYSTEM_PROMPT = (
     'Answer in two sentences: the first explains the core reason or fact, '
     'the second gives a brief real-world consequence or example. '
-    'Plain text only — no markdown, no bullet points, no caveats, no filler. '
+    'Plain text only, no markdown, no bullet points, no caveats, no filler. '
     'Never exceed two sentences.'
 )
 
@@ -69,9 +69,15 @@ class AskPill:
 
         self._win = tk.Toplevel(root)
         self._win.overrideredirect(True)
-        self._win.attributes('-topmost', True)
+        # Do NOT use -topmost. The pill auto-dismisses after 30s; with
+        # -topmost set, it would float over YouTube / Chrome / any
+        # other app the user switches to during that window. Instead
+        # we lift it to the top of the non-topmost z-order once after
+        # creation via Win32 SetWindowPos with SWP_NOACTIVATE so it
+        # paints above whatever app the user just asked from, without
+        # blocking subsequent app switches.
 
-        # Windows transparentcolor trick — same as OverlayWindow
+        # Windows transparentcolor trick, same as OverlayWindow
         try:
             self._win.configure(bg=_TRANSP)
             self._win.attributes('-transparentcolor', _TRANSP)
@@ -83,11 +89,11 @@ class AskPill:
         self._win.bind('<Escape>', lambda e: self._close())
         self._auto_id  = self._win.after(_AUTO_DISMISS_MS, self._close)
         self._grabbed  = False
-        # NOTE: no global keyboard hook here — main.py's _hk_escape handles
+        # NOTE: no global keyboard hook here, main.py's _hk_escape handles
         # closing pills so their escape doesn't get nuked by unhook_all().
 
         if static is not None:
-            # Status-only pill — no API call, auto-closes after 5 s
+            # Status-only pill, no API call, auto-closes after 5 s
             self._render_single(f'ℹ  {static}', WARN)
             self._win.after(5_000, self._close)
         else:
@@ -121,7 +127,7 @@ class AskPill:
             _RADIUS // 2 + _BAR_W, h * 3 // 4,
             fill=bar_color, outline='')
 
-        # Text — centred on bar+padding the same way overlay.py does it
+        # Text, centred on bar+padding the same way overlay.py does it
         c.create_text(
             _RADIUS // 2 + _BAR_W + 10 + tw // 2, h // 2,
             text=text, fill=_TEXT_CLR, font=_FONT, anchor='center')
@@ -144,7 +150,7 @@ class AskPill:
         # ── Pass 1: measure heights on a hidden canvas ────────────────────────
         m = tk.Canvas(self._win, width=w, height=4000,
                       bg='black', highlightthickness=0)
-        # (not packed — we only use it for text measurement)
+        # (not packed, we only use it for text measurement)
 
         y = _PAD_Y
 
@@ -196,7 +202,7 @@ class AskPill:
         c.create_text(pad_l, ans_y, text=text, width=text_w,
                       anchor='nw', font=_FONT, fill=_TEXT_CLR)
 
-        # Footer — Copy (left) and ✕ (right)
+        # Footer, Copy (left) and ✕ (right)
         self._copy_id = c.create_text(
             pad_l, footer_y, text='⎘  Copy',
             anchor='nw', font=_FONT_S, fill=_MUTED)
@@ -209,13 +215,13 @@ class AskPill:
             c.tag_bind(item, '<Enter>', lambda e, i=item: c.itemconfig(i, fill=_TEXT_CLR))
             c.tag_bind(item, '<Leave>', lambda e, i=item: c.itemconfig(i, fill=_MUTED))
 
-        # Copy — copies text; return 'break' prevents propagation to window close
+        # Copy, copies text; return 'break' prevents propagation to window close
         def _on_copy(e):
             self._copy()
             return 'break'
         c.tag_bind(self._copy_id, '<ButtonPress-1>', _on_copy)
 
-        # × and everything else on the canvas — close
+        # × and everything else on the canvas, close
         c.tag_bind(close_id, '<ButtonPress-1>', lambda e: self._close())
         c.tag_bind('all', '<ButtonPress-1>', lambda e: self._close())
         c.bind('<ButtonPress-1>', lambda e: self._close())
@@ -259,6 +265,18 @@ class AskPill:
         x = max(_MARGIN, min(x, sw - w - _MARGIN))
         y = max(_MARGIN, y)
         self._win.geometry(f'{w}x{h}+{x}+{y}')
+        # Lift above whatever app the user just asked from, without
+        # stealing focus and without floating above subsequent app
+        # switches. HWND_TOP=0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE.
+        try:
+            import sys as _sys
+            if _sys.platform == 'win32':
+                import ctypes as _ct
+                _ct.windll.user32.SetWindowPos(
+                    self._win.winfo_id(), 0, 0, 0, 0, 0,
+                    0x0001 | 0x0002 | 0x0010)
+        except Exception:
+            pass
 
     # ── API fetch ─────────────────────────────────────────────────────────────
 
@@ -270,7 +288,7 @@ class AskPill:
             logger.warning('AskPill: %s', exc)
             from engine import friendly_error_message
             # active_provider isn't reachable from here without main.py
-            # context, but Ask uses self._provider directly — if it's the
+            # context, but Ask uses self._provider directly, if it's the
             # local Qwen we'd still see network errors only when the
             # provider INTERNALLY calls a remote, which Local never does.
             msg = friendly_error_message(exc, feature='Ask')
@@ -288,7 +306,7 @@ class AskPill:
         except Exception:
             pass
         self._render_answer(text)
-        # grab_set routes all in-app mouse events here — any click dismisses
+        # grab_set routes all in-app mouse events here, any click dismisses
         try:
             self._win.grab_set()
             self._grabbed = True

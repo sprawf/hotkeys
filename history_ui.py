@@ -1,4 +1,4 @@
-"""Transcription History viewer — shows past whisper results with copy & search."""
+"""Transcription History viewer, shows past whisper results with copy & search."""
 import datetime
 import threading
 from typing import Callable
@@ -41,7 +41,7 @@ class HistoryWindow:
 
     def _build(self) -> None:
         self.win = ctk.CTkToplevel(self.root)
-        self.win.title('Transcription History — Hotkeys')
+        self.win.title('Transcription History, Hotkeys')
         self.win.configure(fg_color=BG)
         self.win.minsize(540, 400)
         self.win.withdraw()

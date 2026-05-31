@@ -1,0 +1,160 @@
+name: Build Windows (signed by SignPath)
+
+# Manual trigger from the Actions tab. Once SignPath approves the project,
+# fill in the four `signpath:` placeholders below + add the matching repo
+# secrets, and every run produces a SIGNED Hotkeys.exe that AVG / Defender /
+# Avast accept without quarantine.
+#
+# Required repo secrets (Settings → Secrets and variables → Actions):
+#   CEREBRAS_KEY          your Cerebras API key  (baked into _bundled_keys.py)
+#   GROQ_KEY              your Groq      API key  (baked into _bundled_keys.py)
+#   SIGNPATH_API_TOKEN    issued by SignPath when they approve your project
+#
+# Required SignPath dashboard config (paste real values into the `signpath:`
+# block at the bottom of this file):
+#   organization-id       UUID, shown in SignPath dashboard → Settings
+#   project-slug          the slug you chose for this project (likely "hotkeys")
+#   signing-policy-slug   typically "release-signing" or "test-signing"
+#   artifact-configuration-slug  typically "initial" — set when project is created
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag to publish to (e.g. v3.2.0). Must exist as a draft or live release.'
+        required: true
+        default: 'v3.2.0'
+
+jobs:
+  build-and-sign:
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    permissions:
+      contents: write     # upload signed asset to the release
+      id-token: write     # SignPath OIDC verification of the build
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # full history; some build steps read git tags
+
+      # ── 2. Python 3.12 (matches the local venv) ────────────────────────────
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      # ── 3. Bake API keys into _bundled_keys.py ─────────────────────────────
+      - name: Write bundled API keys
+        shell: bash
+        run: |
+          printf 'CEREBRAS = "%s"\nGROQ     = "%s"\n' \
+            "${{ secrets.CEREBRAS_KEY }}" "${{ secrets.GROQ_KEY }}" > _bundled_keys.py
+
+      # ── 4. pip deps ────────────────────────────────────────────────────────
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller pywin32
+
+      # ── 5. Whisper base + small models (~600 MB total) ─────────────────────
+      - name: Download Whisper models
+        shell: bash
+        run: |
+          python - <<'EOF'
+          from huggingface_hub import snapshot_download
+          import os
+          for tier, repo in [('base',  'Systran/faster-whisper-base'),
+                             ('small', 'Systran/faster-whisper-small')]:
+              os.makedirs(f'models/{tier}', exist_ok=True)
+              snapshot_download(repo, local_dir=f'models/{tier}',
+                                local_dir_use_symlinks=False)
+              print(f'{tier} model ready')
+          EOF
+
+      # ── 6. Heavy bundled assets (Tenacity + diarization) ───────────────────
+      #
+      # NOTE: these are NOT in git. Two options for handling them in CI:
+      #   a) Commit them via Git LFS (recommended once approved)
+      #   b) Download from a private storage / GitHub Release asset using a
+      #      separate gh release upload step from your local machine, then
+      #      pull them in here with gh release download.
+      #
+      # Until either is set up, the build will run but Shift+F8 whiteboard,
+      # Shift+F9 transcribe (diarization), and Shift+F10 audio editor will
+      # fall back to "asset missing" handlers at runtime. The signed exe is
+      # still valid; the missing features just show a friendly "feature
+      # unavailable in this build" message instead of crashing.
+      - name: Fetch bundled assets (Tenacity, pyannote, whiteboard)
+        shell: bash
+        run: |
+          echo "TODO: replace with your asset-fetch strategy"
+          echo "Options:"
+          echo "  a) git lfs install && git lfs pull"
+          echo "  b) gh release download v0.0-assets -p '*.zip' && unzip ..."
+          mkdir -p audio_editor_assets/tenacity assets/diarization whiteboard_assets/dist
+
+      # ── 7. Build dist ──────────────────────────────────────────────────────
+      - name: Build dist
+        run: python build_dist.py
+
+      # ── 8. Zip the dist into the shippable artifact ────────────────────────
+      - name: Zip dist
+        shell: bash
+        run: |
+          python - <<'EOF'
+          import shutil
+          shutil.make_archive('Hotkeys-${{ github.event.inputs.release_tag }}-win64',
+                              'zip', root_dir='dist', base_dir='Hotkeys')
+          print('zip ready')
+          EOF
+          ls -lh *.zip
+
+      # ── 9. Upload UNSIGNED zip as workflow artifact (SignPath fetches it) ──
+      - name: Upload unsigned artifact for SignPath
+        id: upload-unsigned
+        uses: actions/upload-artifact@v4
+        with:
+          name: Hotkeys-unsigned
+          path: Hotkeys-*.zip
+          retention-days: 1
+
+      # ── 10. Submit to SignPath for signing ─────────────────────────────────
+      # SignPath will:
+      #   - download the artifact from this workflow run
+      #   - verify the build provenance (repo, ref, workflow file)
+      #   - sign every .exe inside the zip
+      #   - return a new artifact with signed binaries
+      #
+      # First-run setup: replace the four placeholders below with the values
+      # SignPath gives you after they approve the project (org dashboard →
+      # this project → Artifact Configurations / Signing Policies).
+      - name: Submit signing request to SignPath
+        id: signpath
+        uses: signpath/github-action-submit-signing-request@v1.2
+        with:
+          api-token: '${{ secrets.SIGNPATH_API_TOKEN }}'
+          organization-id: 'REPLACE-WITH-SIGNPATH-ORG-ID'
+          project-slug: 'hotkeys'
+          signing-policy-slug: 'release-signing'
+          artifact-configuration-slug: 'initial'
+          github-artifact-id: '${{ steps.upload-unsigned.outputs.artifact-id }}'
+          wait-for-completion: true
+          output-artifact-directory: 'signed'
+
+      # ── 11. Publish signed zip to the GitHub Release ───────────────────────
+      - name: Upload signed zip to release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -lh signed/
+          # The signed zip lands in signed/ with the same name as the unsigned one.
+          ZIP=$(ls signed/Hotkeys-*.zip | head -n1)
+          echo "Publishing $ZIP to release ${{ github.event.inputs.release_tag }}"
+          gh release upload "${{ github.event.inputs.release_tag }}" "$ZIP" --clobber
+          echo "Done."

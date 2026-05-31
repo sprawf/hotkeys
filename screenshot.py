@@ -75,10 +75,10 @@ def start_prtsc_listener(callback) -> None:
         _hook_ref[0] = _user32.SetWindowsHookExW(13, proc, None, 0)
         if not _hook_ref[0]:
             logging.getLogger(__name__).warning(
-                'SetWindowsHookEx for Print Screen failed — PrtSc unavailable')
+                'SetWindowsHookEx for Print Screen failed, PrtSc unavailable')
             return
         msg = ctypes.wintypes.MSG()
-        # GetMessageW blocks until a message arrives — the OS wakes this thread
+        # GetMessageW blocks until a message arrives, the OS wakes this thread
         # whenever a WH_KEYBOARD_LL callback needs to fire, so there is no
         # polling delay.  The old PeekMessageW + sleep(0.01) loop worked but
         # added up to 10 ms latency before the hook callback ran, which could
@@ -122,7 +122,7 @@ _HANDLE_R     = 5             # handle square half-size (px)
 _BADGE_BG     = '#1a1a1a'
 _BADGE_FG     = '#ffffff'
 
-# Right toolbar — app dark theme, Lightshot-identical shape/dimensions
+# Right toolbar, app dark theme, Lightshot-identical shape/dimensions
 _TB_BG        = SURF2        # '#1e1e1e'  dark panel
 _TB_BORDER    = BORDER2      # '#383838'  border ring
 _TB_FG        = TEXT_P       # '#f0f0f0'  white icons on dark bg
@@ -133,7 +133,7 @@ _TB_BTN_H     = 28           # ~28px per button (Lightshot ≈ 25px; slight incr
 _TB_RADIUS    = 9
 _TB_GAP       = 3
 
-# Bottom action bar — same dark theme
+# Bottom action bar, same dark theme
 _AB_BG        = SURF2        # '#1e1e1e'
 _AB_FG        = TEXT_P       # '#f0f0f0'
 _AB_HOVER     = SURF3        # '#282828'
@@ -268,7 +268,7 @@ class ScreenshotOverlay:
         canvas.bind('<ButtonRelease-1>', self._on_lup)
         canvas.bind('<ButtonPress-3>',   self._on_rclick)
         canvas.bind('<Motion>',          self._on_motion)
-        # Escape bound on both win and canvas — canvas steals keyboard focus
+        # Escape bound on both win and canvas, canvas steals keyboard focus
         # once the mouse moves over it, so win-only binding misses most presses.
         win.bind(   '<Escape>',          lambda e: self._cancel())
         canvas.bind('<Escape>',          lambda e: self._cancel())
@@ -295,9 +295,9 @@ class ScreenshotOverlay:
             pass
 
         if self._own_root:
-            # We own this root — run our own mainloop then clean up.
+            # We own this root, run our own mainloop then clean up.
             # Mainloop exits via _close() → root.quit().
-            # Safe to destroy here — not from inside the event handler, which
+            # Safe to destroy here, not from inside the event handler, which
             # would corrupt tkinter's _default_root global and kill the main
             # CTk app. Destroying here lets Tk clean up its own WH_KEYBOARD_LL
             # hooks properly, preventing them going orphaned and disrupting the
@@ -324,7 +324,7 @@ class ScreenshotOverlay:
     def capture_for_ask(self) -> 'Image.Image | None':
         """Return the selected region (with annotations) as a PIL Image, or None.
 
-        Safe to call from a background thread — only reads PIL data, no Tkinter.
+        Safe to call from a background thread, only reads PIL data, no Tkinter.
         Intended for Shift+F4 → OCR → answer-pill while overlay is still open.
         """
         return self._render()
@@ -534,7 +534,7 @@ class ScreenshotOverlay:
             # Thick diagonal stroke (~5px) like pen direction
             ids += [c.create_line(cx-5, cy+5, cx+5, cy-5,
                                   fill=fg, width=5, capstyle='butt', tags=t)]
-            # Horizontal underline bar — KEY distinguishing feature vs pen/line
+            # Horizontal underline bar, KEY distinguishing feature vs pen/line
             ids += [c.create_line(cx-7, cy+8, cx+7, cy+8,
                                   fill=fg, width=2, capstyle='butt', tags=t)]
 
@@ -580,11 +580,11 @@ class ScreenshotOverlay:
     def _draw_toolbar(self, x1, y1, x2, y2) -> None:
         c = self._canvas
         tools = [
-            ('marker', 'Marker — highlight'),
+            ('marker', 'Marker (highlight)'),
             ('line',   'Line'),
             ('arrow',  'Arrow'),
             ('rect',   'Rectangle'),
-            ('pen',    'Pen — freehand drawing'),
+            ('pen',    'Pen (freehand drawing)'),
             ('text',   'Text'),
             ('color',  'Annotation colour'),
             ('undo',   'Undo last annotation'),
@@ -603,7 +603,7 @@ class ScreenshotOverlay:
         # Store bounding box so click/cursor handlers can check it
         self._toolbar_bbox = (tx, ty, tx + _TB_W, ty + total_h)
 
-        # Panel background — rounded corners like Lightshot
+        # Panel background, rounded corners like Lightshot
         self._rounded_rect(c, tx, ty, tx + _TB_W, ty + total_h,
                            _TB_RADIUS, fill=_TB_BG, outline=_TB_BORDER,
                            width=1, tags=('toolbar',))
@@ -628,7 +628,7 @@ class ScreenshotOverlay:
                 c.create_line(tx + 5, by1, tx + _TB_W - 5, by1,
                               fill=BORDER, tags=('toolbar',))
 
-            # Bind icon items too — fill='' hit-rects are inert to canvas events,
+            # Bind icon items too, fill='' hit-rects are inert to canvas events,
             # so clicks on icon shapes (lines, polygons) would be swallowed without
             # a binding on the icon ids themselves.
             icon_ids = self._draw_tb_icon(c, tid, icx, icy, _TB_FG, bg, self._color)
@@ -729,7 +729,7 @@ class ScreenshotOverlay:
         # Store bounding box so click/cursor handlers can check it
         self._actionbar_bbox = (bx, by, bx + total_w, by + _AB_H)
 
-        # Panel background — rounded corners like Lightshot
+        # Panel background, rounded corners like Lightshot
         self._rounded_rect(c, bx, by, bx + total_w, by + _AB_H,
                            _AB_RADIUS, fill=_AB_BG, outline=_TB_BORDER,
                            width=1, tags=('actionbar',))
@@ -832,7 +832,7 @@ class ScreenshotOverlay:
         # Right-click on toolbar / action-bar: ignore
         if self._in_ui(event.x, event.y):
             return
-        # Always show a context menu — Copy/Save appear only when a selection
+        # Always show a context menu, Copy/Save appear only when a selection
         # exists, but the Exit option is ALWAYS present as a failsafe so the
         # overlay can never be "stuck" without an escape route.
         self._show_context_menu(event.x_root, event.y_root)
@@ -853,7 +853,7 @@ class ScreenshotOverlay:
             menu.add_command(label='  Copy',   command=self._copy)
             menu.add_command(label='  Save',   command=self._save)
             menu.add_separator()
-        # Exit is always present — this is the last-resort escape if Esc/Del
+        # Exit is always present, this is the last-resort escape if Esc/Del
         # are somehow not responding (e.g. focus was stolen by another app).
         menu.add_command(label='  Exit screenshot', command=self._cancel)
         try:
@@ -938,7 +938,7 @@ class ScreenshotOverlay:
             return
 
         if self._tool == 'marker':
-            # Freehand highlighter — accumulates points exactly like pen
+            # Freehand highlighter, accumulates points exactly like pen
             self._pen_pts.append((ex, ey))
             if self._draw_live:
                 c.delete(self._draw_live)
@@ -1130,7 +1130,7 @@ class ScreenshotOverlay:
                 None, 'print', tmp.name, None, None, 0)
         except Exception as e:
             print(f'Screenshot print error: {e}')
-        # Don't close overlay — let user continue after printing
+        # Don't close overlay, let user continue after printing
 
     def _copy(self) -> None:
         img = self._render()
@@ -1167,7 +1167,7 @@ class ScreenshotOverlay:
                 except Exception:
                     pass
 
-            # Restore overlay (always — whether saved or cancelled)
+            # Restore overlay (always, whether saved or cancelled)
             self._win.attributes('-topmost', True)
             self._win.lift()
             self._win.bind('<Escape>', lambda e: self._cancel())
@@ -1210,7 +1210,7 @@ class ScreenshotOverlay:
         except Exception:
             pass
         if self._own_root:
-            # We own this root — quit our mainloop so _build() can return
+            # We own this root, quit our mainloop so _build() can return
             try:
                 self._root.quit()
             except Exception:
@@ -1261,10 +1261,34 @@ def take_screenshot(root=None, on_done=None) -> None:
     thread via root.after() so _build() never stalls the event loop.
     """
     # Claim the singleton slot BEFORE spawning the thread so rapid PrtSc
-    # presses don't start multiple concurrent grabs.
+    # presses don't start multiple concurrent grabs. Before refusing,
+    # self-heal: if the flag is set but no real overlay window exists
+    # (previous overlay crashed, was force-closed, raced through cleanup,
+    # etc.), clear the flag and proceed. Without this, a single stale
+    # True silently dead-locks Print Screen forever.
     with _overlay_lock:
         if _overlay_active[0]:
-            return
+            ov = _pending_overlay[0]
+            still_alive = False
+            try:
+                if ov is not None:
+                    # An overlay is "real" iff its toplevel still exists
+                    # and is mapped. Anything else is a ghost.
+                    tk_root = getattr(ov, '_overlay', None) or \
+                              getattr(ov, '_root',    None)
+                    still_alive = (tk_root is not None
+                                   and tk_root.winfo_exists()
+                                   and tk_root.winfo_ismapped())
+            except Exception:
+                still_alive = False
+            if still_alive:
+                return   # genuine in-flight overlay, do not start a 2nd
+            # Stale flag, clear and continue.
+            _overlay_active[0] = False
+            _pending_overlay[0] = None
+            import logging
+            logging.getLogger(__name__).info(
+                'Cleared stale screenshot flag from previous run.')
         _overlay_active[0] = True
 
     if root is not None:
@@ -1283,7 +1307,7 @@ def take_screenshot(root=None, on_done=None) -> None:
 
         threading.Thread(target=_grab, daemon=True, name='screenshot-grab').start()
     else:
-        # Legacy fallback: no root supplied — run everything in a thread
+        # Legacy fallback: no root supplied, run everything in a thread
         # (creates its own Tk root inside ScreenshotOverlay).
         threading.Thread(target=lambda: ScreenshotOverlay(None, on_done=on_done),
                          daemon=True, name='screenshot-overlay').start()

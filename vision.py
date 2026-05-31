@@ -6,7 +6,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 DEFAULT_VISION_MODEL = 'meta-llama/llama-4-scout-17b-16e-instruct'
-LONG_TEXT_WARN       = 2000   # chars — prompt user if result is very long
+LONG_TEXT_WARN       = 2000   # chars, prompt user if result is very long
 _MAX_PX              = 1280   # max image dimension sent to API
 _TIMEOUT             = 15.0   # seconds per request
 
@@ -23,7 +23,7 @@ _EXTRACT_PROMPT = (
 def get_clipboard_image() -> tuple:
     """Read an image from the clipboard.
 
-    ALWAYS returns a 2-tuple — callers MUST unpack:
+    ALWAYS returns a 2-tuple, callers MUST unpack:
         img, err = get_clipboard_image()
 
     Returns
@@ -31,17 +31,17 @@ def get_clipboard_image() -> tuple:
     (PIL.Image, None)
         Image found and decoded successfully.
     (None, None)
-        Clipboard contains no image data — expected, let normal paste proceed.
+        Clipboard contains no image data, expected, let normal paste proceed.
     (None, str)
-        Something went wrong trying to read the clipboard — show the string
+        Something went wrong trying to read the clipboard, show the string
         to the user so they know what to fix.
 
     Tries every known Windows clipboard image format in order:
-      1. PIL ImageGrab.grabclipboard()  — CF_DIB / CF_BITMAP (classic PrtSc)
-      2. win32clipboard PNG format       — Win11 Snipping Tool (Win+Shift+S)
-      3. win32clipboard CF_DIB           — our built-in PrtSc screenshot tool
-      4. win32clipboard CF_BITMAP        — older apps
-      5. File list on clipboard          — image file copied from Explorer
+      1. PIL ImageGrab.grabclipboard() , CF_DIB / CF_BITMAP (classic PrtSc)
+      2. win32clipboard PNG format      , Win11 Snipping Tool (Win+Shift+S)
+      3. win32clipboard CF_DIB          , our built-in PrtSc screenshot tool
+      4. win32clipboard CF_BITMAP       , older apps
+      5. File list on clipboard         , image file copied from Explorer
     """
     import io
     import struct
@@ -71,11 +71,11 @@ def get_clipboard_image() -> tuple:
         try:
             win32clipboard.OpenClipboard()
         except Exception as e:
-            # Can't open clipboard at all — likely blocked by AV or another app
+            # Can't open clipboard at all, likely blocked by AV or another app
             last_syserr = str(e)
             err_lower   = last_syserr.lower()
             if 'access' in err_lower or '5' in last_syserr:
-                return None, ('Clipboard access denied — antivirus (e.g. AVG Clipboard Shield) '
+                return None, ('Clipboard access denied, antivirus (e.g. AVG Clipboard Shield) '
                               'may be blocking it. Try disabling clipboard protection temporarily.')
             return None, f'Could not open clipboard: {last_syserr}'
 
@@ -111,7 +111,7 @@ def get_clipboard_image() -> tuple:
                     logger.debug(f'CF_DIB decode: {e}')
                     last_syserr = str(e)
 
-            # Method 4: CF_BITMAP (older apps — convert via PIL)
+            # Method 4: CF_BITMAP (older apps, convert via PIL)
             if win32clipboard.IsClipboardFormatAvailable(win32con.CF_BITMAP):
                 try:
                     # PIL's grabclipboard handles CF_BITMAP; if we're here it failed,
@@ -142,9 +142,9 @@ def get_clipboard_image() -> tuple:
 
     # ── Nothing found ─────────────────────────────────────────────────────────
     if last_syserr:
-        # Clipboard was accessible but decoding failed — surface the reason
+        # Clipboard was accessible but decoding failed, surface the reason
         return None, f'Image found on clipboard but could not be decoded: {last_syserr}'
-    return None, None   # genuinely no image — expected, let normal paste proceed
+    return None, None   # genuinely no image, expected, let normal paste proceed
 
 
 # ── Image helpers ─────────────────────────────────────────────────────────────

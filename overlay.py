@@ -1,8 +1,8 @@
 """
-Floating status pill — appears near the cursor during refinement or recording.
+Floating status pill, appears near the cursor during refinement or recording.
 True pill shape via Canvas + Windows transparentcolor trick.
 Slot 0 = text-refine pill  (Y offset 0)
-Slot 1 = whisper pill      (Y offset +50 px — stacks below refine pill)
+Slot 1 = whisper pill      (Y offset +50 px, stacks below refine pill)
 """
 import time
 import tkinter as tk
@@ -11,9 +11,9 @@ from tkinter.font import Font as TkFont
 from theme import ACCENT, OK, WARN, ERR, INFO, FONT_FAMILY, FONT_MONO, SURFACE, BORDER, TEXT_P
 
 # Pill styling
-_PILL_BG    = SURFACE      # '#141414' — dark surface for pill background
-_BORDER_CLR = BORDER       # '#2a2a2a' — subtle separator border
-_TEXT_CLR   = TEXT_P       # '#f0f0f0' — primary text
+_PILL_BG    = SURFACE      # '#141414', dark surface for pill background
+_BORDER_CLR = BORDER       # '#2a2a2a', subtle separator border
+_TEXT_CLR   = TEXT_P       # '#f0f0f0', primary text
 _TRANSP     = '#010101'    # Windows transparentcolor (near-black = transparent)
 _RADIUS     = 20
 _PAD_X      = 22
@@ -55,7 +55,7 @@ class OverlayWindow:
     # ── Refine pill states ────────────────────────────────────────────────────
 
     def show(self) -> None:
-        """Refining — animated elapsed-time pill."""
+        """Refining, animated elapsed-time pill."""
         self._close()
         self._t0   = time.time()
         self._tick = True
@@ -64,7 +64,7 @@ class OverlayWindow:
 
     def show_loading_model(self) -> None:
         self._close()
-        self._build('⏳  Local model loading — try again in ~10s', _TEXT_CLR, WARN)
+        self._build('⏳  Local model loading, try again in ~10s', _TEXT_CLR, WARN)
         if self._win:
             self._win.after(4000, self._close)
 
@@ -98,7 +98,7 @@ class OverlayWindow:
     # ── Whisper pill states ───────────────────────────────────────────────────
 
     def show_recording(self) -> None:
-        """Recording in progress — animated elapsed-time pill."""
+        """Recording in progress, animated elapsed-time pill."""
         self._close()
         self._t0   = time.time()
         self._tick = True
@@ -114,7 +114,7 @@ class OverlayWindow:
         else:
             self._build('⏳  Transcribing...', _TEXT_CLR, ACCENT)
         # Safety: auto-dismiss after 30 s in case transcriber never reports back.
-        # Cancel any previous timer first — if show_transcribing is called again
+        # Cancel any previous timer first, if show_transcribing is called again
         # before the old 30 s fires, we must not let the stale callback destroy
         # the new window.
         self._cancel_safety_timer()
@@ -144,20 +144,21 @@ class OverlayWindow:
 
     def show_whisper_loading(self) -> None:
         self._close()
-        self._build('⏳  Whisper loading — try again shortly', _TEXT_CLR, WARN)
+        self._build('⏳  Whisper loading, try again shortly', _TEXT_CLR, WARN)
         if self._win:
             self._win.after(4000, self._close)
 
     def show_whisper_cancelled(self) -> None:
         self._tick = False
+        text = '🔇  No speech detected'
         if self._win:
-            self._set_text('—  No speech detected')
+            self._set_text(text)
             self._set_bar(WARN)
-            self._win.after(1600, self._close)
+            self._win.after(1800, self._close)
         else:
-            self._build('—  No speech detected', _TEXT_CLR, WARN)
+            self._build(text, _TEXT_CLR, WARN)
             if self._win:
-                self._win.after(1600, self._close)
+                self._win.after(1800, self._close)
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
@@ -218,7 +219,7 @@ class OverlayWindow:
             win.update_idletasks()   # ensure the HWND exists before querying
             _u32 = ctypes.windll.user32
             # Set argtypes/restype so ctypes uses the correct 64-bit HWND type on
-            # 64-bit Windows (HANDLE is a pointer-sized integer — without this,
+            # 64-bit Windows (HANDLE is a pointer-sized integer, without this,
             # ctypes defaults to c_int which silently truncates the upper 32 bits).
             _u32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
             _u32.GetAncestor.restype  = ctypes.c_void_p
@@ -280,7 +281,7 @@ class OverlayWindow:
     # ── Macro pill states ─────────────────────────────────────────────────────
 
     def show_macro_recording(self) -> None:
-        """Macro recording — animated elapsed-time pill."""
+        """Macro recording, animated elapsed-time pill."""
         self._close()
         self._t0   = time.time()
         self._tick = True
@@ -288,7 +289,7 @@ class OverlayWindow:
         self._update_macro_recording()
 
     def show_macro_playing(self) -> None:
-        """Macro playback — animated elapsed-time pill."""
+        """Macro playback, animated elapsed-time pill."""
         self._close()
         self._t0   = time.time()
         self._tick = True
@@ -296,32 +297,32 @@ class OverlayWindow:
         self._update_macro_playing()
 
     def show_macro_ready(self, n_events: int) -> None:
-        """Recording stopped — show count, then auto-close after 3 s."""
+        """Recording stopped, show count, then auto-close after 3 s."""
         self._tick = False
         self._close()
-        self._build(f'⏹  {n_events} events — Shift+F1 to play', _TEXT_CLR, ACCENT)
+        self._build(f'⏹  {n_events} events, Shift+F1 to play', _TEXT_CLR, ACCENT)
         if self._win:
             self._win.after(3000, self._close)
 
     def show_macro_done(self) -> None:
         self._tick = False
         if self._win:
-            self._set_text('✓  Macro done — Shift+F1 to replay')
+            self._set_text('✓  Macro done, Shift+F1 to replay')
             self._set_bar(OK)
             self._win.after(2000, self._close)
         else:
-            self._build('✓  Macro done — Shift+F1 to replay', _TEXT_CLR, OK)
+            self._build('✓  Macro done, Shift+F1 to replay', _TEXT_CLR, OK)
             if self._win:
                 self._win.after(2000, self._close)
 
     def show_macro_stopped(self) -> None:
         self._tick = False
         if self._win:
-            self._set_text('⬜  Stopped — Shift+F1 to replay')
+            self._set_text('⬜  Stopped, Shift+F1 to replay')
             self._set_bar(WARN)
             self._win.after(1500, self._close)
         else:
-            self._build('⬜  Stopped — Shift+F1 to replay', _TEXT_CLR, WARN)
+            self._build('⬜  Stopped, Shift+F1 to replay', _TEXT_CLR, WARN)
             if self._win:
                 self._win.after(1500, self._close)
 
@@ -329,7 +330,7 @@ class OverlayWindow:
         """Brief confirmation pill after a macro is saved."""
         self._tick = False
         self._close()
-        hk_part = f'  —  {hotkey.upper()} to play' if hotkey else '  —  assign a hotkey in Library'
+        hk_part = f'  ·  {hotkey.upper()} to play' if hotkey else '  ·  assign a hotkey in Library'
         text = f'✓  "{name}" saved{hk_part}'
         self._build(text, _TEXT_CLR, OK)
         if self._win:
@@ -352,7 +353,7 @@ class OverlayWindow:
     # ── Recorder pill states ──────────────────────────────────────────────────
 
     def show_recorder_recording(self) -> None:
-        """Screen recording active — animated elapsed-time pill (red)."""
+        """Screen recording active, animated elapsed-time pill (red)."""
         self._close()
         self._t0   = time.time()
         self._tick = True
@@ -360,7 +361,7 @@ class OverlayWindow:
         self._update_recorder_recording()
 
     def show_recorder_stopping(self) -> None:
-        """Encoding / finalizing — brief amber pill."""
+        """Encoding / finalizing, brief amber pill."""
         self._tick = False
         self._close()
         self._build('⏳  Saving recording…', _TEXT_CLR, WARN)
@@ -370,34 +371,34 @@ class OverlayWindow:
             return
         elapsed = time.time() - self._t0
         m, s = divmod(int(elapsed), 60)
-        self._set_text(f'⏺  Recording…  {m:02d}:{s:02d}  —  Shift+F2 to stop')
+        self._set_text(f'⏺  Recording…  {m:02d}:{s:02d}  ·  Shift+F2 to stop')
         self._win.after(1000, self._update_recorder_recording)
 
     # ── GIF pill states ───────────────────────────────────────────────────────
 
     def show_gif_recording(self) -> None:
-        """GIF capture active — animated frame-count pill (purple/accent)."""
+        """GIF capture active, animated frame-count pill (purple/accent)."""
         self._close()
         self._t0   = time.time()
         self._tick = True
-        self._build('🎞  GIF  0s  —  Shift+F3 to stop', _TEXT_CLR, ACCENT)
+        self._build('🎞  GIF  0s  ·  Shift+F3 to stop', _TEXT_CLR, ACCENT)
         self._update_gif_recording()
 
     def _update_gif_recording(self) -> None:
         if not self._tick or self._win is None:
             return
         elapsed = time.time() - self._t0
-        self._set_text(f'🎞  GIF  {int(elapsed)}s  —  Shift+F3 to stop')
+        self._set_text(f'🎞  GIF  {int(elapsed)}s  ·  Shift+F3 to stop')
         self._win.after(1000, self._update_gif_recording)
 
     def show_gif_encoding(self) -> None:
-        """GIF encoding in progress — brief amber pill."""
+        """GIF encoding in progress, brief amber pill."""
         self._tick = False
         self._close()
         self._build('⏳  Saving GIF…', _TEXT_CLR, WARN)
 
     def show_gif_capped(self, dur_s: int) -> None:
-        """Duration cap hit — show notification, then auto-close."""
+        """Duration cap hit, show notification, then auto-close."""
         self._tick = False
         self._close()
         self._build(f'⏹  Max duration reached ({dur_s}s)', _TEXT_CLR, WARN)
@@ -417,7 +418,7 @@ class OverlayWindow:
                 pass
             self._pulse_job = None
         self._tick = False
-        text = f'⛓  Step {step_num}/{total} — {label}…'
+        text = f'⛓  Step {step_num}/{total}, {label}…'
         if self._win:
             self._set_text(text)
             self._set_bar(ACCENT)
@@ -438,7 +439,7 @@ class OverlayWindow:
             except Exception:
                 pass
             self._pulse_job = None
-        text = f'✓  Chain done — {name}'
+        text = f'✓  Chain done, {name}'
         if self._win:
             self._set_text(text)
             self._set_bar(OK)
@@ -449,7 +450,7 @@ class OverlayWindow:
                 self._win.after(3000, self._close)
 
     def hide(self) -> None:
-        """Public alias for _close — lets external callers hide the overlay."""
+        """Public alias for _close, lets external callers hide the overlay."""
         self._close()
 
     def _update_chain_pulse(self) -> None:

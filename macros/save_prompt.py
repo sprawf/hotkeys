@@ -1,5 +1,5 @@
 """
-MacroSavePrompt — small floating dialog shown after a macro recording stops.
+MacroSavePrompt, small floating dialog shown after a macro recording stops.
 Appears near the mouse cursor and lets the user name, assign a hotkey, and
 save or discard the recording.
 """

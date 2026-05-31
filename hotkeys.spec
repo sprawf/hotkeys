@@ -8,6 +8,17 @@ from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, co
 
 ROOT = Path(r'E:\Hotkeys')
 
+# ── Generate the brand icon up-front ─────────────────────────────────────────
+# The spec is self-contained: it imports brand_icon.py and writes the .ico
+# into the build tree before PyInstaller starts packaging. No manual prep
+# step required ("run main.py first" etc.) — clone the repo and `pyinstaller
+# hotkeys.spec` Just Works™.
+sys.path.insert(0, str(ROOT))
+from brand_icon import save_ico  # noqa: E402
+_BRAND_ICO_FOR_EXE = ROOT / 'build_icon.ico'
+save_ico(str(_BRAND_ICO_FOR_EXE))
+print(f'[hotkeys.spec] brand icon written to {_BRAND_ICO_FOR_EXE}')
+
 # ── Data files ────────────────────────────────────────────────────────────────
 
 datas = []
@@ -18,6 +29,20 @@ datas += collect_data_files('faster_whisper', include_py_files=False)
 
 # UI theme/image data for customtkinter
 datas += collect_data_files('customtkinter', include_py_files=False)
+
+# pyspellchecker — ships en/de/es/fr/... .json.gz dictionaries under
+# spellchecker/resources/. Without this PyInstaller bundles the .py but
+# NOT the dictionaries, and the background _get_checker() thread raises
+# ValueError("The provided dictionary language (en) does not exist!") at
+# import time of spellcheck.py — silently killing the frozen exe between
+# hotkey registration and tray creation.
+datas += collect_data_files('spellchecker', include_py_files=False)
+
+# tkinterdnd2 — ships native libtkdnd*.dll under tkinterdnd2/tkdnd/win-x64/.
+# Used by the Library and Transcribe UIs for drag-and-drop. Bundled
+# transitively in past builds by analyser-walk luck; making it explicit
+# so a spec edit can never silently drop drag-drop support.
+datas += collect_data_files('tkinterdnd2', include_py_files=False)
 
 # ctranslate2 — ships model-format DLLs and CUDA kernels as data
 datas += collect_data_files('ctranslate2', include_py_files=False)
@@ -32,21 +57,82 @@ datas += collect_data_files('onnxruntime', include_py_files=False)
 # collect_all picks up pyd files, av.libs FFmpeg DLLs, and data in one shot
 _av_datas, _av_bins, _av_hidden = collect_all('av')
 
+# ── Shift+F9 Transcribe pipeline ─────────────────────────────────────────────
+# DIAGNOSTIC: temporarily NOT bundling torch + pyannote.audio + torchaudio +
+# soundfile. Hypothesis: their bundled MKL/OpenMP/BLAS DLLs conflict with
+# ctranslate2/onnxruntime/numpy/av, producing the deterministic heap
+# corruption (STATUS_STACK_BUFFER_OVERRUN 0xc0000409 at PyInstaller bootloader
+# offset 0x1c325). v3.0 didn't bundle these and worked. Restoring them with
+# proper isolation is a follow-up — for now, prove the hypothesis.
+# Shift+F9 transcribe will gracefully fall back to no-diarization mode at
+# runtime (no speaker labels in transcripts, but the rest works).
+# _torch_datas,   _torch_bins,   _torch_hidden   = collect_all('torch')
+# _taudio_datas,  _taudio_bins,  _taudio_hidden  = collect_all('torchaudio')
+# _pyanno_datas,  _pyanno_bins,  _pyanno_hidden  = collect_all('pyannote.audio')
+# _sf_datas,      _sf_bins,      _sf_hidden      = collect_all('soundfile')
+_ytdl_datas,    _ytdl_bins,    _ytdl_hidden    = collect_all('yt_dlp')
+# imageio-ffmpeg ships a portable ffmpeg binary (~83 MB) under
+# imageio_ffmpeg/binaries/ — required so yt-dlp can merge separate
+# video+audio streams (every YouTube format above 720p is split). Without
+# this the F9 downloader silently caps quality at 720p single-stream.
+_ioff_datas,    _ioff_bins,    _ioff_hidden    = collect_all('imageio_ffmpeg')
+
 # pynput — macro recorder uses pynput for mouse/keyboard capture & replay
 # collect_all is needed; PyInstaller misses the Windows backend otherwise
 _pynput_datas, _pynput_bins, _pynput_hidden = collect_all('pynput')
 datas += _av_datas
 datas += _pynput_datas
+# datas += _torch_datas
+# datas += _taudio_datas
+# datas += _pyanno_datas
+# datas += _sf_datas
+datas += _ytdl_datas
+datas += _ioff_datas
 
 # Whisper models (base=141 MB, small=464 MB; large-v3-turbo excluded — no model.bin)
 datas += [(str(ROOT / 'models' / 'base'),  'models/base')]
 datas += [(str(ROOT / 'models' / 'small'), 'models/small')]
 
-# Silero VAD ONNX model
+# Silero VAD ONNX model + pyannote diarization pipeline (Shift+F9 Transcribe).
+# `assets/diarization/` holds the config.yaml + segmentation + embedding +
+# PLDA files — pre-downloaded with HF auth at dev time, redistributed under
+# CC-BY-4.0. ~33 MB. Resolved at runtime via storage.assets_dir() which
+# returns <_MEIPASS>/assets in frozen mode.
 datas += [(str(ROOT / 'assets'), 'assets')]
 
 # Prompt library
 datas += [(str(ROOT / 'prompts.json'), '.')]
+
+# ── Whiteboard offline bundle (Shift+F8 whiteboard) ──────────────────────────
+# whiteboard.py loads whiteboard_assets/dist/index.html via file://.
+# Path resolution at runtime: when frozen, looks under sys._MEIPASS — so the
+# tree must land at <_MEIPASS>/whiteboard_assets/dist/...
+_wb_dist = ROOT / 'whiteboard_assets' / 'dist'
+if _wb_dist.exists():
+    for _p in _wb_dist.rglob('*'):
+        if _p.is_file():
+            _rel = _p.relative_to(ROOT).parent  # e.g. whiteboard_assets/dist/fonts/Cascadia
+            datas += [(str(_p), str(_rel))]
+else:
+    print(f'!! whiteboard_assets/dist missing — build it first: '
+          f'cd whiteboard_assets && npm install && node build.mjs')
+
+# ── Audio editor bundle (Shift+F10, Tenacity portable, relabeled) ────────────
+# audio_editor.py spawns audio_editor_assets/tenacity/tenacity.exe as a
+# sibling process. PyInstaller drops every file under _MEIPASS/ at the same
+# relative path. In onedir mode (what we ship) _MEIPASS is <dist>/_internal,
+# so the runnable layout becomes
+#   _internal/audio_editor_assets/tenacity/tenacity.exe + DLLs + Plug-Ins/ + ...
+# which is exactly what the launcher expects.
+_ae_dir = ROOT / 'audio_editor_assets' / 'tenacity'
+if _ae_dir.exists():
+    for _p in _ae_dir.rglob('*'):
+        if _p.is_file():
+            _rel = _p.relative_to(ROOT).parent
+            datas += [(str(_p), str(_rel))]
+else:
+    print(f'!! audio_editor_assets/tenacity missing — see audio_editor.py'
+          f' header for bundling steps')
 
 # ── Binaries (native shared libs) ─────────────────────────────────────────────
 
@@ -55,6 +141,13 @@ binaries += collect_dynamic_libs('ctranslate2')
 binaries += collect_dynamic_libs('onnxruntime')
 binaries += _av_bins       # av.libs FFmpeg DLLs + av .pyd extensions
 binaries += _pynput_bins   # pynput Windows backend
+# DIAGNOSTIC: dropped torch/torchaudio/pyannote/soundfile binaries (see notes above).
+# binaries += _torch_bins
+# binaries += _taudio_bins
+# binaries += _pyanno_bins
+# binaries += _sf_bins
+binaries += _ytdl_bins     # yt-dlp Cython speedups if present
+binaries += _ioff_bins     # imageio-ffmpeg's ffmpeg.exe
 
 # ── Hidden imports ────────────────────────────────────────────────────────────
 
@@ -137,6 +230,7 @@ hiddenimports = [
     'psutil',
     'psutil._pswindows',
     'spellchecker',
+    'tkinterdnd2',
 
     # App core modules
     'storage',
@@ -168,13 +262,71 @@ hiddenimports = [
     'macros.library',
     'macros.save_prompt',
 
+    # Shift+F9 — file/URL transcription pipeline
+    'transcribe',
+    'transcribe.engine',
+    'transcribe.exporters',
+    'transcribe.youtube',
+    'transcribe_ui',
+    # DIAGNOSTIC: soundfile / pyannote.audio / torch / torchaudio temporarily
+    # NOT bundled — see diagnostic block at top of this spec. Transcribe will
+    # fall back to no-diarization mode (faster_whisper handles the core
+    # transcription on its own).
+    # 'soundfile',
+    'yt_dlp',
+    'fpdf',           # fpdf2 wheel installs as `fpdf`
+    'docx',           # python-docx
+    # 'pyannote.audio',
+    # 'torch',
+    # 'torchaudio',
+    'imageio_ffmpeg',
+
     # Quick Notes
     'quicknotes',
+
+    # Whiteboard — offline Whiteboard via pywebview (Shift+F8)
+    'whiteboard',
+    'win_geometry',     # shared: center-on-work-area for Notes + Whiteboard
+    'hotkey_validator', # central conflict checks for every hotkey UI
+    'brand_icon',       # render + save brand .ico (used at build + runtime)
+    'webview',
+    'webview.platforms.edgechromium',
+    'clr_loader',
+    'pythonnet',
+    'bottle',
+    'proxy_tools',
+    'typing_extensions',
+    # Stdlib modules lazy-imported by webview/wsgiref/bottle that PyInstaller's
+    # static analyzer misses. Without these, the whiteboard subprocess crashes
+    # on `from wsgiref.simple_server import make_server` → ModuleNotFoundError.
+    'http',
+    'http.server',
+    'http.client',
+    'wsgiref',
+    'wsgiref.simple_server',
+    'wsgiref.util',
+    'wsgiref.headers',
+    'wsgiref.handlers',
+    'wsgiref.validate',
+    'socketserver',
+    'xml',
+    'xml.etree',
+    'xml.etree.ElementTree',
 ]
 
 # Collect all submodules of heavy packages so nothing gets missed
 hiddenimports += collect_submodules('faster_whisper')
 hiddenimports += collect_submodules('huggingface_hub')
+# Belt-and-braces: also collect data + submodules via collect_all so the
+# package is FORCED into the bundle. PyInstaller's static analyzer has been
+# dropping huggingface_hub when nothing at module level imports it (lazy
+# import inside _ensure_model_downloaded was being missed). transcribe/
+# engine.py also has a top-level anchor import; either should be enough,
+# both is safer.
+_hf_datas, _hf_bins, _hf_hidden = collect_all('huggingface_hub')
+datas += _hf_datas
+binaries += _hf_bins
+hiddenimports += _hf_hidden
 hiddenimports += _av_hidden   # av submodules from collect_all
 hiddenimports += collect_submodules('ctranslate2')
 hiddenimports += [m for m in collect_submodules('onnxruntime') if 'quantization' not in m and 'onnx' not in m]
@@ -183,6 +335,30 @@ hiddenimports += collect_submodules('cerebras')
 hiddenimports += collect_submodules('pystray')
 hiddenimports += collect_submodules('scipy.signal')
 hiddenimports += _pynput_hidden   # pynput submodules from collect_all
+# DIAGNOSTIC: dropped torch/torchaudio/pyannote/soundfile hidden imports.
+# hiddenimports += _torch_hidden
+# hiddenimports += _taudio_hidden
+# hiddenimports += _pyanno_hidden
+# hiddenimports += _sf_hidden
+hiddenimports += _ytdl_hidden     # yt_dlp submodules
+hiddenimports += _ioff_hidden     # imageio_ffmpeg submodules
+
+# pywebview's edgechromium backend pulls .NET (pythonnet/clr_loader)
+hiddenimports += collect_submodules('webview')
+hiddenimports += collect_submodules('clr_loader')
+_webview_datas, _webview_bins, _webview_hidden = collect_all('webview')
+datas += _webview_datas
+binaries += _webview_bins
+hiddenimports += _webview_hidden
+_clr_datas, _clr_bins, _clr_hidden = collect_all('clr_loader')
+datas += _clr_datas
+binaries += _clr_bins
+hiddenimports += _clr_hidden
+
+# NOTE: tried adding `collect_all('pythonnet')` here but it caused a native
+# heap corruption at runtime (STATUS_STACK_BUFFER_OVERRUN 0xc0000409 at
+# fault offset 0x1c325 in the PyInstaller bootloader). Reverting. pythonnet
+# is still bundled transitively via pywebview's edgechromium backend.
 
 # ── Excludes (heavy packages NOT used by this app) ────────────────────────────
 
@@ -197,13 +373,39 @@ excludes = [
     # NOTE: huggingface_hub and fsspec must NOT be excluded —
     # faster_whisper/utils.py imports huggingface_hub at module level,
     # even though we bundle the models and never download them at runtime.
-    'unittest',
-    'test',
-    'tkinter.test',
-    'xmlrpc',
-    'email.mime',
-    'http.server',
-    'urllib.robotparser',
+    # KEEP unittest available — scipy.signal.resample lazily imports it for
+    # input validation, and excluding it makes the audio resampler fail with
+    # "No module named 'unittest'" on every audio chunk, eventually crashing
+    # the audio callback thread with ACCESS_VIOLATION 0xc0000005.
+    # 'unittest',     # DO NOT EXCLUDE
+    # 'test',         # DO NOT EXCLUDE — used by stdlib test helpers some libs hit
+    # 'tkinter.test', # DO NOT EXCLUDE
+    'sklearn.datasets.tests',
+    'sklearn.tests',
+    # DIAGNOSTIC FORCE-EXCLUDE: torch + pyannote + torchaudio + soundfile.
+    # PyInstaller was still pulling these in transitively despite my drops
+    # earlier in this spec, producing the 0xc0000409 heap corruption crash.
+    # Force them out completely. Shift+F9 transcribe-with-diarization falls
+    # back gracefully (try/except in transcribe/engine.py:578).
+    'torch',
+    'torchaudio',
+    'pyannote',
+    'pyannote.audio',
+    'pyannote.core',
+    'pyannote.database',
+    'pyannote.metrics',
+    'pyannote.pipeline',
+    'soundfile',
+    'lightning',
+    'pytorch_lightning',
+    'tensorboard',
+    # KEEP stdlib modules — they're lazy-imported by libraries at runtime.
+    # http.server: wsgiref.simple_server (used by pywebview's bottle web
+    #              server) imports it. Excluding crashes whiteboard.
+    # 'xmlrpc',
+    # 'email.mime',
+    # 'http.server',
+    # 'urllib.robotparser',
 ]
 
 # ── Analysis ──────────────────────────────────────────────────────────────────
@@ -242,7 +444,10 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    # No .ico file present — icon drawn at runtime via PIL
+    # Brand .ico embedded as the exe's native icon resource. Windows uses
+    # this for the taskbar, Alt+Tab, jump list, file properties, shortcut
+    # creation — every default-icon fallback path in the shell.
+    icon=str(_BRAND_ICO_FOR_EXE),
 )
 
 coll = COLLECT(

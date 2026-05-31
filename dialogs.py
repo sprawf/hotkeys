@@ -1,5 +1,5 @@
 """
-Themed dialogs — replaces tkinter.messagebox throughout the app.
+Themed dialogs, replaces tkinter.messagebox throughout the app.
 
 Usage:
     from dialogs import alert, confirm
@@ -26,8 +26,8 @@ class ThemedDialog(ctk.CTkToplevel):
     """
     Minimal dark-themed dialog.
 
-    mode='alert'   — single OK button; result is always False
-    mode='confirm' — Cancel + coloured action button; result True on confirm
+    mode='alert'  , single OK button; result is always False
+    mode='confirm', Cancel + coloured action button; result True on confirm
     """
 
     def __init__(self, parent, title: str, message: str,
@@ -36,7 +36,7 @@ class ThemedDialog(ctk.CTkToplevel):
                  action_color: str = ACCENT,
                  action_hover: str = ACCENTL) -> None:
         super().__init__(parent)
-        self.withdraw()          # hide until positioned — avoids top-left flash
+        self.withdraw()          # hide until positioned, avoids top-left flash
         self.title(title)
         self.configure(fg_color=BG)
         self.resizable(False, False)
@@ -173,6 +173,61 @@ def confirm(parent, title: str, message: str,
     return dlg.result
 
 
+def confirm3(parent, title: str, message: str,
+             primary_label: str, alt_label: str,
+             primary_color: str = ACCENT,
+             primary_hover: str = ACCENTL) -> str:
+    """Three-button themed dialog used when the user needs to make a
+    choice between two real actions plus Cancel.
+
+    Returns one of:
+        'primary'  if they clicked primary_label
+        'alt'      if they clicked alt_label
+        'cancel'   if they cancelled (Esc or Cancel button)
+    """
+    dlg = ctk.CTkToplevel(parent)
+    dlg.withdraw()
+    dlg.title(title)
+    dlg.configure(fg_color=BG)
+    dlg.resizable(False, False)
+    choice = {'val': 'cancel'}
+
+    hdr = ctk.CTkFrame(dlg, fg_color=SURFACE, corner_radius=0)
+    hdr.pack(fill='x')
+    ctk.CTkLabel(hdr, text=title, font=(FONT_FAMILY, 14, 'bold'),
+                 text_color=TEXT_P).pack(anchor='w', padx=PAD, pady=PAD_SM)
+
+    ctk.CTkLabel(dlg, text=message, font=(FONT_FAMILY, 13), text_color=TEXT_S,
+                 wraplength=380, justify='left').pack(padx=PAD, pady=PAD)
+
+    foot = ctk.CTkFrame(dlg, fg_color=SURFACE, corner_radius=0)
+    foot.pack(fill='x')
+
+    def _mk(text, cmd, fg, hover, width=170):
+        return ctk.CTkButton(foot, text=text, command=cmd, width=width,
+                             fg_color=fg, hover_color=hover, text_color=TEXT_P,
+                             corner_radius=RADIUS_SM, font=(FONT_FAMILY, 13))
+
+    def _pick(v):
+        choice['val'] = v
+        dlg.destroy()
+
+    _mk(primary_label, lambda: _pick('primary'), primary_color, primary_hover,
+        width=200).pack(side='right', padx=PAD, pady=PAD_SM)
+    _mk(alt_label, lambda: _pick('alt'), SURF2, SURF3, width=180
+        ).pack(side='right', pady=PAD_SM)
+    _mk('Cancel', lambda: _pick('cancel'), SURF2, SURF3, width=80
+        ).pack(side='right', padx=(0, PAD_SM), pady=PAD_SM)
+
+    dlg.bind('<Escape>', lambda e: _pick('cancel'))
+    dlg.bind('<Return>', lambda e: _pick('primary'))
+
+    dlg.after(50, lambda: (center_over_parent(dlg, parent),
+                           dlg.deiconify(), dlg.grab_set()))
+    parent.wait_window(dlg)
+    return choice['val']
+
+
 # ── PopupMenu ────────────────────────────────────────────────────────────────
 
 class PopupMenu:
@@ -198,7 +253,7 @@ class PopupMenu:
     _DIM_D      = '#484848'
     _SEP_D      = '#2a2a2a'
 
-    _HOVER_BG = ACCENT   # purple — same in both themes
+    _HOVER_BG = ACCENT   # purple, same in both themes
     _HOVER_FG = '#ffffff'
     _FONT     = (FONT_FAMILY, 11)
     _PAD_X    = 14

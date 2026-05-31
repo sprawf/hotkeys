@@ -1,13 +1,13 @@
 """
-screen_recorder.py — Screen + audio recording engine for the Hotkeys app.
+screen_recorder.py, Screen + audio recording engine for the Hotkeys app.
 
 Public surface
 --------------
-ScreenCapture   — Win32 BitBlt capture context
-Recorder        — threaded encoder (H.264 + AAC → MP4 via PyAV)
-list_windows()  — enumerate capturable desktop windows
-RecorderSetupDialog  — pre-recording options dialog (tkinter)
-show_save_dialog()   — post-recording save-as dialog (tkinter)
+ScreenCapture  , Win32 BitBlt capture context
+Recorder       , threaded encoder (H.264 + AAC → MP4 via PyAV)
+list_windows() , enumerate capturable desktop windows
+RecorderSetupDialog , pre-recording options dialog (tkinter)
+show_save_dialog()  , post-recording save-as dialog (tkinter)
 
 No global state lives here; all orchestration is in main.py / library.py.
 """
@@ -307,7 +307,7 @@ class Recorder:
                     callback=self._audio_cb,
                 )
             except Exception as exc:
-                # Store as a warning — mic failed but video recording can still proceed
+                # Store as a warning, mic failed but video recording can still proceed
                 self.mic_warning = f'Mic unavailable: {exc}'
                 self._mic = False
                 # Release any partial WASAPI handle before continuing
@@ -363,12 +363,12 @@ class Recorder:
             vstream.pix_fmt = 'yuv420p'
             vstream.options = {'preset': 'ultrafast', 'tune': 'zerolatency', 'crf': '23'}
 
-            # Audio stream — mic failures are non-fatal: fall back to video-only
+            # Audio stream, mic failures are non-fatal: fall back to video-only
             apts_samples = 0
             if self._mic and self._sd_stream is not None:
                 try:
                     astream = container.add_stream('aac', rate=AUDIO_RATE)
-                    # Use layout only — avoids the deprecated .channels setter
+                    # Use layout only, avoids the deprecated .channels setter
                     # which raises AttributeError in PyAV ≥ 12.
                     astream.layout = 'stereo'
                     self._sd_stream.start()
@@ -408,7 +408,7 @@ class Recorder:
                         except queue.Empty:
                             break
                         # chunk: float32 (frames, channels) from sounddevice.
-                        # fltp (float planar) expects (channels, frames) float32 —
+                        # fltp (float planar) expects (channels, frames) float32,
                         # matches chunk.T exactly and is the AAC encoder's native fmt.
                         af = av.AudioFrame.from_ndarray(
                             chunk.T.copy(), format='fltp', layout='stereo')
@@ -444,7 +444,7 @@ class Recorder:
                     self._sd_stream.close()
             except Exception:
                 pass
-            # Flush encoder queues — errors here are non-fatal (partial flush)
+            # Flush encoder queues, errors here are non-fatal (partial flush)
             if vstream is not None:
                 try:
                     for pkt in vstream.encode():
@@ -467,7 +467,7 @@ class Recorder:
                     if not self.error:
                         self.error = f'Failed to finalise recording: {_close_exc}'
             elif self.output_path and os.path.exists(self.output_path):
-                # container was never opened (ScreenCapture or av.open failed) —
+                # container was never opened (ScreenCapture or av.open failed),
                 # remove the empty temp file so caller sees no file rather than a 0-byte stub.
                 try:
                     os.unlink(self.output_path)
@@ -480,7 +480,7 @@ class Recorder:
 # ── Region selector overlay ───────────────────────────────────────────────────
 
 _REG_BORDER  = '#ff0000'   # OBS-style red border
-_REG_FILL    = '#ff000022' # very faint red tint inside region (approx — canvas has no alpha)
+_REG_FILL    = '#ff000022' # very faint red tint inside region (approx, canvas has no alpha)
 _REG_DIM     = 0.45        # outside-region brightness factor
 _REG_HANDLE  = 6           # handle square half-size px
 _REG_DASH    = (6, 3)
@@ -492,7 +492,7 @@ class RegionSelectorOverlay:
     Result is stored in self.region as (left, top, width, height) in screen
     coordinates, or None if the user cancelled.
 
-    Usage (blocking — run on the main thread with its own mainloop):
+    Usage (blocking, run on the main thread with its own mainloop):
         ov = RegionSelectorOverlay(root)
         root.wait_window(ov._win)
         region = ov.region   # (l, t, w, h) or None
@@ -555,7 +555,7 @@ class RegionSelectorOverlay:
 
         # Instruction label
         self._instr = canvas.create_text(
-            vw // 2, 28, text='Drag to select recording region  —  Enter to confirm  —  Esc to cancel',
+            vw // 2, 28, text='Drag to select recording region  ·  Enter to confirm  ·  Esc to cancel',
             fill='#ffffff', font=(FONT_FAMILY, 12), tags=('instr',))
 
         canvas.bind('<ButtonPress-1>',   self._on_down)
@@ -689,7 +689,7 @@ class RegionSelectorOverlay:
                 self._res_sy     = event.y
                 self._res_orig   = (self._sx, self._sy, self._cx, self._cy)
                 return
-            # Click inside existing selection — move it
+            # Click inside existing selection, move it
             if s[0] <= event.x <= s[2] and s[1] <= event.y <= s[3]:
                 self._resizing   = True
                 self._res_handle = 'move'
@@ -778,7 +778,7 @@ class RecorderSetupDialog:
         self.win.title('Start Recording')
         self.win.resizable(False, False)
         self.win.configure(bg=BG)
-        # Only set transient when the parent is actually mapped — on Windows,
+        # Only set transient when the parent is actually mapped, on Windows,
         # a transient child of a withdrawn/hidden parent is itself hidden,
         # making the dialog invisible and preventing the user from closing it.
         if parent.winfo_ismapped():
@@ -881,7 +881,7 @@ class RecorderSetupDialog:
             command=self._on_mic_toggle,
         ).pack(side='left')
 
-        # Device picker — visible only when checkbox is ticked
+        # Device picker, visible only when checkbox is ticked
         dev_labels = [lbl for _, lbl in self._mic_devices]
         self._mic_dev_var   = tk.StringVar(value=dev_labels[0] if dev_labels else '')
         self._mic_dev_combo = ttk.Combobox(
@@ -1038,7 +1038,7 @@ class RecorderSetupDialog:
             x = parent.winfo_rootx() + (pw - w) // 2
             y = parent.winfo_rooty() + (ph - h) // 2
         else:
-            # Parent is withdrawn/hidden — centre on screen instead
+            # Parent is withdrawn/hidden, centre on screen instead
             x = (sw - w) // 2
             y = (sh - h) // 2
         x = max(0, min(x, sw - w))

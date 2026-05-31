@@ -2,7 +2,7 @@
 Macro Recorder & Replayer
 Records mouse + keyboard events with precise timestamps, replays them exactly.
 
-Completely standalone — no dependency on main app.
+Completely standalone, no dependency on main app.
 """
 
 import json
@@ -19,12 +19,49 @@ from pynput.keyboard import Key
 # Minimum mouse movement delta to record (filters micro-jitter)
 _MIN_MOUSE_DELTA = 5
 
-# Keys that are NEVER recorded — they are reserved for stopping
+# Keys that are NEVER recorded, they are reserved for stopping
 _STOP_KEYS = {Key.esc, Key.delete}
 
-# Hard cap on events per recording — prevents runaway macros from filling RAM/disk.
+# Hard cap on events per recording, prevents runaway macros from filling RAM/disk.
 # 5,000 events ≈ 3-10 minutes of active use depending on mouse activity.
 _MAX_EVENTS = 5_000
+
+# ── Capture suspension (module-level, refcounted) ─────────────────────────────
+# When the app injects keystrokes on the user's behalf (paste-from-clipboard
+# during Refine / dictation / chain output), those events would otherwise be
+# captured by an active macro recording and replayed as garbage. Wrap any
+# such injection in `with suspend_capture():` to make every live MacroRecorder
+# ignore events until the block exits. Refcounted so nested wraps work.
+_SUSPEND_COUNT = 0
+_SUSPEND_LOCK  = threading.Lock()
+
+
+class _CaptureSuspender:
+    def __enter__(self):
+        global _SUSPEND_COUNT
+        with _SUSPEND_LOCK:
+            _SUSPEND_COUNT += 1
+        return self
+    def __exit__(self, *exc):
+        global _SUSPEND_COUNT
+        with _SUSPEND_LOCK:
+            _SUSPEND_COUNT = max(0, _SUSPEND_COUNT - 1)
+        return False
+
+
+def suspend_capture() -> _CaptureSuspender:
+    """Context manager: while inside, all MacroRecorder listeners ignore events.
+
+    Use this around any code that injects keystrokes on the user's behalf,
+    paste_from_clipboard(), copy_selection(), undo_last(), so the injection
+    doesn't get baked into a concurrent macro recording.
+    """
+    return _CaptureSuspender()
+
+
+def is_capture_suspended() -> bool:
+    return _SUSPEND_COUNT > 0
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -51,7 +88,7 @@ def _str_to_key(s: str):
 
 
 def _release_all(kc, mc) -> None:
-    """Release every modifier key and mouse button — called on stop/done."""
+    """Release every modifier key and mouse button, called on stop/done."""
     for key in (
         Key.ctrl, Key.ctrl_l, Key.ctrl_r,
         Key.alt,  Key.alt_l,  Key.alt_r,
@@ -126,7 +163,7 @@ class MacroRecorder:
     def start_recording(self, on_cap_reached=None) -> None:
         """Begin capturing mouse + keyboard events.
 
-        on_cap_reached — optional callable fired once on the listener thread
+        on_cap_reached, optional callable fired once on the listener thread
                          when the _MAX_EVENTS limit is hit.  Use to auto-stop.
         """
         if self._recording or self._playing:
@@ -165,7 +202,7 @@ class MacroRecorder:
             self._keyboard_listener = None
         self._trim_stop_hotkey()
 
-    # F1 is the macro record/play hotkey key — never record it so replaying
+    # F1 is the macro record/play hotkey key, never record it so replaying
     # the macro never re-triggers the macro control hotkey.
     # Shift keys are stripped only from the trailing window (the stop-press).
     _F1_KEY       = 'Key.f1'
@@ -174,9 +211,9 @@ class MacroRecorder:
     def _trim_stop_hotkey(self, window_s: float = 0.4) -> None:
         """Strip macro-control key events so replay never re-triggers the hotkey.
 
-        * Key.f1  — removed from the ENTIRE recording (Shift+F1 is the macro
+        * Key.f1 , removed from the ENTIRE recording (Shift+F1 is the macro
           hotkey; replaying it mid-macro would cause chaos).
-        * Shift keys — removed only from the trailing ``window_s`` seconds
+        * Shift keys, removed only from the trailing ``window_s`` seconds
           (the actual stop-press), so Shift held during normal typing is kept.
         """
         if not self._events:
@@ -210,7 +247,7 @@ class MacroRecorder:
         return False
 
     def _on_move(self, x: int, y: int) -> None:
-        if not self._recording:
+        if not self._recording or is_capture_suspended():
             return
         with self._lock:
             if self._check_cap():
@@ -224,7 +261,7 @@ class MacroRecorder:
             self._events.append({'type': 'mouse_move', 'x': x, 'y': y, 't': self._ts()})
 
     def _on_click(self, x: int, y: int, button: Button, pressed: bool) -> None:
-        if not self._recording:
+        if not self._recording or is_capture_suspended():
             return
         with self._lock:
             if self._check_cap():
@@ -239,7 +276,7 @@ class MacroRecorder:
             })
 
     def _on_scroll(self, x: int, y: int, dx: int, dy: int) -> None:
-        if not self._recording:
+        if not self._recording or is_capture_suspended():
             return
         with self._lock:
             if self._check_cap():
@@ -252,7 +289,7 @@ class MacroRecorder:
             })
 
     def _on_key_press(self, key) -> None:
-        if not self._recording:
+        if not self._recording or is_capture_suspended():
             return
         if key in _STOP_KEYS:
             return           # never record stop keys
@@ -262,7 +299,7 @@ class MacroRecorder:
             self._events.append({'type': 'key_press', 'key': _key_to_str(key), 't': self._ts()})
 
     def _on_key_release(self, key) -> None:
-        if not self._recording:
+        if not self._recording or is_capture_suspended():
             return
         if key in _STOP_KEYS:
             return
@@ -277,8 +314,8 @@ class MacroRecorder:
         """
         Replay the recording in a background thread.
 
-        on_done  — called when playback completes naturally.
-        on_stop  — called if playback was force-stopped before completion.
+        on_done , called when playback completes naturally.
+        on_stop , called if playback was force-stopped before completion.
         Both callbacks are optional and called from the playback thread.
         """
         if self._playing or self._recording:
@@ -307,7 +344,7 @@ class MacroRecorder:
                     stopped_early = True
                     break
 
-                # Absolute-timestamp wait — self-correcting, no drift
+                # Absolute-timestamp wait, self-correcting, no drift
                 wait = (start + event['t']) - time.perf_counter()
                 if wait > 0:
                     if self._stop_event.wait(timeout=wait):

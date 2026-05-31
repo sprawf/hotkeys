@@ -1,8 +1,8 @@
 """
-Quick Notes — Shift+F7
+Quick Notes, Shift+F7
 Simplenote-inspired: two-column, flat, minimal.
-Left  — searchable list of saved notes
-Right — editor (text / checklist / voice)
+Left , searchable list of saved notes
+Right, editor (text / checklist / voice)
 """
 import logging
 import sys
@@ -29,10 +29,10 @@ SAMPLE_RATE = 16_000
 _MAX_REC_S  = 180          # 3-min hard cap on voice recording
 _MAX_RENDERED = 250        # max note rows rendered in list (virtual perf cap)
 
-_W, _H  = 1216, 796        # window size — matches Claude desktop app
+_W, _H  = 1216, 796        # window size, matches Claude desktop app
 _LIST_W = 300              # left panel fixed width
 
-# ── Palette — left panel follows app theme; editor stays dark/neutral ─────────
+# ── Palette, left panel follows app theme; editor stays dark/neutral ─────────
 _WIN    = '#0e0e0e'        # outermost bg  (app BG)
 _LIST   = '#141414'        # left panel bg (app SURFACE)
 _EDIT   = '#1a1a1a'        # right editor bg
@@ -60,7 +60,7 @@ _OK_C   = '#22c55e'
 _WARN_C = '#f59e0b'
 _BLUE   = '#60a5fa'
 
-# Active font family — switched to monospace in light mode
+# Active font family, switched to monospace in light mode
 _ACTIVE_FF = FONT_FAMILY   # updated by _set_theme
 
 # ── Palette presets (for light/dark theme switching) ─────────────────────────
@@ -93,7 +93,7 @@ NOTE_COLORS = [
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _normalize_paste(text: str) -> str:
-    """Strip heavy formatting from pasted text — plain body text only.
+    """Strip heavy formatting from pasted text, plain body text only.
 
     Handles clipboard content from Word, Google Docs, web pages, etc.:
     • Normalise line endings  (\r\n / \r  → \n)
@@ -347,12 +347,14 @@ class QuickNotesWindow(ctk.CTkToplevel):
                  vision_extractor: Callable | None = None,
                  provider=None,
                  initial_geometry: str = '',
-                 on_geometry_change: Callable | None = None) -> None:
+                 on_geometry_change: Callable | None = None,
+                 initial_theme: str = 'light',
+                 on_theme_change: Callable | None = None) -> None:
         """
-        mic_busy_fn      — optional callable() -> bool; returns True when the main
+        mic_busy_fn     , optional callable() -> bool; returns True when the main
                            Whisper recorder is active. Quick Notes won't record while it's True.
-        vision_extractor — optional callable(img) -> str; Groq vision API extractor.
-        provider         — optional LLM provider with .refine(text, prompt) -> str.
+        vision_extractor, optional callable(img) -> str; Groq vision API extractor.
+        provider        , optional LLM provider with .refine(text, prompt) -> str.
         """
         super().__init__(root)
         self._transcribe_fn    = transcribe_fn
@@ -361,6 +363,7 @@ class QuickNotesWindow(ctk.CTkToplevel):
         self._mic_busy_fn         = mic_busy_fn
         self._vision_extractor    = vision_extractor
         self._on_geometry_change  = on_geometry_change
+        self._on_theme_change     = on_theme_change
         self._initial_geometry    = initial_geometry
 
         # Editor state
@@ -405,8 +408,6 @@ class QuickNotesWindow(ctk.CTkToplevel):
         # Drag
         self._drag_ox = self._drag_oy = 0
 
-        # Resize drag start state (7-tuple: start_x, start_y, orig_w, orig_h, orig_wx, orig_wy, edge)
-        self._rsz = (0, 0, 0, 0, 0, 0, 'se')
 
         # Search debounce
         self._search_job = None
@@ -415,10 +416,11 @@ class QuickNotesWindow(ctk.CTkToplevel):
         self._notes_cache: list = []
         self._notes_dirty = True
 
-        # Theme — apply light palette to module globals before _build()
-        self._theme = 'light'
+        # Theme, apply saved palette to module globals before _build()
+        self._theme = initial_theme if initial_theme in ('light', 'dark') else 'light'
+        _palette = _LIGHT_PALETTE if self._theme == 'light' else _DARK_PALETTE
         _mod = sys.modules[__name__]
-        for _k, _v in _LIGHT_PALETTE.items():
+        for _k, _v in _palette.items():
             setattr(_mod, _k, _v)
 
         # Voice decide bar (inline recording confirmation)
@@ -435,36 +437,84 @@ class QuickNotesWindow(ctk.CTkToplevel):
         self._trash_expanded = False
 
         # ── Window chrome ─────────────────────────────────────────────────────
+        # overrideredirect(True) gives us a borderless frame for the custom
+        # title bar, but on Windows it also hides the window from Alt+Tab
+        # and the taskbar by default, we restore both via WS_EX_APPWINDOW
+        # after the window is realised (see _enable_alt_tab below).
+        # We do NOT use -topmost: clicking another app must be able to put
+        # Notes in the background (Whiteboard behaves the same way).
         self.withdraw()
         self.overrideredirect(True)
-        self.attributes('-topmost', True)
+        self.title('Notes')   # taskbar hover-preview + Alt+Tab caption
         self.configure(fg_color=_WIN)
+        # Window icon + taskbar promotion handled in _enable_alt_tab()
+        # after deiconify(). Setting icon here (iconphoto/iconbitmap)
+        # silently no-ops on overrideredirect windows on Win32, and in
+        # one tried-and-failed iteration also interfered with the
+        # subsequent WS_EX_APPWINDOW transition.
 
         self._build()
         self._bind_keys()
 
+        # Centering and clamping use the Windows WORK AREA (screen minus
+        # taskbar), same helper the Whiteboard uses. The previous code
+        # used winfo_screenwidth/height which is the full monitor, so the
+        # bottom edge could end up behind the taskbar and the right edge
+        # could slide off-screen on multi-monitor setups.
+        from win_geometry import center_on_work_area, get_work_area
+        wa_x, wa_y, wa_w, wa_h = get_work_area()
+
         self.update_idletasks()
         if self._initial_geometry:
-            # Restore saved geometry, but clamp position to visible screen area
+            # Restore saved geometry, but clamp BOTH size and position to
+            # the WORK area. A saved width/height from an older version of
+            # this code (or a different monitor) could exceed the current
+            # work area; shrink it so the title bar and bottom edge always
+            # stay visible.
             try:
-                self.geometry(self._initial_geometry)
-                self.update_idletasks()
-                # Clamp so window stays on screen
-                sw = self.winfo_screenwidth()
-                sh = self.winfo_screenheight()
-                wx, wy = self.winfo_x(), self.winfo_y()
-                ww, wh = self.winfo_width(), self.winfo_height()
-                x = max(0, min(wx, sw - ww))
-                y = max(0, min(wy, sh - wh))
-                self.geometry(f'+{x}+{y}')
+                # Reject geometries that are SUSPICIOUSLY SMALL (e.g. the
+                # user accidentally dragged the corner down to the
+                # 600×400 minsize and the small size got persisted). We
+                # don't want to silently restore a useless tiny window on
+                # every reopen — fall back to the Whiteboard-matched
+                # default size instead. The user can still legitimately
+                # resize smaller; we just don't PERSIST resizes below
+                # this threshold (see _on_geometry_change save hook).
+                import re as _re
+                _m = _re.match(r'(\d+)x(\d+)', self._initial_geometry)
+                if _m:
+                    _sw, _sh = int(_m.group(1)), int(_m.group(2))
+                    # If saved size is < 80% of default, treat as garbage
+                    # and fall through to default centering.
+                    if _sw < int(_W * 0.8) or _sh < int(_H * 0.8):
+                        logger.info(
+                            f'Quick Notes: ignoring tiny saved geometry '
+                            f'({_sw}x{_sh}), falling back to default '
+                            f'({_W}x{_H}) — likely an accidental resize.'
+                        )
+                        self._initial_geometry = ''
+                if self._initial_geometry:
+                    self.geometry(self._initial_geometry)
+                    self.update_idletasks()
+                    wx, wy = self.winfo_x(), self.winfo_y()
+                    ww, wh = self.winfo_width(), self.winfo_height()
+                    # Shrink if too tall/wide for this monitor's work area.
+                    ww = min(ww, wa_w)
+                    wh = min(wh, wa_h)
+                    # Then reposition so the window fits inside the work area.
+                    x = max(wa_x, min(wx, wa_x + wa_w - ww))
+                    y = max(wa_y, min(wy, wa_y + wa_h - wh))
+                    self.geometry(f'{ww}x{wh}+{x}+{y}')
             except Exception:
                 self._initial_geometry = ''
         if not self._initial_geometry:
-            sw = self.winfo_screenwidth()
-            sh = self.winfo_screenheight()
-            x  = (sw - _W) // 2
-            y  = max(40, (sh - _H) // 2)
-            self.geometry(f'{_W}x{_H}+{x}+{y}')
+            # First-launch default: identical centering to the Whiteboard
+            # so users see the same layout for both Shift+F7 and Shift+F8.
+            # center_on_work_area shrinks the requested size if needed so
+            # the whole window always fits inside the work area, even on
+            # short monitors.
+            x, y, W, H = center_on_work_area(_W, _H)
+            self.geometry(f'{W}x{H}+{x}+{y}')
         self.minsize(600, 400)
 
         # Windows 11 rounded corners
@@ -479,18 +529,24 @@ class QuickNotesWindow(ctk.CTkToplevel):
         self.deiconify()
         self.lift()
         self._enable_native_resize()
+        # Promote the overrideredirect window into Alt+Tab + taskbar so
+        # the user can switch back after clicking another app. Has to
+        # happen after deiconify(), the HWND only exists once mapped.
+        self.after(60, self._enable_alt_tab)
         self.after(80, self._focus_content)
 
     # ── Build ─────────────────────────────────────────────────────────────────
 
     def _build(self) -> None:
-        # 1px accent border via highlightthickness — drawn synchronously with
-        # the frame itself, so it never distorts during live OS-native resize.
-        outer = tk.Frame(self, bg=_WIN,
-                         highlightthickness=1,
-                         highlightbackground=_ACCENT,
-                         highlightcolor=_ACCENT)
-        outer.pack(fill='both', expand=True)
+        # Purple accent border (matches Shift+F8 Whiteboard's frame).
+        # The window is borderless (overrideredirect=True), so the border is
+        # drawn by an outer tk.Frame whose background is the accent color
+        # and which pads its inner content by 3px on every edge.
+        border = tk.Frame(self, bg=_ACCENT, highlightthickness=0)
+        border.pack(fill='both', expand=True)
+        outer = tk.Frame(border, bg=_WIN, highlightthickness=0)
+        outer.pack(fill='both', expand=True, padx=3, pady=3)
+        self._outer = outer  # resize handles are placed inside this frame
 
         # Left panel (note list)
         left = tk.Frame(outer, bg=_LIST, width=_LIST_W)
@@ -517,12 +573,12 @@ class QuickNotesWindow(ctk.CTkToplevel):
         hdr.bind('<B1-Motion>',     self._drag_move)
         hdr.bind('<Double-Button-1>', lambda e: self._toggle_maximize())
 
-        # Header label — app-style bold section title
+        # Header label, app-style bold section title
         tk.Label(hdr, text='Notes', bg=_LIST, fg=_T1,
                  font=(FONT_FAMILY, 13, 'bold'),
                  ).pack(side='left', padx=(14, 0), pady=12)
 
-        # New-note button — large, accent-filled, impossible to miss
+        # New-note button, large, accent-filled, impossible to miss
         nb = ctk.CTkButton(
             hdr, text='+', width=32, height=32,
             fg_color=_ACCENT, hover_color='#6d28d9',
@@ -537,7 +593,7 @@ class QuickNotesWindow(ctk.CTkToplevel):
         # Separator
         tk.Frame(parent, bg=_DIV, height=1).pack(fill='x')
 
-        # Search bar — CTkEntry for rounded pill look
+        # Search bar, CTkEntry for rounded pill look
         sf = tk.Frame(parent, bg=_LIST, pady=8, padx=10)
         sf.pack(fill='x')
 
@@ -556,7 +612,7 @@ class QuickNotesWindow(ctk.CTkToplevel):
         # Separator
         tk.Frame(parent, bg=_DIV, height=1).pack(fill='x')
 
-        # ── Small paste zone — just below search bar ────────────────────────
+        # ── Small paste zone, just below search bar ────────────────────────
         pz = tk.Frame(parent, bg=_LIST, height=26)
         pz.pack(fill='x')
         pz.pack_propagate(False)
@@ -566,19 +622,19 @@ class QuickNotesWindow(ctk.CTkToplevel):
         pz_lbl.pack(fill='both', expand=True)
         # Click on the label directly pastes; hover gives feedback
         pz_lbl.bind('<Button-1>',  self._paste_to_list)
-        pz_lbl.bind('<Enter>',     lambda e: pz_lbl.configure(fg=_T2))
-        pz_lbl.bind('<Leave>',     lambda e: pz_lbl.configure(fg=_T3))
+        pz_lbl.bind('<Enter>',     lambda e: (pz_lbl.configure(fg=_T1), pz.configure(bg=_SURF3), pz_lbl.configure(bg=_SURF3)))
+        pz_lbl.bind('<Leave>',     lambda e: (pz_lbl.configure(fg=_T3), pz.configure(bg=_LIST), pz_lbl.configure(bg=_LIST)))
         for w in (pz, pz_lbl):
             w.bind('<Button-3>',  self._on_list_bg_rclick)
             w.bind('<Control-v>', self._paste_to_list)
             w.bind('<Control-V>', self._paste_to_list)
         tk.Frame(parent, bg=_DIV, height=1).pack(fill='x')
 
-        # ── Trash toggle — bottom-pinned (36px, matches right-panel bottom bar) ─
+        # ── Trash toggle, bottom-pinned (36px, matches right-panel bottom bar) ─
         self._trash_section = tk.Frame(parent, bg=_LIST, height=36)
         self._trash_section.pack(side='bottom', fill='x')
         self._trash_section.pack_propagate(False)
-        # Separator sits above the trash section — packed side='bottom' after the
+        # Separator sits above the trash section, packed side='bottom' after the
         # section so it appears just above it (same level as right-panel separator)
         tk.Frame(parent, bg=_DIV, height=1).pack(side='bottom', fill='x')
         self._trash_btn: tk.Label | None = None
@@ -627,7 +683,7 @@ class QuickNotesWindow(ctk.CTkToplevel):
             except Exception:
                 pass
 
-        # Bind at the toplevel — fires for every scroll anywhere in the window
+        # Bind at the toplevel, fires for every scroll anywhere in the window
         self.bind('<MouseWheel>', _on_window_scroll, add='+')
 
         # Dummy enter/leave stores (no-ops now, kept so _make_note_row doesn't break)
@@ -637,7 +693,7 @@ class QuickNotesWindow(ctk.CTkToplevel):
         self._refresh_list()
 
     def _srch_in(self, _=None) -> None:
-        # CTkEntry handles its own placeholder — just update text color on focus
+        # CTkEntry handles its own placeholder, just update text color on focus
         try: self._srch_entry.configure(text_color=_T1)
         except Exception: pass
 
@@ -740,7 +796,55 @@ class QuickNotesWindow(ctk.CTkToplevel):
             pass
 
     def _paste_to_list(self, event=None) -> str:
-        """Ctrl+V on the list panel — create a new note from clipboard text."""
+        """Ctrl+V on the list panel.
+
+        Two modes:
+          1. Clipboard has IMAGE → create empty note, open it, stage image
+             for OCR in the editor. The same _ocr_stage flow the editor's
+             own Ctrl+V uses, so user sees the image preview + Enter prompt.
+          2. Clipboard has TEXT → create note with that text (legacy behaviour).
+        Returns 'break' so the event doesn't propagate.
+        """
+        # ── Mode 1: clipboard image → new note + OCR staging ─────────────────
+        try:
+            from vision import get_clipboard_image
+            img, err = get_clipboard_image()
+            if err:
+                logger.warning(f'Quick Notes: clipboard image read error: {err}')
+            elif img is not None:
+                # Create a fresh empty note and open it, then stage the image.
+                note = {
+                    'id':         str(uuid.uuid4()),
+                    'text':       '',
+                    'items':      [{'text': '', 'checked': False}],
+                    'voice':      '',
+                    'color':      None,
+                    'pinned':     False,
+                    'created_at': datetime.now().isoformat(timespec='seconds'),
+                }
+                notes = load_notes()
+                notes.append(note)
+                save_notes(notes)
+                self._invalidate_notes_cache()
+                self._refresh_list()
+                # Open the new note for editing so _ocr_stage's preview/status
+                # lands in a visible context.
+                try:
+                    self._open_note(note['id'])
+                except Exception as exc:
+                    logger.warning(f'Quick Notes: open new note for OCR failed: {exc}')
+                # Stage the image for OCR on the next idle tick — the editor's
+                # widgets need to be mapped first.
+                try:
+                    self.after_idle(lambda: self._ocr_stage(img))
+                except Exception as exc:
+                    logger.warning(f'Quick Notes: schedule OCR stage failed: {exc}')
+                logger.info('Quick note created from clipboard image (OCR staged)')
+                return 'break'
+        except Exception as exc:
+            logger.warning(f'Quick Notes: clipboard image check failed: {exc}')
+
+        # ── Mode 2: clipboard text → new note ───────────────────────────────
         try:
             raw = self.clipboard_get()
         except tk.TclError:
@@ -823,7 +927,7 @@ class QuickNotesWindow(ctk.CTkToplevel):
                              bg=_LIST, fg=_T3, font=(FONT_FAMILY, 11),
                              ).pack(padx=14, pady=20, anchor='w')
                 else:
-                    # Empty state — show brief usage hints
+                    # Empty state, show brief usage hints
                     hint_frame = tk.Frame(self._list_inner, bg=_LIST)
                     hint_frame.pack(fill='x', padx=14, pady=(20, 4))
                     tk.Label(hint_frame, text='No notes yet',
@@ -849,7 +953,7 @@ class QuickNotesWindow(ctk.CTkToplevel):
                         bg=_LIST, fg=_T3, font=(FONT_FAMILY, 9),
                     ).pack(padx=14, pady=(4, 0), anchor='w')
 
-        # Spacer — always fills remaining height so right-click / Ctrl+V
+        # Spacer, always fills remaining height so right-click / Ctrl+V
         # has a generous target area even when the note list is short.
         # Small spacer so the last note isn't flush with the paste zone
         spacer = tk.Frame(self._list_inner, bg=_LIST, height=8)
@@ -873,12 +977,12 @@ class QuickNotesWindow(ctk.CTkToplevel):
         is_selected = (nid == self._editing_nid)
         base_bg  = _SEL_BG if is_selected else _LIST
 
-        # ── Outer row — fixed height so next row snaps to the same Y position ──
-        row = tk.Frame(self._list_inner, bg=base_bg, cursor='hand2', height=58)
+        # ── Outer row, fixed height so next row snaps to the same Y position ──
+        row = tk.Frame(self._list_inner, bg=base_bg, cursor='hand2', height=62)
         row.pack(fill='x')
         row.pack_propagate(False)  # lock height regardless of content
 
-        # ── Left accent bar — always purple; custom color overrides ──────────
+        # ── Left accent bar, always purple; custom color overrides ──────────
         bar_color = color if color else _ACCENT
         tk.Frame(row, bg=bar_color, width=3).pack(side='left', fill='y')
 
@@ -900,7 +1004,7 @@ class QuickNotesWindow(ctk.CTkToplevel):
         is_untitled = (title == '(new note)')
         title_fg = _T3 if (is_trashed or is_untitled) else _T1
 
-        # Action button — pack side='right' BEFORE the expanding title label
+        # Action button, pack side='right' BEFORE the expanding title label
         # so Tkinter reserves its space first and it's never crowded out.
         action_fn = (
             (lambda i=nid: self._del_note_permanent(i)) if is_trashed
@@ -911,7 +1015,7 @@ class QuickNotesWindow(ctk.CTkToplevel):
         trash_cvs.pack(side='right', padx=(2, 1))
 
         title_lbl = tk.Label(top, text=title, bg=base_bg, fg=title_fg,
-                             font=(_ACTIVE_FF, 12), anchor='w')
+                             font=(_ACTIVE_FF, 13, 'bold'), anchor='w')
         title_lbl.pack(side='left', fill='x', expand=True, padx=(0, 6))
 
         _trash_fg = ['#3a3a3a']  # mutable cell so closures below can update it
@@ -943,7 +1047,7 @@ class QuickNotesWindow(ctk.CTkToplevel):
         prev_lbl = None
         if prev:
             prev_lbl = tk.Label(bot, text=prev, bg=base_bg, fg=_T2,
-                                font=(_ACTIVE_FF, 10), anchor='w')
+                                font=(_ACTIVE_FF, 11), anchor='w')
             prev_lbl.pack(side='left', fill='x', expand=True)
 
         # ── Hover / selection state ───────────────────────────────────────────
@@ -1072,7 +1176,7 @@ class QuickNotesWindow(ctk.CTkToplevel):
         # ── Unified load with backwards compat ───────────────────────────────
         ntype = note.get('type', 'text')   # legacy field
         if ntype == 'checklist':
-            # Old format: items in 'items', text is serialized — ignore serialized text
+            # Old format: items in 'items', text is serialized, ignore serialized text
             self._text_content = ''
             items = note.get('items')
             if items:
@@ -1193,7 +1297,7 @@ class QuickNotesWindow(ctk.CTkToplevel):
     # ── Right-click context menu (note rows) ──────────────────────────────────
 
     def _on_list_bg_rclick(self, event) -> None:
-        """Right-click on empty list background — quick actions."""
+        """Right-click on empty list background, quick actions."""
         try:
             has_clip = bool(self.clipboard_get().strip())
         except tk.TclError:
@@ -1313,7 +1417,7 @@ class QuickNotesWindow(ctk.CTkToplevel):
         if img is not None:
             self._ocr_stage(img)
             return 'break'
-        # No image — paste as normalized plain text
+        # No image, paste as normalized plain text
         try:
             raw = self.clipboard_get()
         except tk.TclError:
@@ -1357,7 +1461,7 @@ class QuickNotesWindow(ctk.CTkToplevel):
         if self._swipe_btn1_down or self._swipe_just_completed:
             self._swipe_just_completed = False
             return
-        import webbrowser, urllib.parse
+        import webbrowser, urllib.parse, spellcheck as _sc
         w = event.widget
         has_sel = bool(w.tag_ranges('sel'))
         has_text = bool(self._tb_text())
@@ -1394,14 +1498,28 @@ class QuickNotesWindow(ctk.CTkToplevel):
                 self._ocr_stage(img)
             else:
                 w.event_generate('<<Paste>>')
-        (self._popup()
-            .add('Cut',          lambda: w.event_generate('<<Cut>>'),   enabled=has_sel)
-            .add('Copy',         lambda: w.event_generate('<<Copy>>'),  enabled=has_sel)
-            .add('Paste',        lambda: w.event_generate('<<Paste>>'))
+
+        pm = self._popup()
+
+        # ── Spell suggestions (injected at top when cursor is on a misspelled word) ──
+        spell = _sc.get_info(w, event.x, event.y)
+        if spell:
+            word, ws, we, suggestions = spell
+            for s in suggestions:
+                pm.add(s, lambda r=s, a=ws, b=we: _sc.apply_suggestion(w, a, b, r))
+            pm.separator()
+            pm.add('Ignore all',        lambda wrd=word: _sc.ignore_word(w, wrd))
+            pm.add('Add to dictionary', lambda wrd=word: _sc.add_word(w, wrd))
+            pm.separator()
+
+        (pm
+            .add('Cut',               lambda: w.event_generate('<<Cut>>'),   enabled=has_sel)
+            .add('Copy',              lambda: w.event_generate('<<Copy>>'),  enabled=has_sel)
+            .add('Paste',             lambda: w.event_generate('<<Paste>>'))
             .separator()
-            .add(label,          _search_google,                         enabled=has_sel)
+            .add(label,               _search_google,                         enabled=has_sel)
             .separator()
-            .add(proofread_label, self._proofread,                        enabled=can_proofread)
+            .add(proofread_label,     self._proofread,                        enabled=can_proofread)
             .separator()
             .add('Paste & Extract Image', _smart_paste)
             .show(event.x_root, event.y_root))
@@ -1432,7 +1550,7 @@ class QuickNotesWindow(ctk.CTkToplevel):
                     'Proofread the following text. Fix spelling, grammar, and '
                     'punctuation errors. Preserve the original meaning, tone, '
                     'line breaks, and formatting. Return ONLY the corrected text '
-                    '— no explanations, no commentary.',
+                    ', no explanations, no commentary.',
                 )
             except Exception as exc:
                 self.after(0, lambda: self._set_status(f'⚠ Proofread failed: {exc}', _ERR))
@@ -1460,7 +1578,10 @@ class QuickNotesWindow(ctk.CTkToplevel):
         if self._ocr_pending:
             return
         if self._vision_extractor is None:
-            alert(self, 'OCR unavailable', 'No vision API key configured.')
+            alert(self, 'OCR needs a vision provider',
+                  'Reading text from images needs an AI provider that can '
+                  '"see". Open Settings → AI providers and add an OpenAI, '
+                  'Anthropic, Gemini, or Groq key.')
             return
         if img is None:
             from vision import get_clipboard_image
@@ -1483,7 +1604,16 @@ class QuickNotesWindow(ctk.CTkToplevel):
                 text = _extractor(img)
                 self.after(0, lambda: self._ocr_done(text))
             except Exception as exc:
-                self.after(0, lambda: self._ocr_error(str(exc)))
+                # Friendly message: offline → "OCR needs an internet
+                # connection"; rate-limited → "Daily limit reached";
+                # otherwise → original exception (short form). Avoids
+                # surfacing raw tracebacks like "ConnectError(...)".
+                try:
+                    from engine import friendly_error_message
+                    msg = friendly_error_message(exc, feature='OCR')
+                except Exception:
+                    msg = str(exc)
+                self.after(0, lambda m=msg: self._ocr_error(m))
         threading.Thread(target=_worker, daemon=True).start()
 
     _OCR_REFUSAL_PATTERNS = (
@@ -1561,7 +1691,7 @@ class QuickNotesWindow(ctk.CTkToplevel):
         if 'api key' in m or ('invalid' in m and 'key' in m):
             friendly = 'No API key configured'
         elif 'connect' in m or 'network' in m or 'timeout' in m:
-            friendly = 'Network error — check connection'
+            friendly = 'Network error, check connection'
         else:
             friendly = f'Error: {message[:80]}'
         self._ocr_show_status(f'⚠ {friendly}', _ERR, dismissable=True)
@@ -1572,7 +1702,7 @@ class QuickNotesWindow(ctk.CTkToplevel):
     _SWIPE_MAX_Y = 45    # maximum vertical pixels (keeps it horizontal)
 
     def _swipe_press(self, event) -> None:
-        # Track button state ourselves — Tkinter's event.state bitmask is
+        # Track button state ourselves, Tkinter's event.state bitmask is
         # populated inconsistently on Windows for the *second* button press.
         if event.num == 1:
             self._swipe_btn1_down = True
@@ -1642,7 +1772,7 @@ class QuickNotesWindow(ctk.CTkToplevel):
             callback()
             return
 
-        overlay = tk.Frame(self._content_host, bg='#0e0e0e')
+        overlay = tk.Frame(self._content_host, bg=_WIN)
         overlay.place(x=0, y=0, width=w, height=h)
         overlay.lift()
 
@@ -1684,7 +1814,7 @@ class QuickNotesWindow(ctk.CTkToplevel):
         ctrl = tk.Frame(tb, bg=_EDIT)
         ctrl.pack(side='right', padx=(0, 12), pady=8)
 
-        # Pin / star — gold when pinned, dim when not
+        # Pin / star, gold when pinned, dim when not
         self._pin_btn = tk.Label(ctrl, text='★', bg=_EDIT, fg=_T3,
                                   font=(FONT_FAMILY, 14), cursor='hand2')
         self._pin_btn.pack(side='left', padx=(0, 10))
@@ -1694,7 +1824,7 @@ class QuickNotesWindow(ctk.CTkToplevel):
             fg='#d4aa00' if self._pinned else _T3))
         _attach_tooltip(self._pin_btn, 'Pin to top of list')
 
-        # Minimize — hide without saving
+        # Minimize, hide without saving
         mn = tk.Label(ctrl, text='–', bg=_EDIT, fg=_T3,
                        font=(FONT_FAMILY, 16), cursor='hand2')
         mn.pack(side='left', padx=(0, 10))
@@ -1712,7 +1842,7 @@ class QuickNotesWindow(ctk.CTkToplevel):
         self._max_btn.bind('<Leave>', lambda e: self._max_btn.configure(fg=_T3))
         _attach_tooltip(self._max_btn, 'Maximize / restore window')
 
-        # Close — save and close
+        # Close, save and close
         cl = tk.Label(ctrl, text='×', bg=_EDIT, fg=_T3,
                        font=(FONT_FAMILY, 20), cursor='hand2')
         cl.pack(side='left')
@@ -1721,7 +1851,7 @@ class QuickNotesWindow(ctk.CTkToplevel):
         cl.bind('<Leave>', lambda e: cl.configure(fg=_T3))
         _attach_tooltip(cl, 'Save & close  (Esc)')
 
-        # Theme toggle — ☀ light / 🌙 dark
+        # Theme toggle, ☀ light / 🌙 dark
         _theme_icon = '☀' if self._theme == 'light' else '🌙'
         self._theme_btn = tk.Label(ctrl, text=_theme_icon, bg=_EDIT, fg=_T3,
                                     font=(FONT_FAMILY, 13), cursor='hand2')
@@ -1734,13 +1864,13 @@ class QuickNotesWindow(ctk.CTkToplevel):
         # Separator
         tk.Frame(parent, bg=_DIV, height=1).pack(fill='x')
 
-        # Gesture hint — persistent dim hint bar (survives panel rebuilds)
+        # Gesture hint, persistent dim hint bar (survives panel rebuilds)
         _hint = tk.Frame(parent, bg=_EDIT, height=18)
         _hint.pack(fill='x')
         _hint.pack_propagate(False)
         tk.Label(_hint,
                  text='Hold L+R mouse buttons and swipe left to save',
-                 bg=_EDIT, fg='#585858',
+                 bg=_EDIT, fg='#808080',
                  font=(FONT_FAMILY, 9),
                  ).pack(side='right', padx=(0, 18))
 
@@ -1750,7 +1880,7 @@ class QuickNotesWindow(ctk.CTkToplevel):
 
         self._show_panel()
 
-        # ── OCR overlays — placed on _content_host so they float above the editor ──
+        # ── OCR overlays, placed on _content_host so they float above the editor ──
         # Status strip (pinned to bottom of content host)
         self._ocr_status_frame = tk.Frame(self._content_host, bg='#1a1a1a')
         self._ocr_status_lbl = tk.Label(
@@ -1784,7 +1914,7 @@ class QuickNotesWindow(ctk.CTkToplevel):
         lf = tk.Frame(bar, bg=_EDIT)
         lf.pack(side='left', padx=(10, 0), pady=6)
 
-        # ☑ Task — insert checkbox line at cursor
+        # ☑ Task, insert checkbox line at cursor
         task_btn = ctk.CTkButton(
             lf, text='☑  Task', width=64, height=24,
             fg_color='transparent', hover_color=_SURF3,
@@ -1794,7 +1924,7 @@ class QuickNotesWindow(ctk.CTkToplevel):
         task_btn.pack(side='left', padx=(0, 4))
         _attach_tooltip(task_btn, 'Insert checklist item at cursor')
 
-        # 🎙 Voice — inline recording button
+        # 🎙 Voice, inline recording button
         self._toolbar_mic = ctk.CTkButton(
             lf, text='🎙  Voice', width=68, height=24,
             fg_color='transparent', hover_color=_SURF3,
@@ -1805,10 +1935,20 @@ class QuickNotesWindow(ctk.CTkToplevel):
         self._toolbar_mic.pack(side='left', padx=(0, 4))
         _attach_tooltip(self._toolbar_mic, 'Record voice → transcribe into note')
 
+        # 📷 OCR, capture screen region and insert text
+        ocr_btn = ctk.CTkButton(
+            lf, text='📷  OCR', width=64, height=24,
+            fg_color='transparent', hover_color=_SURF3,
+            text_color=_T3, font=(FONT_FAMILY, 11), corner_radius=4,
+            command=self._ocr_start,
+        )
+        ocr_btn.pack(side='left', padx=(0, 4))
+        _attach_tooltip(ocr_btn, 'Capture screen region → extract text into note')
+        self._ocr_btn = ocr_btn
+
         # Right side: word count
         rf = tk.Frame(bar, bg=_EDIT)
         rf.pack(side='right', padx=(0, 14), pady=7)
-        self._ocr_btn = None   # removed; OCR still available via Ctrl+V / right-click
 
         # Word count
         self._wcount = tk.Label(rf, text='', bg=_EDIT, fg=_T3, font=(FONT_FAMILY, 10))
@@ -1826,90 +1966,57 @@ class QuickNotesWindow(ctk.CTkToplevel):
     # ── Unified panel ─────────────────────────────────────────────────────────
 
     def _panel_unified(self) -> None:
-        """Inline editor: title + flowing body (text + □ tasks + voice inline)."""
-        _PH_TITLE = 'Title…'
+        """Single-textbox editor, first line is auto-styled as title (bold, larger).
+        No separate title entry. Matches SimpleNote UX: one continuous flow."""
         _PH_BODY  = 'Start writing…'
         _PH_COLOR = '#5a5a5a'
 
-        title_text, body_text = _split_text(self._text_content)
-
-        # Build inline body: combine text lines + checklist items + voice transcript
-        inline_parts: list[str] = []
-        if body_text:
-            inline_parts.append(body_text)
+        # Build full content: stored text + inline checklist items + voice
+        parts: list[str] = []
+        if self._text_content:
+            parts.append(self._text_content)
         for it in self._checklist_items:
             if it.get('text', '').strip():
                 prefix = '✓ ' if it.get('checked') else '□ '
-                inline_parts.append(prefix + it['text'])
+                parts.append(prefix + it['text'])
         if self._voice_transcript:
-            inline_parts.append(self._voice_transcript)
-        full_body = '\n'.join(inline_parts)
+            parts.append(self._voice_transcript)
+        full_content = '\n'.join(parts)
 
-        # ── Outer container (no scroll — body textbox grows naturally) ────────
+        # ── Outer container ───────────────────────────────────────────────────
         outer = tk.Frame(self._content_host, bg=_EDIT)
         outer.pack(fill='both', expand=True)
 
-        # ── Title entry ──────────────────────────────────────────────────────
-        self._title_ph  = not bool(title_text)
-        self._title_var = tk.StringVar(value=title_text if title_text else _PH_TITLE)
-
-        self._title_entry = tk.Entry(
-            outer,
-            textvariable=self._title_var,
-            bg=_EDIT, fg=_T1 if title_text else _PH_COLOR,
-            font=(_ACTIVE_FF, 20, 'bold'),
-            relief='flat', bd=0, insertbackground=_T1, highlightthickness=0,
-        )
-        self._title_entry.pack(fill='x', padx=18, pady=(14, 0))
-
-        def _title_focus_in(e):
-            if self._title_ph:
-                self._title_var.set('')
-                self._title_entry.configure(fg=_T1)
-                self._title_ph = False
-
-        def _title_focus_out(e):
-            if not self._title_var.get().strip():
-                self._title_var.set(_PH_TITLE)
-                self._title_entry.configure(fg=_PH_COLOR)
-                self._title_ph = True
-
-        self._title_entry.bind('<FocusIn>',    _title_focus_in)
-        self._title_entry.bind('<FocusOut>',   _title_focus_out)
-        self._title_entry.bind('<Return>',     lambda e: self._tb._textbox.focus_set())
-        self._title_entry.bind('<KeyRelease>', self._on_key)
-        self._title_entry.bind('<ButtonPress-1>',   self._swipe_press,   add='+')
-        self._title_entry.bind('<ButtonRelease-1>', self._swipe_release, add='+')
-        self._title_entry.bind('<ButtonPress-3>',   self._swipe_press,   add='+')
-        self._title_entry.bind('<ButtonRelease-3>', self._swipe_release, add='+')
-
-        # ── Body textbox — ALL content lives here ────────────────────────────
+        # ── Single textbox, body font; title_line tag overrides line 1 ──────
         self._tb = ctk.CTkTextbox(
             outer,
-            font=(_ACTIVE_FF, 15), fg_color=_EDIT,
+            font=(_ACTIVE_FF, 17), fg_color=_EDIT,
             text_color=_T1, border_width=0,
             scrollbar_button_color='#333',
             scrollbar_button_hover_color='#444',
             wrap='word', corner_radius=0,
         )
-        self._tb.pack(fill='both', expand=True, padx=18, pady=(4, 4))
+        self._tb.pack(fill='both', expand=True, padx=18, pady=(14, 4))
         self._tb._textbox.configure(undo=True, maxundo=100)
 
-        self._ph = not bool(full_body)
+        # Title tag: line 1 rendered larger and bold
+        self._tb._textbox.tag_configure('title_line', font=(_ACTIVE_FF, 20, 'bold'))
+        # Task done tag
+        self._tb._textbox.tag_configure('task_done', foreground=_T3)
+
+        self._ph = not bool(full_content)
         self._ph_text  = _PH_BODY
         self._ph_color = _PH_COLOR
-        if full_body:
-            self._tb.insert('1.0', full_body)
+        if full_content:
+            self._tb.insert('1.0', full_content)
             self._tb.configure(text_color=_T1)
         else:
             self._tb.insert('1.0', _PH_BODY)
             self._tb.configure(text_color=_PH_COLOR)
 
-        # Configure task styling tags
-        self._tb._textbox.tag_configure('task_done', foreground=_T3)
-
-        # Apply checkbox visual styling to pre-loaded content
+        # Apply tags after widget is rendered
         self.after(10, self._apply_all_task_tags)
+        self.after(10, self._apply_title_tag)
 
         self._tb._textbox.bind('<Key>',         self._ph_key)
         self._tb._textbox.bind('<FocusOut>',    self._ph_out)
@@ -1918,7 +2025,6 @@ class QuickNotesWindow(ctk.CTkToplevel):
         self._tb._textbox.bind('<Control-V>',   self._on_ctrl_v)
         self._tb._textbox.bind('<Return>',      self._on_return_key)
         self._tb._textbox.bind('<Button-3>',    self._on_editor_right_click)
-        self._title_entry.bind('<Button-3>',    self._on_title_right_click)
         outer.bind('<Button-3>', self._on_editor_right_click)
         self._tb._textbox.bind('<Control-z>',   self._text_ctrl_z)
         self._tb._textbox.bind('<Control-Z>',   self._text_ctrl_z)
@@ -1929,10 +2035,15 @@ class QuickNotesWindow(ctk.CTkToplevel):
         # Click on □/✓ prefix to toggle checkbox
         self._tb._textbox.bind('<Button-1>', self._on_body_click, add='+')
 
-        # Live spell-check (red underline + right-click suggestions)
+        pass  # no spell-check in notes, keep editor clean
+
+    def _apply_title_tag(self) -> None:
+        """Re-apply the 'title_line' font tag to line 1 (skipped when placeholder active)."""
         try:
-            import spellcheck
-            spellcheck.attach(self._tb)
+            w = self._tb._textbox
+            w.tag_remove('title_line', '1.0', 'end')
+            if not self._ph:
+                w.tag_add('title_line', '1.0', '1.end')
         except Exception:
             pass
 
@@ -1993,7 +2104,7 @@ class QuickNotesWindow(ctk.CTkToplevel):
 
     def _start_rec(self) -> None:
         if self._mic_busy_fn and self._mic_busy_fn():
-            self._set_status('Mic busy — stop other recording first', _WARN_C)
+            self._set_status('Mic busy, stop other recording first', _WARN_C)
             self.after(2500, lambda: self._set_status(''))
             return
         try:
@@ -2021,7 +2132,7 @@ class QuickNotesWindow(ctk.CTkToplevel):
             return
         s = int(time.time() - self._rec_start)
         if s >= _MAX_REC_S:
-            self._set_status(f'Max {_MAX_REC_S}s reached — stopping', _WARN_C)
+            self._set_status(f'Max {_MAX_REC_S}s reached, stopping', _WARN_C)
             try: self._voice_hint.configure(text=f'Max {_MAX_REC_S}s reached')
             except Exception: pass
             self.after(400, self._stop_rec)
@@ -2099,15 +2210,11 @@ class QuickNotesWindow(ctk.CTkToplevel):
 
     def _on_key(self, _=None) -> None:
         self._update_wcount()
+        self._apply_title_tag()
 
     def _update_wcount(self) -> None:
         try:
-            try:
-                title = '' if self._title_ph else self._title_var.get().strip()
-            except AttributeError:
-                title = ''
-            combined = (title + ' ' + self._tb_text()).strip()
-            self._wcount.configure(text=_word_count(combined))
+            self._wcount.configure(text=_word_count(self._tb_text()))
         except Exception:
             pass
 
@@ -2121,27 +2228,18 @@ class QuickNotesWindow(ctk.CTkToplevel):
 
     def _focus_content(self) -> None:
         try:
-            if self._title_ph:
-                self._title_entry.focus_set()
-            else:
-                self._tb._textbox.focus_set()
+            self._tb._textbox.focus_set()
         except Exception:
             pass
 
     # ── Flush ─────────────────────────────────────────────────────────────────
 
     def _flush_current(self) -> None:
-        # Title
-        try:
-            title = '' if self._title_ph else self._title_var.get().strip()
-        except AttributeError:
-            title = ''
-
-        # Body — parse inline □/✓ checklist lines back into separate fields
-        body_raw = self._tb_text()
+        # Full content in one textbox, first line is the title when stored
+        raw = self._tb_text()
         text_lines:  list[str]  = []
         item_lines:  list[dict] = []
-        for line in body_raw.splitlines():
+        for line in raw.splitlines():
             s = line.strip()
             if s.startswith('□ ') or s.startswith('☐ '):
                 item_lines.append({'text': s[2:], 'checked': False})
@@ -2150,15 +2248,7 @@ class QuickNotesWindow(ctk.CTkToplevel):
             else:
                 text_lines.append(line)
 
-        text_body = '\n'.join(text_lines).strip()
-
-        if title and text_body:
-            self._text_content = title + '\n' + text_body
-        elif title:
-            self._text_content = title
-        else:
-            self._text_content = text_body
-
+        self._text_content    = '\n'.join(text_lines).strip()
         self._checklist_items = item_lines or [{'text': '', 'checked': False}]
         # Voice transcript is embedded inline; keep field empty for new notes
         self._voice_transcript = ''
@@ -2317,97 +2407,216 @@ class QuickNotesWindow(ctk.CTkToplevel):
             try: self._max_btn.configure(text='⊡')
             except Exception: pass
 
+    # ── Alt+Tab / taskbar visibility for an overrideredirect window ───────────
+
+    def _enable_alt_tab(self) -> None:
+        """Force the borderless window into the Alt+Tab switcher + taskbar.
+
+        Tk's overrideredirect(True) defaults to WS_EX_TOOLWINDOW which
+        hides the window from Alt+Tab/taskbar; we swap for WS_EX_APPWINDOW
+        so the user can click another app to send Notes to the background
+        and Alt+Tab back, same as the Shift+F8 Whiteboard.
+
+        The taskbar icon itself is dictated by pythonw.exe in dev/source
+        mode (Windows falls back to the executable icon when no per-
+        window icon resource is registered). The dist build embeds the
+        brand .ico as the .exe's own icon resource, which is the only
+        reliable way to override this in source mode without unstable
+        Win32 / Tk interactions. We attempted the WM_SETICON path and
+        rejected it because it interfered with Tk's window-state machine.
+        """
+        if sys.platform != 'win32':
+            return
+        try:
+            import ctypes
+            u = ctypes.windll.user32
+            hwnd = self.winfo_id()
+            for _ in range(8):
+                parent = u.GetParent(hwnd)
+                if not parent:
+                    break
+                hwnd = parent
+            GWL_EXSTYLE      = -20
+            WS_EX_TOOLWINDOW = 0x00000080
+            WS_EX_APPWINDOW  = 0x00040000
+            style = u.GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
+            new   = (style & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW
+            if new == style:
+                return
+            u.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new)
+            # Force the Explorer-side taskbar registration to pick up the
+            # new ex-style WITHOUT touching window visibility. SWP_FRAME-
+            # CHANGED is the safe path; an SW_HIDE / SW_SHOWNOACTIVATE
+            # toggle hides the window for reasons specific to CTk's
+            # internal state machine.
+            SWP_NOMOVE       = 0x0002
+            SWP_NOSIZE       = 0x0001
+            SWP_NOZORDER     = 0x0004
+            SWP_NOACTIVATE   = 0x0010
+            SWP_FRAMECHANGED = 0x0020
+            u.SetWindowPos(hwnd, 0, 0, 0, 0, 0,
+                           SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                           SWP_NOACTIVATE | SWP_FRAMECHANGED)
+        except Exception as e:
+            logger.warning(f'_enable_alt_tab failed: {e}')
+
     # ── All-sides resize ──────────────────────────────────────────────────────
 
     def _enable_native_resize(self) -> None:
-        """Hook WM_NCHITTEST so Windows handles all-sides resize natively.
+        """Smooth borderless resize, no WS_THICKFRAME, no distortion.
 
-        Uses SetWindowLongPtrW to subclass the top-level window procedure.
-        The OS resize loop is rock-solid — no Tkinter geometry calls needed.
+        Eight transparent tk.Frame handles are placed on _outer (above all
+        content) for each resize edge/corner.  They carry Tkinter cursors and
+        bind press/drag/release.  On motion, SetWindowPos is called directly;
+        WM_SIZE flows through so Tkinter re-layouts live, no DWM stretching.
+        CORN=12 keeps corner handles clear of the 'Notes' label text (≈x15,y13).
         """
         try:
             import ctypes, ctypes.wintypes as wt
-            GWL_WNDPROC  = -4
-            WM_NCHITTEST = 0x0084
-            HTCLIENT = 1
-            _HT = {'nw': 13, 'n': 12, 'ne': 14,
-                   'w':  10,           'e':  11,
-                   'sw': 16, 's': 15, 'se': 17}
-            EDGE = 8   # px from window edge for resize zone (8 is easier to grab)
 
-            # Must set argtypes/restype explicitly — on 64-bit Python the default
-            # c_int restype truncates the 64-bit procedure pointer to 32 bits.
+            SWP_NOZORDER   = 0x0004
+            SWP_NOACTIVATE = 0x0010
+            _MIN_W, _MIN_H = 600, 400
+
             user32 = ctypes.windll.user32
-            user32.GetWindowLongPtrW.restype  = ctypes.c_ssize_t
-            user32.GetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int]
-            user32.SetWindowLongPtrW.restype  = ctypes.c_ssize_t
-            user32.SetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
-            user32.CallWindowProcW.restype    = ctypes.c_ssize_t
-            user32.CallWindowProcW.argtypes   = [
-                ctypes.c_ssize_t, ctypes.c_void_p,
-                ctypes.c_uint, ctypes.c_ssize_t, ctypes.c_ssize_t,
-            ]
-            user32.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(wt.RECT)]
             user32.GetWindowRect.restype  = ctypes.c_bool
+            user32.GetWindowRect.argtypes = [ctypes.c_void_p,
+                                             ctypes.POINTER(wt.RECT)]
             user32.GetAncestor.restype    = ctypes.c_void_p
             user32.GetAncestor.argtypes   = [ctypes.c_void_p, ctypes.c_uint]
+            user32.SetWindowPos.restype   = ctypes.c_bool
+            user32.SetWindowPos.argtypes  = [ctypes.c_void_p, ctypes.c_void_p,
+                                             ctypes.c_int, ctypes.c_int,
+                                             ctypes.c_int, ctypes.c_int,
+                                             ctypes.c_uint]
 
-            # winfo_id() on CTkToplevel may return a child-frame HWND, not the
-            # actual Win32 top-level.  WM_NCHITTEST is only sent to the top-level
-            # window, so subclassing a child frame has no effect.
-            # GetAncestor(GA_ROOT=2) walks up to the real root window.
             child_hwnd = self.winfo_id()
-            hwnd       = user32.GetAncestor(child_hwnd, 2)  # GA_ROOT
+            hwnd = user32.GetAncestor(child_hwnd, 2)  # GA_ROOT
             if not hwnd:
-                hwnd = child_hwnd  # fallback if GetAncestor returns NULL
+                hwnd = child_hwnd
 
-            old_proc = user32.GetWindowLongPtrW(hwnd, GWL_WNDPROC)
-            if not old_proc:
-                logger.warning('Native resize: GetWindowLongPtrW returned 0 '
-                                f'(err={ctypes.GetLastError()}), skipping hook.')
-                return
+            # No WndProc subclassing needed: each SetWindowPos from a
+            # <B1-Motion> callback generates exactly one WM_SIZE, no flood,
+            # no suppression required.  Letting WM_SIZE through means Tkinter
+            # re-layouts live during drag, preventing DWM bitmap stretching.
 
-            WndProcType = ctypes.WINFUNCTYPE(
-                ctypes.c_ssize_t,
-                ctypes.c_void_p, ctypes.c_uint,
-                ctypes.c_ssize_t, ctypes.c_ssize_t,
-            )
+            # ── Drag state ────────────────────────────────────────────────────
+            _d = {}   # sx, sy, origL, origT, origR, origB, ht
 
-            @WndProcType
-            def _wndproc(hw, msg, wp, lp):
-                if msg == WM_NCHITTEST:
-                    rect = wt.RECT()
-                    user32.GetWindowRect(hw, ctypes.byref(rect))
-                    # Screen coords are packed as two signed 16-bit values in lp
-                    x = ctypes.c_short(lp & 0xFFFF).value
-                    y = ctypes.c_short((lp >> 16) & 0xFFFF).value
-                    L, T, R, B = rect.left, rect.top, rect.right, rect.bottom
-                    l = x < L + EDGE
-                    r = x > R - EDGE
-                    t = y < T + EDGE
-                    b = y > B - EDGE
-                    if t and l: return _HT['nw']
-                    if t and r: return _HT['ne']
-                    if b and l: return _HT['sw']
-                    if b and r: return _HT['se']
-                    if l:       return _HT['w']
-                    if r:       return _HT['e']
-                    if t:       return _HT['n']
-                    if b:       return _HT['s']
-                    return HTCLIENT
-                return user32.CallWindowProcW(old_proc, hw, msg, wp, lp)
+            # HT codes matching the 8 edge/corner names
+            _HT = {'nw': 13, 'n': 12, 'ne': 14,
+                   'w':  10,            'e':  11,
+                   'sw': 16, 's': 15,  'se': 17}
 
-            set_result = user32.SetWindowLongPtrW(hwnd, GWL_WNDPROC, _wndproc)
-            if not set_result:
-                logger.warning('Native resize: SetWindowLongPtrW returned 0 '
-                                f'(err={ctypes.GetLastError()})')
-            else:
-                logger.info(f'Native resize hook installed: hwnd={hwnd:#010x} '
-                             f'(child={child_hwnd:#010x})')
-            # Keep a strong reference — ctypes callback is GC'd if not held
-            self._wndproc_ref = _wndproc
+            # Tkinter cursor names for each edge (Windows-valid names only)
+            _CUR = {
+                'nw': 'size_nw_se',        'se': 'size_nw_se',
+                'ne': 'size_ne_sw',        'sw': 'size_ne_sw',
+                'n':  'sb_v_double_arrow', 's':  'sb_v_double_arrow',
+                'w':  'sb_h_double_arrow', 'e':  'sb_h_double_arrow',
+            }
+
+            def _press(event, ht):
+                r = wt.RECT()
+                user32.GetWindowRect(hwnd, ctypes.byref(r))
+                _d.update(sx=event.x_root, sy=event.y_root, ht=ht,
+                          origL=r.left, origT=r.top,
+                          origR=r.right, origB=r.bottom)
+
+            def _motion(event):
+                if not _d:
+                    return
+                dx = event.x_root - _d['sx']
+                dy = event.y_root - _d['sy']
+                L, T, R, B = _d['origL'], _d['origT'], _d['origR'], _d['origB']
+                ht = _d['ht']
+                if ht in (10, 13, 16): L += dx
+                if ht in (11, 14, 17): R += dx
+                if ht in (12, 13, 14): T += dy
+                if ht in (15, 16, 17): B += dy
+                if R - L < _MIN_W:
+                    if ht in (10, 13, 16): L = R - _MIN_W
+                    else:                  R = L + _MIN_W
+                if B - T < _MIN_H:
+                    if ht in (12, 13, 14): T = B - _MIN_H
+                    else:                  B = T + _MIN_H
+                user32.SetWindowPos(hwnd, 0, L, T, R - L, B - T,
+                                    SWP_NOZORDER | SWP_NOACTIVATE)
+
+            def _release(event):
+                _d.clear()
+
+            # ── Transparent edge/corner handle frames ─────────────────────────
+            # CORN=12: NW corner reaches x=1-12, y=1-12.  The "Notes" label
+            # text starts at ≈x=15, y=13 within _outer, just outside the
+            # corner zone, so no handle frame ever covers visible text.
+            EDGE = 8    # resize grab width in px
+            CORN = 12   # corner square size in px
+            HL   = 1    # _outer highlightthickness, offset handles inward
+
+            # Compute placements as functions of outer-frame size
+            def _placements(w, h):
+                return {
+                    'nw': (HL,        HL,        CORN,           CORN),
+                    'ne': (w-CORN-HL, HL,        CORN,           CORN),
+                    'sw': (HL,        h-CORN-HL, CORN,           CORN),
+                    'se': (w-CORN-HL, h-CORN-HL, CORN,           CORN),
+                    'n':  (CORN,      HL,        w-2*CORN,       EDGE),
+                    's':  (CORN,      h-EDGE-HL, w-2*CORN,       EDGE),
+                    'w':  (HL,        CORN,      EDGE,           h-2*CORN),
+                    'e':  (w-EDGE-HL, CORN,      EDGE,           h-2*CORN),
+                }
+
+            # 4 accent border strips, placed via place() so they're always
+            # fully visible regardless of CTkToplevel's internal frame layout.
+            # Lifted before handles so handles sit on top (no overlap anyway
+            # since handles start at HL=1 inset and strips are at edge 0).
+            _border_strips = [tk.Frame(self._outer, bg=_ACCENT) for _ in range(4)]
+
+            _handle_frames = []
+            # Edges first, then corners, corners lifted last so they win at
+            # overlap zones and always show the diagonal cursor
+            for edge_name in ('n', 's', 'w', 'e', 'nw', 'ne', 'sw', 'se'):
+                ht = _HT[edge_name]
+                frm = tk.Frame(self._outer, bg=_WIN,
+                               cursor=_CUR[edge_name])
+                frm.bind('<ButtonPress-1>',   lambda e, h=ht: _press(e, h))
+                frm.bind('<B1-Motion>',       _motion)
+                frm.bind('<ButtonRelease-1>', _release)
+                _handle_frames.append((frm, edge_name))
+
+            def _place_handles():
+                try:
+                    w = self._outer.winfo_width()
+                    h = self._outer.winfo_height()
+                    if w < 20 or h < 20:
+                        self.after(80, _place_handles)
+                        return
+                    # Border strips: top, bottom, left, right (1px each)
+                    _border_strips[0].place(x=0,   y=0,   width=w, height=1)
+                    _border_strips[1].place(x=0,   y=h-1, width=w, height=1)
+                    _border_strips[2].place(x=0,   y=0,   width=1, height=h)
+                    _border_strips[3].place(x=w-1, y=0,   width=1, height=h)
+                    for bf in _border_strips:
+                        bf.lift()
+                    # Resize handles on top of border strips
+                    pl = _placements(w, h)
+                    for frm, edge_name in _handle_frames:
+                        x, y, fw, fh = pl[edge_name]
+                        frm.place(x=x, y=y, width=fw, height=fh)
+                        frm.lift()
+                except Exception:
+                    pass
+
+            # Reposition handles whenever the outer frame changes size
+            self._outer.bind('<Configure>', lambda e: _place_handles(), add='+')
+            self.after(120, _place_handles)
+            self._resize_handles = _handle_frames   # prevent GC
+            self._border_strips  = _border_strips   # prevent GC
+
+            logger.info(f'Resize hook installed (handle-frames): hwnd={hwnd:#010x}')
         except Exception as e:
-            logger.warning(f'Native resize hook failed: {e}')
+            logger.warning(f'Resize hook failed: {e}')
 
     # ── Gesture undo ──────────────────────────────────────────────────────────
 
@@ -2447,9 +2656,9 @@ class QuickNotesWindow(ctk.CTkToplevel):
         level so gesture undo can fire."""
         try:
             self._tb._textbox.edit_undo()
-            return 'break'   # undo succeeded — stop propagation
+            return 'break'   # undo succeeded, stop propagation
         except Exception:
-            pass             # stack empty — fall through to window handler
+            pass             # stack empty, fall through to window handler
         return None          # allow window-level binding to fire
 
     def _gesture_ctrl_z(self, event=None) -> str:
@@ -2476,11 +2685,11 @@ class QuickNotesWindow(ctk.CTkToplevel):
             line_end = f'{line_num}.end'
             line_txt = tb.get(f'{line_num}.0', line_end).strip()
             if line_txt:
-                # Non-empty line — insert new □ line below
+                # Non-empty line, insert new □ line below
                 tb.mark_set('insert', line_end)
                 tb.insert('insert', '\n□ ')
             else:
-                # Empty line — just put □ here
+                # Empty line, just put □ here
                 tb.insert(f'{line_num}.0', '□ ')
             tb.see('insert')
             tb.focus_set()
@@ -2607,6 +2816,9 @@ class QuickNotesWindow(ctk.CTkToplevel):
         """Switch between dark and light palettes and rebuild the window."""
         self._flush_current()
         self._theme = theme
+        if self._on_theme_change:
+            try: self._on_theme_change(theme)
+            except Exception: pass
         palette = _LIGHT_PALETTE if theme == 'light' else _DARK_PALETTE
         _mod = sys.modules[__name__]
         for k, v in palette.items():

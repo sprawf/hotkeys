@@ -11,6 +11,94 @@ _INTERIM_EVERY = SAMPLE_RATE * 4       # emit interim every 4 s of new audio
 _MAX_RECORD_S  = 300                   # hard cap: 5 minutes of recording
 
 
+# ── Physical-mic heuristics ───────────────────────────────────────────────────
+#
+# Substrings (case-insensitive) that mark a device as VIRTUAL or NOT-A-MIC.
+# Devices matching any of these are deprioritised when auto-detecting.
+_VIRTUAL_HINTS = (
+    'droidcam', 'voicemod', 'vb-audio', 'vb-cable', 'cable input', 'cable output',
+    'voicemeeter', 'obs virtual', 'obs-camera', 'streamlabs',
+    'stereo mix', 'what u hear', 'wave out mix',
+    'line in', 'line input',
+    'midi', 'wave',
+    'sound mapper', 'primary sound', 'mapper',
+    'spatial sound', 'azure', 'spotify',
+)
+
+# Substrings that suggest a real physical mic. Used to boost scoring.
+_PHYSICAL_HINTS = (
+    'microphone', 'mic ', 'mic-', 'headset', 'webcam',
+    'realtek', 'usb audio', 'usb mic',
+    'array', 'condenser',
+)
+
+
+def is_virtual_mic(name: str) -> bool:
+    """Heuristic: True if the device name looks like a virtual sound source
+    (DroidCam, OBS, Stereo Mix, etc.) rather than a real microphone."""
+    low = (name or '').lower()
+    return any(t in low for t in _VIRTUAL_HINTS)
+
+
+def _physical_mic_candidates(exclude: set | None = None) -> list:
+    """Return ALL physical-mic candidates as a list of (index, name) tuples,
+    sorted best-first. Each one is worth trying in turn, Windows often
+    exposes the same hardware mic via 3 host APIs (MME, DirectSound,
+    WASAPI), and one of them usually works even when the others reject
+    our sample rate. The runtime walks the whole list before giving up.
+    """
+    exclude = set(exclude or set())
+    candidates = []
+    try:
+        try:
+            hostapis = sd.query_hostapis()
+        except Exception:
+            hostapis = []
+        for i, d in enumerate(sd.query_devices()):
+            if i in exclude:
+                continue
+            if d.get('max_input_channels', 0) <= 0:
+                continue
+            name = d.get('name', '') or ''
+            low  = name.lower()
+            score = 0
+            if any(t in low for t in _PHYSICAL_HINTS):
+                score += 10
+            if any(t in low for t in _VIRTUAL_HINTS):
+                score -= 100
+            # Host-API preference: WASAPI accepts any sample rate via shared
+            # mode and is the most reliable; MME is least permissive.
+            hostapi_idx = d.get('hostapi', -1)
+            hostapi_name = ''
+            if 0 <= hostapi_idx < len(hostapis):
+                hostapi_name = (hostapis[hostapi_idx].get('name') or '').lower()
+            if 'wasapi' in hostapi_name:
+                score += 2
+            if 'directsound' in hostapi_name:
+                score += 1
+            if 'mme' in hostapi_name:
+                score -= 1
+            if score > 0:        # only real-looking candidates
+                candidates.append((score, -i, i, name))
+    except Exception as e:
+        logger.debug(f'_physical_mic_candidates enumeration failed: {e}')
+        return []
+    candidates.sort(reverse=True)
+    return [(idx, name) for (_score, _neg_i, idx, name) in candidates]
+
+
+def _pick_best_physical_mic(exclude: set | None = None) -> int | None:
+    """Single-best-candidate convenience wrapper for callers that only
+    want one device. The runtime in `_open_stream` uses
+    `_physical_mic_candidates` directly to try the whole list."""
+    cands = _physical_mic_candidates(exclude)
+    if not cands:
+        return None
+    idx, name = cands[0]
+    logger.info(f'Auto-detected physical mic: [{idx}] {name!r} (top of {len(cands)})')
+    return idx
+
+
 class AudioCapture:
     def __init__(self, on_chunk, on_utterance_ready, cfg, on_interim=None):
         self._on_chunk           = on_chunk
@@ -23,60 +111,201 @@ class AudioCapture:
         self._buffer         = []
         self._interim_last_n = 0
         self._db             = -60.0
+        # Resampling state, set when the chosen device rejects 16 kHz and
+        # we have to open the stream at its native rate (e.g. DroidCam at
+        # 44.1 kHz, some USB mics at 48 kHz). `_device_rate=None` means
+        # the device accepts 16 kHz directly and no resampling is needed.
+        self._device_rate:  int | None = None
+        self._resample_buf: np.ndarray = np.zeros(0, dtype=np.float32)
+        # Surfaced to the UI: when non-empty, the last open-stream error
+        # message, lets the "Microphone unavailable" dialog show what
+        # actually went wrong (sample rate? permissions? device gone?).
+        self.last_error: str = ''
 
     @property
     def db(self):
         return self._db
 
     def _open_stream(self):
+        """Open the input stream. Self-healing, tries every reasonable
+        combination before surfacing an error to the user, so a stale
+        config or a wrongly-configured Windows default (e.g. DroidCam
+        marked as default but silent) silently degrades to a working
+        physical mic.
+
+        Try order:
+          1. Saved device      @ 16 kHz                ← ideal
+          2. Saved device      @ device's native rate  ← weird-rate mics
+          3. System default    @ 16 kHz                ← saved device gone
+          4. System default    @ native rate           ← belt + suspenders
+          5. Best PHYSICAL mic @ 16 kHz                ← Windows default is bad
+          6. Best physical mic @ native rate           ← physical mic non-16k
+        Each failed attempt is logged at warning; only when all attempts
+        fail do we re-raise so the UI dialog appears.
+        """
+        saved_device = self._cfg.audio.input_device_index
+        self.last_error = ''
+        self._device_rate = None
+        self.fell_back_to_default = False   # surfaced to UI for an info toast
+
+        attempts = []
+        if saved_device is not None:
+            # User explicitly picked a device, respect that first, then
+            # fall back through default → scan if it fails.
+            attempts.append((saved_device, SAMPLE_RATE,
+                             'saved @ 16 kHz'))
+            attempts.append((saved_device, self._native_rate(saved_device),
+                             'saved @ native'))
+            attempts.append((None,         SAMPLE_RATE,
+                             'default @ 16 kHz'))
+            attempts.append((None,         self._native_rate(None),
+                             'default @ native'))
+            scanned = _pick_best_physical_mic(exclude={saved_device})
+            if scanned is not None:
+                attempts.append((scanned, SAMPLE_RATE,
+                                 f'scan-physical[{scanned}] @ 16 kHz'))
+                attempts.append((scanned, self._native_rate(scanned),
+                                 f'scan-physical[{scanned}] @ native'))
+        else:
+            # AUTO-DETECT: walk the full list of physical-mic candidates
+            # in score order. Windows often exposes the same Realtek mic
+            # via MME + DirectSound + WASAPI as 3 separate device indices,
+            # one may reject our sample rate while another accepts it.
+            # Trying each in turn means we recover from per-backend
+            # weirdness before falling back to whatever Windows says is
+            # "default" (which is often a silent virtual mic).
+            for idx, name in _physical_mic_candidates():
+                attempts.append((idx, SAMPLE_RATE,
+                                 f'auto-pick[{idx}] @ 16 kHz'))
+                attempts.append((idx, self._native_rate(idx),
+                                 f'auto-pick[{idx}] @ native'))
+            # Windows default as the final safety net, covers users who
+            # explicitly set a virtual mic as their Windows default ON
+            # PURPOSE (e.g. they DO use DroidCam and want it).
+            attempts.append((None, SAMPLE_RATE,
+                             'default @ 16 kHz'))
+            attempts.append((None, self._native_rate(None),
+                             'default @ native'))
+
+        # CAP attempts at 4. PortAudio's WASAPI host has a known issue:
+        # after ~5 failed sd.InputStream opens (e.g. format-unsupported on
+        # every device the user has), its internal heap corrupts and the
+        # whole process crashes with STATUS_STACK_BUFFER_OVERRUN. Trying
+        # the four most likely options is enough for any sane Windows
+        # config; if none of them work we tell the user gracefully.
+        attempts = attempts[:4]
+        last_exc: Exception | None = None
+        for device, rate, label in attempts:
+            if rate is None:        # query_devices failed, skip this combo
+                continue
+            try:
+                self._stream = sd.InputStream(
+                    device=device,
+                    samplerate=rate,
+                    channels=1,
+                    dtype='float32',
+                    blocksize=BLOCKSIZE,
+                    callback=self._callback,
+                )
+                self._stream.start()
+                self._device_rate  = rate if rate != SAMPLE_RATE else None
+                self._resample_buf = np.zeros(0, dtype=np.float32)
+                self.fell_back_to_default = (
+                    saved_device is not None and device is None
+                )
+                if self.fell_back_to_default:
+                    logger.warning(
+                        f"Saved mic (device {saved_device}) couldn't be "
+                        f"opened, using system default instead ({label})."
+                    )
+                elif self._device_rate is not None:
+                    logger.info(
+                        f'Opened input at {rate} Hz ({label}); '
+                        f'will resample to {SAMPLE_RATE} Hz in callback.'
+                    )
+                else:
+                    logger.info(f'Opened input at {SAMPLE_RATE} Hz ({label}).')
+                return
+            except Exception as e:
+                last_exc = e
+                logger.warning(f'Audio open attempt failed [{label}]: {e}')
+                self._stream = None
+
+        # Everything failed, propagate the last error to the UI.
+        msg = str(last_exc) if last_exc else 'unknown audio error'
+        logger.error(f'Audio stream error (all fallbacks exhausted): {msg}')
+        self.last_error = msg
+        raise last_exc if last_exc else RuntimeError('audio init failed')
+
+    def _native_rate(self, device) -> int | None:
+        """Best-effort lookup of `device`'s default sample rate. Returns
+        None if the query fails (caller will skip that attempt)."""
         try:
-            self._stream = sd.InputStream(
-                device=self._cfg.audio.input_device_index,
-                samplerate=SAMPLE_RATE,
-                channels=1,
-                dtype='float32',
-                blocksize=BLOCKSIZE,
-                callback=self._callback,
-            )
-            self._stream.start()
+            info = sd.query_devices(device, 'input')
+            return int(info.get('default_samplerate') or 44100)
         except Exception as e:
-            logger.error(f'Audio stream error: {e}')
-            self._stream = None
-            raise
+            logger.debug(f'query_devices({device}) failed: {e}')
+            return None
 
     def _callback(self, indata, frames, time_info, status):
         try:
             chunk = np.clip(indata[:, 0].copy(), -1.0, 1.0)
-            rms = np.sqrt(np.mean(chunk ** 2) + 1e-9)
-            self._db = float(20 * np.log10(rms))
-            should_interim  = False
-            buf_snapshot    = None
-            force_stop      = False
-            with self._lock:
-                if self._recording:
-                    self._buffer.append(chunk)
-                    total_n = sum(len(b) for b in self._buffer)
-                    # Hard cap: auto-stop at 5 minutes to prevent memory exhaustion
-                    if total_n >= _MAX_RECORD_S * SAMPLE_RATE:
-                        self._recording = False
-                        force_stop = True
-                    elif self._on_interim:
-                        if total_n - self._interim_last_n >= _INTERIM_EVERY:
-                            self._interim_last_n = total_n
-                            should_interim = True
-                            buf_snapshot   = list(self._buffer)
-            self._on_chunk(chunk)
-            if force_stop:
-                logger.warning('Max recording duration reached — auto-stopping.')
-                threading.Thread(target=self.stop_recording, daemon=True).start()
-            elif should_interim and buf_snapshot:
-                audio_snap = np.concatenate(buf_snapshot)
-                threading.Thread(
-                    target=lambda a=audio_snap: self._on_interim(a),
-                    daemon=True,
-                ).start()
+            # Resample on the fly when the device couldn't give us 16 kHz
+            # directly. We buffer the resampled output so we always emit
+            # exact-BLOCKSIZE chunks downstream (Silero VAD requires this).
+            if self._device_rate is not None:
+                try:
+                    from scipy.signal import resample_poly
+                    from math import gcd
+                    g    = gcd(self._device_rate, SAMPLE_RATE)
+                    up   = SAMPLE_RATE      // g
+                    down = self._device_rate // g
+                    resampled = resample_poly(chunk, up, down).astype(np.float32)
+                except Exception as e:
+                    logger.error(f'Resample failed: {e}')
+                    return
+                self._resample_buf = np.concatenate([self._resample_buf, resampled])
+                while len(self._resample_buf) >= BLOCKSIZE:
+                    chunk = self._resample_buf[:BLOCKSIZE].copy()
+                    self._resample_buf = self._resample_buf[BLOCKSIZE:]
+                    self._dispatch_chunk(chunk)
+                return
+            self._dispatch_chunk(chunk)
         except Exception as e:
             logger.error(f'Audio callback error: {e}')
+
+    def _dispatch_chunk(self, chunk: np.ndarray) -> None:
+        """Per-chunk hot path, runs at ~31 Hz (16 kHz / 512). Extracted
+        so the resampling fast path and the no-resample fast path share
+        identical bookkeeping."""
+        rms = np.sqrt(np.mean(chunk ** 2) + 1e-9)
+        self._db = float(20 * np.log10(rms))
+        should_interim  = False
+        buf_snapshot    = None
+        force_stop      = False
+        with self._lock:
+            if self._recording:
+                self._buffer.append(chunk)
+                total_n = sum(len(b) for b in self._buffer)
+                # Hard cap: auto-stop at 5 minutes to prevent memory exhaustion
+                if total_n >= _MAX_RECORD_S * SAMPLE_RATE:
+                    self._recording = False
+                    force_stop = True
+                elif self._on_interim:
+                    if total_n - self._interim_last_n >= _INTERIM_EVERY:
+                        self._interim_last_n = total_n
+                        should_interim = True
+                        buf_snapshot   = list(self._buffer)
+        self._on_chunk(chunk)
+        if force_stop:
+            logger.warning('Max recording duration reached, auto-stopping.')
+            threading.Thread(target=self.stop_recording, daemon=True).start()
+        elif should_interim and buf_snapshot:
+            audio_snap = np.concatenate(buf_snapshot)
+            threading.Thread(
+                target=lambda a=audio_snap: self._on_interim(a),
+                daemon=True,
+            ).start()
 
     def start_recording(self):
         with self._lock:

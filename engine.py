@@ -19,7 +19,7 @@ try:
     truststore.inject_into_ssl()
     logger.debug('SSL: injected OS certificate store via truststore')
 except Exception as _ts_err:
-    logger.debug(f'truststore unavailable ({_ts_err}) — using certifi bundle')
+    logger.debug(f'truststore unavailable ({_ts_err}), using certifi bundle')
 
 # ── Provider metadata ────────────────────────────────────────────────────────
 
@@ -85,10 +85,88 @@ def _mark_ssl_broken() -> None:
     if _ssl_ok:
         _ssl_ok = False
         logger.warning(
-            'Antivirus SSL inspection detected — switching to verify=False. '
+            'Antivirus SSL inspection detected, switching to verify=False. '
             'To fix permanently: add api.groq.com / api.cerebras.ai to your '
             'antivirus HTTPS scanning exclusions.'
         )
+
+
+# Errors that indicate the user is OFFLINE rather than the API itself
+# being broken, DNS, connection refused, network unreachable, plus the
+# Windows-specific socket error codes.  Used by friendly_error_message().
+_OFFLINE_HINTS = (
+    'getaddrinfo failed',
+    'Name or service not known',
+    'nodename nor servname',
+    'Temporary failure in name resolution',
+    'No address associated with hostname',
+    'Network is unreachable',
+    'Could not resolve host',
+    'Could not connect',
+    'Connection refused',
+    'Connection reset',
+    'Connection aborted',
+    'Connection timed out',
+    'Failed to establish a new connection',
+    '[Errno 11001]', '[Errno 11003]', '[Errno 11004]',
+    '[Errno -2]', '[Errno -3]',
+    'WinError 10050',   # network is down
+    'WinError 10051',   # network unreachable
+    'WinError 11001',   # host not found
+    'WinError 11004',   # host not found, no DNS server response
+    # httpx wrappers
+    'ConnectError',
+    'ReadTimeout',
+    'ConnectTimeout',
+)
+
+
+def is_offline_error(exc: BaseException | str) -> bool:
+    """True when the exception text suggests the user is OFFLINE, DNS
+    failure, host unreachable, connection refused, or a network-level
+    timeout. False for API-side errors (401, 429, 5xx, malformed JSON,
+    etc.) which are signs of an upstream issue, not a missing connection.
+    """
+    msg = exc if isinstance(exc, str) else str(exc)
+    msg_l = msg.lower()
+    for h in _OFFLINE_HINTS:
+        if h.lower() in msg_l:
+            return True
+    return False
+
+
+def friendly_error_message(exc: BaseException | str, *, feature: str,
+                           active_provider: str = '') -> str:
+    """Translate a raw exception into a user-friendly one-liner. Picks the
+    right framing depending on whether it looks like the user is offline
+    or the API itself is misbehaving.
+
+    Args:
+        exc:             the exception (or its str()) to translate.
+        feature:         short name for the action that failed
+                         ("Refine", "Ask", "Chain", "OCR", "Explain").
+        active_provider: 'local' / 'groq' / 'cerebras' / ..., when
+                         present and the user is offline, the message
+                         distinguishes "switch to Local" from "you're
+                         already local but vision needs online".
+    """
+    msg = exc if isinstance(exc, str) else str(exc)
+
+    if is_offline_error(msg):
+        if active_provider == 'local' and feature in ('OCR', 'Explain'):
+            # User is already on local but the FEATURE itself needs a
+            # vision-capable model that only ships in cloud providers.
+            return (f'{feature} needs an online provider, '
+                    f'switch to Groq/Cerebras in Settings')
+        return f'You appear to be offline, {feature} needs an internet connection'
+
+    msg_l = msg.lower()
+    if '429' in msg or 'rate' in msg_l or 'quota' in msg_l:
+        return 'Daily limit reached, try again later or add your own API key in Settings'
+    if 'api key' in msg_l or 'api_key' in msg_l or 'unauthorized' in msg_l or '401' in msg:
+        return 'Invalid API key, check Settings'
+    # Generic fallback, keep it short.
+    return msg[:80]
 
 
 def local_provider_available() -> bool:
@@ -97,6 +175,28 @@ def local_provider_available() -> bool:
         import llama_cpp  # noqa: F401
         return True
     except ImportError:
+        return False
+
+
+def provider_available(key: str) -> bool:
+    """True if the SDK for *key* is importable in this build.
+
+    Dist excludes heavy optional SDKs (openai, anthropic, google-genai)
+    to keep the zip small; the Settings dropdown should hide options
+    that would raise "pip install X" on use — users can't pip in a
+    frozen exe. groq + cerebras are always bundled.
+    """
+    if key == 'local':
+        return local_provider_available()
+    if key in ('groq', 'cerebras', 'custom'):
+        return True
+    _pkg = {'openai': 'openai', 'anthropic': 'anthropic', 'gemini': 'google.genai'}.get(key)
+    if _pkg is None:
+        return True
+    try:
+        __import__(_pkg)
+        return True
+    except Exception:
         return False
 
 
@@ -110,18 +210,18 @@ def _robust_post(url: str, payload: dict, headers: dict,
                  timeout: float = 30.0) -> dict:
     """POST JSON with three-level antivirus fallback.
 
-    Level 1 — httpx verify=True  : normal SSL.
+    Level 1, httpx verify=True  : normal SSL.
                                    truststore (injected at import) makes Python
                                    trust AV/corporate CAs from the OS cert store,
                                    so AV SSL-MITM (AVG, Kaspersky, Bitdefender,
                                    ESET, Sophos, Norton, McAfee) is transparent.
-    Level 2 — httpx verify=False : any remaining SSL issue (edge-case AV configs,
+    Level 2, httpx verify=False : any remaining SSL issue (edge-case AV configs,
                                    self-signed certs, truststore unavailable).
-    Level 3 — curl.exe           : AV blocks Python's socket layer entirely via a
+    Level 3, curl.exe           : AV blocks Python's socket layer entirely via a
                                    kernel driver (e.g. AVG avgMonFltProxy).
                                    curl.exe is a native Windows binary that uses
-                                   Schannel — the same SSL stack Windows itself
-                                   uses — so AV proxies it cleanly.
+                                   Schannel, the same SSL stack Windows itself
+                                   uses, so AV proxies it cleanly.
 
     Returns parsed JSON dict.  Raises RuntimeError with user-actionable message.
     """
@@ -141,7 +241,7 @@ def _robust_post(url: str, payload: dict, headers: dict,
                 if r.status_code == 401:
                     raise RuntimeError('Invalid API key.')
                 if r.status_code == 429:
-                    raise RuntimeError('Rate limit reached — wait a moment and try again.')
+                    raise RuntimeError('Rate limit reached, wait a moment and try again.')
                 if r.status_code >= 400:
                     raise RuntimeError(f'API error {r.status_code}: {r.text[:120]}')
                 if not verify and _ssl_ok:
@@ -149,22 +249,22 @@ def _robust_post(url: str, payload: dict, headers: dict,
                 logger.debug(f'_robust_post: httpx verify={verify} succeeded')
                 return r.json()
             except RuntimeError:
-                raise                # API / auth errors — do not retry
+                raise                # API / auth errors, do not retry
             except Exception as e:
                 last_exc = e
                 es = str(e)
                 if any(k in es for k in _SSL_ERRS):
                     logger.warning(
                         f'httpx (verify={verify}) blocked by AV/SSL '
-                        f'({type(e).__name__}: {es[:80]}) — trying next level'
+                        f'({type(e).__name__}: {es[:80]}), trying next level'
                     )
                     continue
                 if verify:
                     continue         # non-SSL error on verify=True: still try False
-                break                # verify=False also failed — fall to curl
+                break                # verify=False also failed, fall to curl
 
     # ── Level 3: curl.exe (Windows system binary, uses Schannel) ─────────────
-    # Prefer C:\Windows\System32\curl.exe — guaranteed on Windows 10 1803+.
+    # Prefer C:\Windows\System32\curl.exe, guaranteed on Windows 10 1803+.
     # Fall back to PATH lookup in case the user has a different curl.
     system_curl = r'C:\Windows\System32\curl.exe'
     curl = system_curl if _os.path.isfile(system_curl) else None
@@ -173,7 +273,7 @@ def _robust_post(url: str, payload: dict, headers: dict,
         curl = _shutil.which('curl')
 
     if curl:
-        logger.warning(f'httpx blocked by AV — falling back to {curl}')
+        logger.warning(f'httpx blocked by AV, falling back to {curl}')
         try:
             args = [curl, '-s', '-S', '--max-time', str(int(timeout)),
                     '-k',           # skip cert verify (Schannel handles trust)
@@ -313,7 +413,7 @@ class LocalProvider(Provider):
             except Exception as e:
                 err = str(e)
                 if 'SSL' in err or 'certificate' in err.lower():
-                    logger.warning('SSL error — retrying without verification.')
+                    logger.warning('SSL error, retrying without verification.')
                     self._ssl_bypass()
                     return _dl()
                 raise
@@ -347,7 +447,7 @@ class LocalProvider(Provider):
         except ImportError:
             raise RuntimeError(
                 'Local AI is not included in this build.\n'
-                'Use Groq or Cerebras instead — both are free and much faster.'
+                'Use Groq or Cerebras instead, both are free and much faster.'
             )
         self._loading = True
         logger.info('Loading local GGUF model…')
@@ -411,10 +511,10 @@ class GroqProvider(Provider):
                 return _clean(data['choices'][0]['message']['content'])
             except RuntimeError as e:
                 if _is_rate_limit(e):
-                    logger.warning(f'Groq key …{key[-6:]} rate-limited — rotating to next key')
+                    logger.warning(f'Groq key …{key[-6:]} rate-limited, rotating to next key')
                     last_err = e
                     continue
-                raise   # auth errors, server errors — don't rotate
+                raise   # auth errors, server errors, don't rotate
         raise last_err or RuntimeError('All Groq keys exhausted')
 
 
@@ -446,7 +546,7 @@ class CerebrasProvider(Provider):
                 return _clean(data['choices'][0]['message']['content'])
             except RuntimeError as e:
                 if _is_rate_limit(e):
-                    logger.warning(f'Cerebras key …{key[-6:]} rate-limited — rotating to next key')
+                    logger.warning(f'Cerebras key …{key[-6:]} rate-limited, rotating to next key')
                     last_err = e
                     continue
                 raise
@@ -469,7 +569,7 @@ class _OpenAICompatProvider(Provider):
         try:
             from openai import OpenAI
         except ImportError:
-            raise RuntimeError('openai package not installed — run: pip install openai')
+            raise RuntimeError('openai package not installed, run: pip install openai')
 
         def _call(verify: bool = True) -> str:
             kw = self._client_kwargs(verify)
@@ -507,7 +607,7 @@ class OpenAIProvider(_OpenAICompatProvider):
 
 
 class GeminiProvider(_OpenAICompatProvider):
-    """Google Gemini via its OpenAI-compatible REST endpoint — no extra SDK needed."""
+    """Google Gemini via its OpenAI-compatible REST endpoint, no extra SDK needed."""
     _BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/openai/'
 
     def __init__(self, api_key: str, model: str = 'gemini-2.0-flash') -> None:
@@ -550,7 +650,7 @@ class CustomProvider(_OpenAICompatProvider):
 
 
 class AnthropicProvider(Provider):
-    """Anthropic Claude — uses the anthropic SDK (different API shape from OpenAI)."""
+    """Anthropic Claude, uses the anthropic SDK (different API shape from OpenAI)."""
 
     def __init__(self, api_key: str, model: str = 'claude-3-5-haiku-20241022') -> None:
         self.api_key = api_key
@@ -565,7 +665,7 @@ class AnthropicProvider(Provider):
         try:
             import anthropic
         except ImportError:
-            raise RuntimeError('anthropic package not installed — run: pip install anthropic')
+            raise RuntimeError('anthropic package not installed, run: pip install anthropic')
 
         def _call(verify: bool = True) -> str:
             kw: dict = {'api_key': self.api_key}
@@ -601,17 +701,17 @@ class FallbackProvider(Provider):
         try:
             return self._primary.refine(text, system_prompt)
         except Exception as e:
-            logger.warning(f'{self._primary.name} failed ({type(e).__name__}: {e!s:.80}) — falling back')
+            logger.warning(f'{self._primary.name} failed ({type(e).__name__}: {e!s:.80}), falling back')
             if isinstance(self._fallback, LocalProvider):
                 # Never block the inference thread loading a GGUF model
                 if not self._fallback.ready:
-                    raise RuntimeError('Local fallback model not loaded yet — try again shortly.')
+                    raise RuntimeError('Local fallback model not loaded yet, try again shortly.')
             elif not self._fallback.ready:
                 self._fallback.load()
             try:
                 return self._fallback.refine(text, system_prompt)
             except Exception as e2:
-                # Both providers failed — give a clean user-facing message
+                # Both providers failed, give a clean user-facing message
                 if '429' in str(e2) or 'rate' in str(e2).lower() or 'quota' in str(e2).lower():
                     raise RuntimeError(
                         'Daily limit reached on both providers. '
@@ -687,7 +787,7 @@ def build_provider(config: dict) -> Provider:
         if local:          tiers.append(local)
         return _chain(tiers) if tiers else cerebras
 
-    # 'local' selected — local first, cloud as silent backup
+    # 'local' selected, local first, cloud as silent backup
     if local:
         tiers = [local]
         if cerebras.ready: tiers.append(cerebras)

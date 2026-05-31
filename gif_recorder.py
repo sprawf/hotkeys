@@ -1,5 +1,5 @@
 """
-GIF Recorder — captures screen frames with Win32 BitBlt and saves as animated GIF.
+GIF Recorder, captures screen frames with Win32 BitBlt and saves as animated GIF.
 
 Reuses ScreenCapture from screen_recorder.py.
 Encoding uses Pillow (already a dependency).
@@ -120,7 +120,7 @@ class GifRecorder:
         self._stop_event.set()
 
     def force_stop(self) -> None:
-        """Abort — stop capture without encoding, discard frames."""
+        """Abort, stop capture without encoding, discard frames."""
         self._stop_event.set()
         with self._lock:
             self._frames_rgb.clear()
@@ -160,7 +160,7 @@ class GifRecorder:
                             pass
                     break
 
-                # Precise timing — wait until next frame slot
+                # Precise timing, wait until next frame slot
                 wait = next_t - time.perf_counter()
                 if wait > 0:
                     if self._stop_event.wait(timeout=wait):
@@ -194,7 +194,7 @@ class GifRecorder:
                 except Exception:
                     pass
 
-        # Capture done — encode
+        # Capture done, encode
         self._recording = False
         self._encoding  = True
         self._encode(on_done, on_error)
@@ -288,7 +288,7 @@ class GifSetupDialog:
         win.title('Record GIF')
         win.configure(fg_color=BG)
         win.resizable(False, False)
-        # Only set transient when parent is mapped — transient to a withdrawn
+        # Only set transient when parent is mapped, transient to a withdrawn
         # parent hides the dialog on Windows, blocking it indefinitely.
         if self._parent.winfo_ismapped():
             win.transient(self._parent)

@@ -1,4 +1,8 @@
-"""Prompt Library — sticky-note grid with full CRUD."""
+"""Library, the central hub window. Houses every tab the app exposes:
+prompts, macros, screen recorder, GIF recorder, explain, web bookmarks,
+chains, notes, whiteboard, transcribe, audio editor, and reserved Shift+F11..F12 slots.
+The bare name "Library" is intentional now that this is more than a
+prompt manager."""
 import logging
 import math
 import os
@@ -28,7 +32,7 @@ from theme import (
 )
 
 CARD_W   = 300
-CARD_H   = 175   # fixed card height — all cards uniform regardless of text length
+CARD_H   = 175   # fixed card height, all cards uniform regardless of text length
 CARD_PAD = 16
 
 
@@ -110,8 +114,10 @@ class EditDialog(ctk.CTkToplevel):
             hk_row, text='', width=180, anchor='w',
             fg_color=SURF2, corner_radius=RADIUS_SM,
             font=(FONT_FAMILY, 12), text_color=TEXT_S,
+            cursor='hand2',
         )
         self._hk_badge.pack(side='left', ipady=4, ipadx=8)
+        self._hk_badge.bind('<Button-1>', lambda e: self._assign_hk())
         self._refresh_hk()
 
         _btn(hk_row, '⌨  Assign…', self._assign_hk, width=110).pack(side='left', padx=(8, 4))
@@ -142,19 +148,19 @@ class EditDialog(ctk.CTkToplevel):
                 'Copy an image to clipboard, then click to extract its text.\n'
                 'You can also press Ctrl+V in the text box above.')
 
-        # Thumbnail — always packed right after the button, just empty when idle
+        # Thumbnail, always packed right after the button, just empty when idle
         self._ocr_thumb_lbl = ctk.CTkLabel(ocr_row, text='', fg_color='transparent')
         self._ocr_thumb_lbl.pack(side='left', padx=(6, 0))
         self._ocr_thumb_ref = None   # keep CTkImage alive
 
-        # Char count — pinned to the right edge
+        # Char count, pinned to the right edge
         self._char_lbl = ctk.CTkLabel(
             ocr_row, text='', font=(FONT_FAMILY, 11), text_color=TEXT_S,
         )
         self._char_lbl.pack(side='right')
         self._update_char_count()
 
-        # Inline status message — centre of the row, changes during OCR
+        # Inline status message, centre of the row, changes during OCR
         self._ocr_status_lbl = ctk.CTkLabel(
             ocr_row, text='', font=(FONT_FAMILY, 11), text_color=TEXT_S,
         )
@@ -177,7 +183,7 @@ class EditDialog(ctk.CTkToplevel):
         # Right-click: Cut / Copy / smart Paste
         inner.bind('<Button-3>', self._show_text_context_menu, add='+')
 
-        # Description is auto-generated from prompt text on save — no manual field needed
+        # Description is auto-generated from prompt text on save, no manual field needed
 
         foot = ctk.CTkFrame(self, fg_color=SURFACE, corner_radius=0)
         foot.pack(fill='x')
@@ -195,7 +201,7 @@ class EditDialog(ctk.CTkToplevel):
                 text_color=ACCENTL, fg_color=SURF2,
             )
         else:
-            self._hk_badge.configure(text='  —  None assigned', text_color=TEXT_S, fg_color=SURFACE)
+            self._hk_badge.configure(text='— None assigned', text_color=TEXT_S, fg_color=SURFACE)
 
     def _assign_hk(self) -> None:
         if self._on_hotkey_suspend:
@@ -208,9 +214,10 @@ class EditDialog(ctk.CTkToplevel):
             return  # cancelled
         new_hk = dlg.result
         if new_hk and new_hk.strip().lower() in self._reserved_hotkeys:
-            alert(self, 'Hotkey reserved',
-                  f'"{new_hk.upper()}" is a system shortcut.\n'
-                  'Change system hotkeys in Settings first.')
+            alert(self, 'Hotkey already in use',
+                  f'"{new_hk.upper()}" is already assigned to a built-in '
+                  'Hotkeys action. Pick another combo, or reassign the '
+                  'built-in one in Settings → Hotkeys.')
             return
         self._hotkey = new_hk
         self._refresh_hk()
@@ -265,7 +272,20 @@ class EditDialog(ctk.CTkToplevel):
             else:
                 w.event_generate('<<Paste>>')
 
-        (PopupMenu(self)
+        pm = PopupMenu(self)
+
+        # ── Spell suggestions at top when cursor is on a misspelled word ──
+        spell = spellcheck.get_info(w, event.x, event.y)
+        if spell:
+            word, ws, we, suggestions = spell
+            for s in suggestions:
+                pm.add(s, lambda r=s, a=ws, b=we: spellcheck.apply_suggestion(w, a, b, r))
+            pm.separator()
+            pm.add('Ignore all',        lambda wrd=word: spellcheck.ignore_word(w, wrd))
+            pm.add('Add to dictionary', lambda wrd=word: spellcheck.add_word(w, wrd))
+            pm.separator()
+
+        (pm
             .add('Cut',   lambda: w.event_generate('<<Cut>>'),  enabled=has_sel)
             .add('Copy',  lambda: w.event_generate('<<Copy>>'), enabled=has_sel)
             .add('Paste', _smart_paste)
@@ -313,7 +333,7 @@ class EditDialog(ctk.CTkToplevel):
             self._ocr_set_status(f'⚠  {err}', WARN)
             return 'break'
         if img is None:
-            return None   # no image — fall through to normal text paste
+            return None   # no image, fall through to normal text paste
         self._ocr_stage(img)
         return 'break'
 
@@ -369,7 +389,10 @@ class EditDialog(ctk.CTkToplevel):
         if self._ocr_pending:
             return
         if self._vision_extractor is None:
-            alert(self, 'OCR unavailable', 'No vision extractor configured.')
+            alert(self, 'OCR needs a vision provider',
+                  'Reading text from images needs an AI provider that can '
+                  '"see". Open Settings → AI providers and add an OpenAI, '
+                  'Anthropic, Gemini, or Groq key.')
             return
 
         if img is None:
@@ -425,7 +448,7 @@ class EditDialog(ctk.CTkToplevel):
                 self._ocr_clear_status()
                 return
 
-        # Refusals are not inserted — just show the warning
+        # Refusals are not inserted, just show the warning
         issue = self._ocr_quality_issue(text)
         if issue in ('No text found', 'No text detected'):
             self._ocr_set_status(f'⚠ {issue}', WARN)
@@ -462,7 +485,7 @@ class EditDialog(ctk.CTkToplevel):
                 return
         except Exception:
             return
-        # Show error inline — no blocking dialog
+        # Show error inline, no blocking dialog
         short = message.split('\n')[0][:40]
         self._ocr_set_status(f'✕ {short}', ERR)
         self.after(4000, self._ocr_clear_status)
@@ -486,12 +509,12 @@ class HotkeyCapture(ctk.CTkToplevel):
     """Listens for the next key combination and returns it as a string.
 
     result after wait_window():
-        None  — user cancelled
-        ''    — user chose to clear the hotkey
-        str   — e.g. 'f12' or 'alt+shift+1'
+        None , user cancelled
+        ''   , user chose to clear the hotkey
+        str  , e.g. 'f12' or 'alt+shift+1'
 
     Design notes:
-    • keyboard.read_hotkey() runs in a daemon thread — never on the UI thread.
+    • keyboard.read_hotkey() runs in a daemon thread, never on the UI thread.
     • A 350 ms startup delay prevents the right-click / Enter that opened this
       dialog from being captured as the hotkey.
     • Live preview: the dialog updates the display label as modifier keys are
@@ -518,7 +541,7 @@ class HotkeyCapture(ctk.CTkToplevel):
         self.result: str | None = None
         self._done = False
 
-        # ── Header — matches SettingsWindow / ThemedDialog pattern ────────────
+        # ── Header, matches SettingsWindow / ThemedDialog pattern ────────────
         hdr = ctk.CTkFrame(self, fg_color=SURFACE, corner_radius=0)
         hdr.pack(fill='x')
         ctk.CTkLabel(hdr, text='⌨   Assign Hotkey',
@@ -539,11 +562,11 @@ class HotkeyCapture(ctk.CTkToplevel):
             ctk.CTkLabel(body, text=f'Current:  {current_hotkey.upper()}',
                          font=(FONT_FAMILY, 11), text_color=TEXT_S).pack(pady=(4, 0))
 
-        # Live preview chip — styled as a keyboard shortcut badge
+        # Live preview chip, styled as a keyboard shortcut badge
         chip = ctk.CTkFrame(body, fg_color=SURF2, corner_radius=RADIUS_SM,
                              border_width=1, border_color=BORDER2)
         chip.pack(pady=(PAD, 0))
-        self._preview_var = tk.StringVar(value='—')
+        self._preview_var = tk.StringVar(value=',')
         ctk.CTkLabel(chip, textvariable=self._preview_var,
                      font=(FONT_FAMILY, 15, 'bold'), text_color=ACCENTL,
                      width=210).pack(padx=PAD_LG, pady=PAD_SM)
@@ -551,7 +574,7 @@ class HotkeyCapture(ctk.CTkToplevel):
         # ── Separator ─────────────────────────────────────────────────────────
         ctk.CTkFrame(self, fg_color=BORDER, height=1, corner_radius=0).pack(fill='x')
 
-        # ── Footer — matches ThemedDialog pattern ─────────────────────────────
+        # ── Footer, matches ThemedDialog pattern ─────────────────────────────
         foot = ctk.CTkFrame(self, fg_color=SURFACE, corner_radius=0)
         foot.pack(fill='x')
         _btn(foot, 'Cancel', self._cancel, width=88).pack(side='right', padx=PAD, pady=PAD_SM)
@@ -567,7 +590,7 @@ class HotkeyCapture(ctk.CTkToplevel):
         """Start both the tkinter binding (for live preview) and the keyboard
         thread (for accurate cross-platform hotkey string capture)."""
         self.focus_force()
-        # tkinter binding for live preview only — shows modifier combos as held
+        # tkinter binding for live preview only, shows modifier combos as held
         self.bind('<KeyPress>',   self._on_key_preview)
         self.bind('<KeyRelease>', self._on_key_release)
         # Accurate capture in a daemon thread via the keyboard library.
@@ -583,9 +606,9 @@ class HotkeyCapture(ctk.CTkToplevel):
             return
         sym = event.keysym.lower()
         if sym in self._MODS:
-            # Just modifiers held — show them
+            # Just modifiers held, show them
             mods = self._get_mods(event.state)
-            self._preview_var.set('+'.join(mods) + '+…' if mods else '—')
+            self._preview_var.set('+'.join(mods) + '+…' if mods else ',')
         else:
             mods  = self._get_mods(event.state)
             parts = mods + [event.keysym.upper() if len(event.keysym) == 1 else event.keysym]
@@ -594,7 +617,7 @@ class HotkeyCapture(ctk.CTkToplevel):
     def _on_key_release(self, event) -> None:
         sym = event.keysym.lower()
         if sym in self._MODS and not self._done:
-            self._preview_var.set('—')
+            self._preview_var.set(',')
 
     @staticmethod
     def _get_mods(state: int) -> list[str]:
@@ -650,7 +673,7 @@ class HotkeyCapture(ctk.CTkToplevel):
 class FolderInputDialog(ctk.CTkToplevel):
     """Dialog for creating or renaming a folder.
 
-    result: dict | None — {'name': str, 'color': str} on save, None on cancel.
+    result: dict | None, {'name': str, 'color': str} on save, None on cancel.
     On rename, color defaults to the current folder color passed as current_color.
     """
 
@@ -689,7 +712,7 @@ class FolderInputDialog(ctk.CTkToplevel):
         )
         self._entry.pack(fill='x', pady=(4, PAD))
 
-        # Colour picker — same swatches as card editor
+        # Colour picker, same swatches as card editor
         ctk.CTkLabel(body, text='Folder colour', font=FONT_SM_BOLD,
                      text_color=TEXT_S).pack(anchor='w')
         cf = ctk.CTkFrame(body, fg_color='transparent')
@@ -747,8 +770,8 @@ class ChainEditDialog(ctk.CTkToplevel):
     """Create or edit a prompt chain.
 
     result after wait_window():
-        None  — cancelled
-        dict  — {'name', 'color', 'hotkey', 'steps': [{'label', 'prompt'}, ...]}
+        None , cancelled
+        dict , {'name', 'color', 'hotkey', 'steps': [{'label', 'prompt'}, ...]}
     """
 
     def __init__(self, parent, chain: dict | None = None,
@@ -769,7 +792,7 @@ class ChainEditDialog(ctk.CTkToplevel):
 
         data = chain or {'name': '', 'color': CARD_COLORS[0], 'hotkey': '', 'steps': []}
         self._hotkey = data.get('hotkey', '')
-        # Working copy of steps — list of {'label': str, 'prompt': str}
+        # Working copy of steps, list of {'label': str, 'prompt': str}
         self._steps: list[dict] = [dict(s) for s in data.get('steps', [])]
 
         # ── Header ─────────────────────────────────────────────────────────────
@@ -823,8 +846,10 @@ class ChainEditDialog(ctk.CTkToplevel):
             hk_row, text='', width=180, anchor='w',
             fg_color=SURF2, corner_radius=RADIUS_SM,
             font=(FONT_FAMILY, 12), text_color=TEXT_S,
+            cursor='hand2',
         )
         self._hk_badge.pack(side='left', ipady=4, ipadx=8)
+        self._hk_badge.bind('<Button-1>', lambda e: self._assign_hk())
         self._refresh_hk()
         _btn(hk_row, '⌨  Assign…', self._assign_hk, width=110).pack(side='left', padx=(8, 4))
         _btn(hk_row, '✕', self._clear_hk, width=36).pack(side='left')
@@ -874,7 +899,7 @@ class ChainEditDialog(ctk.CTkToplevel):
                 text_color=ACCENTL, fg_color=SURF2,
             )
         else:
-            self._hk_badge.configure(text='  —  None assigned', text_color=TEXT_S, fg_color=SURFACE)
+            self._hk_badge.configure(text='— None assigned', text_color=TEXT_S, fg_color=SURFACE)
 
     def _assign_hk(self) -> None:
         if self._on_hotkey_suspend:
@@ -885,7 +910,26 @@ class ChainEditDialog(ctk.CTkToplevel):
             self._on_hotkey_resume()
         if dlg.result is None:
             return
-        self._hotkey = dlg.result
+        new_hk = dlg.result
+        if new_hk:
+            try:
+                from hotkey_validator import (
+                    validate_hotkey, ERROR, WARN)
+                others = getattr(self, '_validator_other_hotkeys', None) or {}
+                this_action = f'chain:{getattr(self, "_name_var", None).get() if hasattr(self, "_name_var") else "Chain"}'
+                others.pop(this_action, None)
+                diag = validate_hotkey(new_hk, this_action,
+                                       other_assignments=others)
+                if diag.severity == ERROR:
+                    alert(self, 'Hotkey conflict', diag.message)
+                    return
+                if diag.severity == WARN:
+                    if not confirm(self, 'Conflicts with common shortcuts',
+                                   diag.message + '\n\nAssign anyway?'):
+                        return
+            except Exception:
+                pass  # validator unavailable, fall through
+        self._hotkey = new_hk
         self._refresh_hk()
 
     def _clear_hk(self) -> None:
@@ -901,7 +945,7 @@ class ChainEditDialog(ctk.CTkToplevel):
         if not self._steps:
             ctk.CTkLabel(
                 self._steps_frame,
-                text='No steps yet — add one below.',
+                text='No steps yet, add one below.',
                 font=(FONT_FAMILY, 12), text_color=TEXT_D,
             ).pack(anchor='w', pady=PAD_SM)
             return
@@ -937,7 +981,7 @@ class ChainEditDialog(ctk.CTkToplevel):
                 self._steps[ii]['label'] = var.get()
         lv.trace_add('write', _on_label_change)
 
-        # Prompt preview (truncated) — click to edit full prompt
+        # Prompt preview (truncated), click to edit full prompt
         prompt_text = step.get('prompt', '')
         preview = (prompt_text[:60] + '…') if len(prompt_text) > 60 else (prompt_text or '(click to set prompt)')
         prev_lbl = ctk.CTkLabel(
@@ -1051,7 +1095,7 @@ class ChainEditDialog(ctk.CTkToplevel):
         for p in self._prompts:
             ctk.CTkButton(
                 scroll,
-                text=p.get('title', '—'),
+                text=p.get('title', ','),
                 anchor='w', height=30,
                 fg_color='transparent', hover_color=SURF2,
                 text_color=TEXT_P, font=(FONT_FAMILY, 12),
@@ -1124,13 +1168,19 @@ class ChainEditDialog(ctk.CTkToplevel):
 class LibraryWindow:
     # Maps library tab key → config hotkeys key (for right-click rebind)
     _TAB_HOTKEY_MAP = {
-        'recorder': 'recorder',
-        'gif':      'gif_record',
-        'ask':      'ask',
-        'web':      'web',
-        'chains':   'chain',
-        'notes':    'notes',
+        'recorder':     'recorder',
+        'gif':          'gif_record',
+        'ask':          'ask',
+        'web':          'web',
+        'chains':       'chain',
+        'notes':        'notes',
+        'whiteboard':   'whiteboard',
+        'transcribe':   'transcribe',
+        'audio_editor': 'audio_editor',
     }
+
+    # No placeholder slots — F11/F12 will be wired when real features arrive.
+    _PLACEHOLDER_SLOTS = ()
 
     def __init__(self, root, prompts: list, on_select: Callable, on_save: Callable,
                  hotkey_cfg: dict | None = None,
@@ -1168,7 +1218,7 @@ class LibraryWindow:
         self._on_recorder_toggle: Callable | None = None  # set by main.py
         self._on_macro_toggle:   Callable | None = None  # set by main.py → fires macro:hotkey
         self._on_macro_reset:    Callable | None = None  # set by main.py → abort + clear
-        self._macro_state = 'idle'   # 'idle'|'recording'|'ready'|'playing' — mirrors main.py
+        self._macro_state = 'idle'   # 'idle'|'recording'|'ready'|'playing', mirrors main.py
         self._rec_tab_ticker    = None   # after() job id
         # GIF tab state
         self._gif_state   = 'idle'   # 'idle'|'recording'|'encoding'
@@ -1178,6 +1228,8 @@ class LibraryWindow:
         self._on_gif_toggle: Callable | None = None  # set by main.py → fires gif:toggle
         self._on_ask: Callable | None = None         # set by main.py → fires ('ask', text)
         self._on_new_note: Callable | None = None    # set by main.py → opens QuickNotesWindow
+        self._on_open_whiteboard: Callable | None = None  # set by main.py → opens Whiteboard
+        self._on_open_audio_editor: Callable | None = None  # set by main.py → toggles audio_editor
         self._active_tab         = 'prompts'   # 'prompts' | 'macros' | 'recorder' | 'gif' | 'ask'
         self.active_idx  = 0
         self._cards: list[ctk.CTkFrame] = []
@@ -1188,6 +1240,15 @@ class LibraryWindow:
         self._reflow_root_cards: list = []
         self._reflow_sep_widget = None
         self._reflow_folders: list = []   # [(fname, header_widget, [card_widgets])]
+        # Tab content cache: keep each tab's widgets alive across switches so
+        # re-visiting a tab is instant (grid_remove + grid instead of destroy
+        # + rebuild). The expensive render only runs on first visit or when
+        # explicitly invalidated by a data-mutation path via _render_cards.
+        self._tab_containers: dict[str, 'ctk.CTkFrame'] = {}
+        self._tab_built:     set[str] = set()
+        # Per-tab scroll position memory so switching away and back feels like
+        # picking up where you left off, not jumping to the top every time.
+        self._tab_scroll_pos: dict[str, float] = {}
         self._collapsed_folders: set[str] = set()
         self._folder_headers: dict[str, ctk.CTkFrame] = {}
         self._drag_folder_tgt: str | None = None
@@ -1197,7 +1258,7 @@ class LibraryWindow:
 
     def _build(self) -> None:
         self.win = ctk.CTkToplevel(self.root)
-        self.win.title('Prompt Library — Hotkeys')
+        self.win.title('Library, Hotkeys')
         self.win.configure(fg_color=BG)
         self.win.minsize(820, 460)
         self.win.withdraw()
@@ -1220,25 +1281,59 @@ class LibraryWindow:
         self._build_header()
         self._build_grid()
         self._render_cards()
+        # Pre-warm every other tab into a hidden container so the user's
+        # first click on any tab feels instant. Adds ~500ms-1s to startup
+        # (the heaviest is Transcribe, which builds ~100 widgets) but the
+        # window stays withdrawn so the user doesn't see it. By the time
+        # they press Alt+Shift+E for the first time, all tabs are hot.
+        _PREWARM_ORDER = (
+            'transcribe',       # heaviest, do first while we have momentum
+            'macros',
+            'chains',
+            'ask',
+            'web',
+            'recorder',
+            'gif',
+            'notes',
+            'whiteboard',
+            'audio_editor',
+        )
+        for _tk in _PREWARM_ORDER:
+            try:
+                self._prewarm_tab(_tk)
+            except Exception as _e:
+                _log.warning(f'pre-warm of {_tk} failed: {_e}')
         self._center()
         self.win.bind('<Configure>', self._on_resize)
         self.win.bind('<Map>', self._on_map_restore)
         self.win.bind('<FocusIn>', self._on_focus_in)
 
     def _build_header(self) -> None:
-        hdr = ctk.CTkFrame(self.win, fg_color=SURFACE, corner_radius=0, height=72)
+        # Taller header so we can fit the title + 3-second tagline + active-
+        # prompt indicator without crowding. The tagline is the elevator
+        # pitch: a layperson opening this window should grok "what's in
+        # here" before they finish reading it.
+        hdr = ctk.CTkFrame(self.win, fg_color=SURFACE, corner_radius=0, height=88)
         hdr.pack(fill='x')
         hdr.pack_propagate(False)
 
         left = ctk.CTkFrame(hdr, fg_color='transparent')
         left.pack(side='left', fill='y', padx=PAD)
-        ctk.CTkLabel(left, text='Prompt Library', font=(FONT_FAMILY, 15, 'bold'),
-                     text_color=TEXT_P).pack(anchor='w', pady=(12, 0))
+        ctk.CTkLabel(left, text='Library',
+                     font=(FONT_FAMILY, 16, 'bold'),
+                     text_color=TEXT_P).pack(anchor='w', pady=(10, 0))
+        # 3-second value-prop subtitle. Action verbs + emojis so the eye
+        # scans the row in under a second.
+        ctk.CTkLabel(
+            left,
+            text='Your hub for templates, voice typing, recordings, and more',
+            font=(FONT_FAMILY, 11), text_color=TEXT_S,
+        ).pack(anchor='w', pady=(0, 2))
         refine_hk = self.hotkey_cfg.get('refine', 'alt+shift+w').upper()
         self._active_lbl = ctk.CTkLabel(
             left,
-            text=f'{refine_hk}  →  {self.prompts[0]["title"] if self.prompts else "—"}',
-            font=(FONT_FAMILY, 12), text_color=TEXT_S,
+            text=f'{refine_hk}  →  {self.prompts[0]["title"] if self.prompts else ","}',
+            font=(FONT_FAMILY, 11), text_color=TEXT_S,
         )
         self._active_lbl.pack(anchor='w')
 
@@ -1276,7 +1371,7 @@ class LibraryWindow:
             f'{gif_hk_h} to start / stop GIF  ·  Auto-stops at max duration  ·  Esc to abort'
         )
         self._hint_ask_text = (
-            f'{ask_hk_h} to explain — select text, copy a screenshot, or type a question below'
+            f'{ask_hk_h} to explain, select text, copy a screenshot, or type a question below'
         )
         self._hint_web_text = (
             f'{web_hk_h} to open active bookmark  ·  Click any bookmark to open in browser'
@@ -1289,16 +1384,32 @@ class LibraryWindow:
         self._hint_notes_text = (
             f'{notes_hk_h} to open Quick Notes  ·  All your saved notes live here'
         )
+        wb_hk_h = hk.get('whiteboard', 'shift+f8').upper()
+        self._hint_whiteboard_text = (
+            f'{wb_hk_h} to open the Whiteboard  ·  Sketch, diagram, brainstorm, offline'
+        )
+        tr_hk_h = hk.get('transcribe', 'shift+f9').upper()
+        self._hint_transcribe_text = (
+            f'{tr_hk_h} to open Transcribe  ·  Audio/video → text with speakers & summary'
+        )
+        # Placeholder slots, same hint shape as the real tabs; the slot
+        # name and hotkey are the only varying parts.
+        self._hint_slot_text: dict[str, str] = {}
+        for _key, _label, _default_hk in self._PLACEHOLDER_SLOTS:
+            _h = hk.get(_key, _default_hk).upper()
+            self._hint_slot_text[_key] = (
+                f'{_h} reserved for {_label}  ·  Feature coming soon, right-click the tab to rebind'
+            )
 
         # ── Tab switcher row ──────────────────────────────────────────────────
         tab_row = ctk.CTkFrame(self.win, fg_color=SURFACE, corner_radius=0, height=38)
         tab_row.pack(fill='x')
         tab_row.pack_propagate(False)
 
-        def _make_tab_btn(text, tab_name):
+        def _make_tab_btn(text, tab_name, width=88):
             is_active = (self._active_tab == tab_name)
             btn = ctk.CTkButton(
-                tab_row, text=text, width=88,
+                tab_row, text=text, width=width,
                 fg_color=ACCENT if is_active else SURF2,
                 hover_color=ACCENTL if is_active else SURF3,
                 text_color=TEXT_P,
@@ -1311,24 +1422,65 @@ class LibraryWindow:
             if tab_name in self._TAB_HOTKEY_MAP:
                 btn.bind('<Button-3>', lambda e, t=tab_name: self._show_rebind_popup(t, e))
 
+        # Tab tooltips follow the principle: never repeat the label, never
+        # repeat the same instruction across tabs. Hotkey + use-case only.
+        # "Right-click to rebind" is shown once in the library hint bar
+        # instead of pasted on every tooltip.
         _make_tab_btn('✦  Prompts', 'prompts')
-        Tooltip(self._tab_btns['prompts'],  'AI prompt templates — click one to make it active,\nthen press Alt+Shift+W anywhere to refine selected text')
+        Tooltip(self._tab_btns['prompts'],
+                f'Pick the template Alt+Shift+W uses to transform selected text')
         _make_tab_btn('⏺  Macros', 'macros')
-        Tooltip(self._tab_btns['macros'],   f'Record & replay mouse/keyboard sequences\n{macro_hk_h} to start recording')
+        Tooltip(self._tab_btns['macros'],
+                f'{macro_hk_h} to record / replay a mouse + keyboard sequence')
         _make_tab_btn('🎥  Screen', 'recorder')
-        Tooltip(self._tab_btns['recorder'], f'Record your screen to a video file\n{recorder_hk_h} to start/stop\nRight-click to change hotkey')
+        Tooltip(self._tab_btns['recorder'],
+                f'{recorder_hk_h} to start / stop a video recording')
         _make_tab_btn('🎞  GIF', 'gif')
-        Tooltip(self._tab_btns['gif'],      f'{gif_hk_h} to start/stop\nRecord a screen region as an animated GIF\nRight-click to change hotkey')
+        Tooltip(self._tab_btns['gif'],
+                f'{gif_hk_h} to start / stop an animated GIF of a screen region')
         _make_tab_btn('✦  Explain', 'ask')
-        Tooltip(self._tab_btns['ask'],      f'{ask_hk_h} to ask / explain selected text\nAlt+Shift+W transforms text; this answers it\nRight-click to change hotkey')
+        Tooltip(self._tab_btns['ask'],
+                f'{ask_hk_h} to ask the AI about selected text '
+                f'(answers it instead of transforming it)')
         _make_tab_btn('🌐  Web', 'web')
-        Tooltip(self._tab_btns['web'],      f'{web_hk_h} to open active bookmark\nRight-click to change hotkey')
+        Tooltip(self._tab_btns['web'],
+                f'{web_hk_h} to open the active bookmark')
         chain_hk_h2 = hk.get('chain', 'shift+f6').upper()
         _make_tab_btn('⛓  Chains', 'chains')
-        Tooltip(self._tab_btns['chains'],   f'{chain_hk_h2} to run active chain on selected text\nRight-click to change hotkey')
+        Tooltip(self._tab_btns['chains'],
+                f'{chain_hk_h2} to run the active multi-step workflow on selected text')
         notes_hk_h2 = hk.get('notes', 'shift+f7').upper()
         _make_tab_btn('📝  Notes', 'notes')
-        Tooltip(self._tab_btns['notes'],    f'{notes_hk_h2} to open Quick Notes anywhere\nRight-click to change hotkey')
+        Tooltip(self._tab_btns['notes'],
+                f'{notes_hk_h2} to open Quick Notes anywhere')
+        wb_hk_h2 = hk.get('whiteboard', 'shift+f8').upper()
+        _make_tab_btn('🎨  Whiteboard', 'whiteboard')
+        Tooltip(self._tab_btns['whiteboard'],
+                f'{wb_hk_h2} to open it from anywhere')
+        tr_hk_h2 = hk.get('transcribe', 'shift+f9').upper()
+        _make_tab_btn('🎙  Transcribe', 'transcribe')
+        Tooltip(self._tab_btns['transcribe'],
+                f'{tr_hk_h2} to open it from anywhere')
+        ae_hk_h2 = hk.get('audio_editor', 'shift+f10').upper()
+        _make_tab_btn('🎵  Audio editor', 'audio_editor')
+        Tooltip(self._tab_btns['audio_editor'],
+                f'{ae_hk_h2} to open it from anywhere')
+        # ── Reserved Shift+F11..F12 placeholder tabs ────────────────────────
+        # Compact buttons, just the function-key label, so the tab row
+        # doesn't blow out horizontally. Tooltip still shows the full hint.
+        _slot_list = list(self._PLACEHOLDER_SLOTS)
+        for _i, (_key, _label, _default_hk) in enumerate(_slot_list):
+            _hk = hk.get(_key, _default_hk).upper()
+            _fn = _hk.split('+')[-1]  # 'F9' from 'SHIFT+F9'
+            _make_tab_btn(f'·  {_fn}', _key, width=56)
+            Tooltip(self._tab_btns[_key],
+                    f'{_hk} reserved for {_label}')
+        # Right margin on the strip: mirror the PAD spacing on the left
+        # of the first tab so the row breathes equally on both sides.
+        # An invisible spacer frame is simpler than fighting Tk's pack
+        # logic to add trailing padx on the last button.
+        ctk.CTkFrame(tab_row, fg_color=SURFACE, width=PAD, height=1
+                     ).pack(side='left')
 
         # "Open Folder" button is rendered inside the Macros tab content (_render_macro_cards)
 
@@ -1406,7 +1558,7 @@ class LibraryWindow:
         except Exception:
             return
         if new_cols == self._current_cols:
-            return  # nothing to do — column count unchanged
+            return  # nothing to do, column count unchanged
         self._current_cols = new_cols
         self._reflow_cards()
 
@@ -1416,12 +1568,12 @@ class LibraryWindow:
         if event and event.widget is not self.win:
             return   # ignore focus events bubbling from child widgets
         if self._active_tab == 'recorder':
-            self._render_recorder_tab()
+            self._invalidate_tab('recorder')
         elif self._active_tab == 'gif':
-            self._render_gif_tab()
+            self._invalidate_tab('gif')
 
     def _on_map_restore(self, event=None) -> None:
-        """Window restored from minimised — reflow to correct column count."""
+        """Window restored from minimised, reflow to correct column count."""
         if hasattr(self, '_resize_job') and self._resize_job:
             try:
                 self.win.after_cancel(self._resize_job)
@@ -1434,7 +1586,7 @@ class LibraryWindow:
         """Kill the DWM zoom-to-taskbar / zoom-to-fullscreen animations.
 
         Without this, maximize/minimize still show an animated transition
-        during which the window is briefly visible at intermediate sizes —
+        during which the window is briefly visible at intermediate sizes,
         WM_SETREDRAW alone can't suppress those DWM-composited frames.
         """
         try:
@@ -1460,7 +1612,7 @@ class LibraryWindow:
     def _reflow_cards(self) -> None:
         """Reposition existing card widgets for the current column count.
 
-        Zero widget creation/destruction — just moves widgets to new grid
+        Zero widget creation/destruction, just moves widgets to new grid
         cells.  Called on resize; _render_cards() is called when data changes.
         """
         cols = self._current_cols
@@ -1499,7 +1651,107 @@ class LibraryWindow:
                 if fcards:
                     current_row += math.ceil(len(fcards) / cols)
 
+    # ── Tab-content caching layer ─────────────────────────────────────────────
+    # Each tab gets its own CTkFrame inside self._scroll, kept alive across
+    # switches. Tab-switch path uses _show_active_tab, which hides others and
+    # shows the target (building it once on first visit). Data-mutation paths
+    # keep calling _render_cards, which now invalidates and rebuilds only the
+    # ACTIVE tab's container, leaving other cached tabs untouched. This makes
+    # repeat switches sub-100ms while still refreshing on data changes.
+
+    def _show_active_tab(self) -> None:
+        """Tab-switch entry: hide non-active containers, show the active one.
+        If first visit, build it. Never rebuilds an already-built tab."""
+        # Hide every cached container that isn't the active tab.
+        for k, c in self._tab_containers.items():
+            if k != self._active_tab:
+                try: c.grid_remove()
+                except Exception: pass
+
+        # Get or create the container for the active tab.
+        if self._active_tab not in self._tab_containers:
+            container = ctk.CTkFrame(self._scroll, fg_color='transparent')
+            container.columnconfigure(0, weight=1)
+            self._tab_containers[self._active_tab] = container
+
+        container = self._tab_containers[self._active_tab]
+        container.grid(row=0, column=0, sticky='nsew')
+
+        # Already built? Just show, no work.
+        if self._active_tab in self._tab_built:
+            return
+
+        # First visit: build the widgets. Swap self._scroll → container so the
+        # existing render methods (which use self._scroll as their parent)
+        # build into the container without modification.
+        real_scroll = self._scroll
+        self._scroll = container
+        try:
+            self._render_cards_impl()
+        finally:
+            self._scroll = real_scroll
+        self._tab_built.add(self._active_tab)
+
+    def _prewarm_tab(self, tab_key: str) -> None:
+        """Build *tab_key*'s widget tree into a hidden container so its
+        first user-visible visit is instant. No-op if already built.
+
+        Used during LibraryWindow construction to warm every tab off
+        the critical path. The user opted into a slower startup in
+        exchange for a smooth post-startup experience.
+        """
+        if tab_key in self._tab_built:
+            return
+        if tab_key not in self._tab_containers:
+            container = ctk.CTkFrame(self._scroll, fg_color='transparent')
+            container.columnconfigure(0, weight=1)
+            self._tab_containers[tab_key] = container
+        container = self._tab_containers[tab_key]
+        # Container intentionally NOT gridded, so it stays invisible.
+
+        # Swap state during the build so the existing render impl wires
+        # widgets into this hidden container without modification.
+        real_active = self._active_tab
+        real_scroll = self._scroll
+        self._active_tab = tab_key
+        self._scroll = container
+        try:
+            self._render_cards_impl()
+        finally:
+            self._active_tab = real_active
+            self._scroll = real_scroll
+        self._tab_built.add(tab_key)
+
+    def _invalidate_tab(self, tab: str) -> None:
+        """Mark *tab* as needing a full rebuild on its next visit. If *tab* is
+        currently active, rebuild immediately so the user sees fresh data."""
+        self._tab_built.discard(tab)
+        if self._active_tab != tab:
+            return  # next visit will rebuild
+        # Rebuild now into the cached container.
+        if tab not in self._tab_containers:
+            # No container yet, normal show path will build it.
+            self._show_active_tab()
+            return
+        c = self._tab_containers[tab]
+        for w in c.winfo_children():
+            try: w.destroy()
+            except Exception: pass
+        real_scroll = self._scroll
+        self._scroll = c
+        try:
+            self._render_cards_impl()
+        finally:
+            self._scroll = real_scroll
+        self._tab_built.add(tab)
+
     def _render_cards(self) -> None:
+        """Data-mutation entry: invalidate the active tab and rebuild it.
+        Tab switches should call _show_active_tab instead, which preserves
+        the cache."""
+        self._invalidate_tab(self._active_tab)
+
+    def _render_cards_impl(self) -> None:
         if self._active_tab == 'macros':
             self._render_macro_cards()
             return
@@ -1520,6 +1772,18 @@ class LibraryWindow:
             return
         if self._active_tab == 'notes':
             self._render_notes_tab()
+            return
+        if self._active_tab == 'whiteboard':
+            self._render_whiteboard_tab()
+            return
+        if self._active_tab == 'transcribe':
+            self._render_transcribe_tab()
+            return
+        if self._active_tab == 'audio_editor':
+            self._render_audio_editor_tab()
+            return
+        if self._active_tab.startswith('slot'):
+            self._render_slot_tab(self._active_tab)
             return
 
         for w in self._scroll.winfo_children():
@@ -1572,7 +1836,7 @@ class LibraryWindow:
 
         current_row = 0
 
-        # ── Root cards (no folder) — displayed first ──────────────────────────
+        # ── Root cards (no folder), displayed first ──────────────────────────
         root_cards_widgets: list = []
         for card_pos_in_group, orig_i in enumerate(root_group):
             card_pos = len(self._cards)
@@ -1596,7 +1860,7 @@ class LibraryWindow:
             self._sep_widget = sep
             current_row += 1
 
-        # ── Folder groups — displayed below root as card-sized folder widgets ─
+        # ── Folder groups, displayed below root as card-sized folder widgets ─
         reflow_folders: list = []
         for fname in self._folders:
             group = folder_groups[fname]
@@ -1642,7 +1906,7 @@ class LibraryWindow:
             active_card_pos = -1
         self._highlight(active_card_pos)
 
-        # Re-bind right-click on scroll canvas — card widgets added above can
+        # Re-bind right-click on scroll canvas, card widgets added above can
         # steal events from the canvas in the empty space between/after them.
         for attr in ('_parent_canvas', '_canvas'):
             try:
@@ -1663,7 +1927,7 @@ class LibraryWindow:
         outer = ctk.CTkFrame(self._scroll, fg_color=color,
                               corner_radius=RADIUS, border_width=2, border_color=BG)
 
-        # ── Folder tab row — mimics the raised tab on a manila folder ─────────
+        # ── Folder tab row, mimics the raised tab on a manila folder ─────────
         tab_row = ctk.CTkFrame(outer, fg_color='transparent', height=32)
         tab_row.pack(fill='x')
         tab_row.pack_propagate(False)
@@ -1706,7 +1970,7 @@ class LibraryWindow:
         menu_btn.configure(font=(FONT_FAMILY, 14))
         menu_btn.place(relx=1.0, x=-8, y=36, anchor='ne')
 
-        # ── Bindings — toggle on click, menu on right-click ───────────────────
+        # ── Bindings, toggle on click, menu on right-click ───────────────────
         def _toggle(e=None, n=name):
             if n in self._collapsed_folders:
                 self._collapsed_folders.discard(n)
@@ -1740,14 +2004,14 @@ class LibraryWindow:
 
     def _make_card(self, card_pos: int, orig_i: int, prompt: dict) -> ctk.CTkFrame:
         """
-        card_pos  — position in the filtered/displayed card list (used for drag-and-drop)
-        orig_i    — index into self.prompts (used for all data operations)
+        card_pos , position in the filtered/displayed card list (used for drag-and-drop)
+        orig_i   , index into self.prompts (used for all data operations)
         """
         color = prompt.get('color', CARD_COLORS[orig_i % len(CARD_COLORS)])
         outer = ctk.CTkFrame(self._scroll, fg_color=color, corner_radius=RADIUS,
                              border_width=2, border_color=BG,
                              width=CARD_W, height=CARD_H)
-        outer.pack_propagate(False)   # lock height — card never grows with content
+        outer.pack_propagate(False)   # lock height, card never grows with content
         outer.grid_propagate(False)
 
         title_lbl = ctk.CTkLabel(outer, text=prompt['title'],
@@ -1776,7 +2040,7 @@ class LibraryWindow:
 
         preview_lbl.pack(fill='both', expand=True, padx=12, pady=(0, 12))
 
-        # ✕ button — placed AFTER pack() children so it renders on top
+        # ✕ button, placed AFTER pack() children so it renders on top
         del_btn = ctk.CTkButton(
             outer, text='✕', width=26, height=26,
             fg_color=_darken(color, 0.72), hover_color=_darken(color, 0.58),
@@ -1869,7 +2133,7 @@ class LibraryWindow:
         if dlg.result:
             updated = dict(self.prompts[orig_i])
             updated.update(dlg.result)
-            # Hotkey: '' means the user cleared it — remove the key entirely
+            # Hotkey: '' means the user cleared it, remove the key entirely
             if not updated.get('hotkey'):
                 updated.pop('hotkey', None)
             self.prompts[orig_i] = updated
@@ -1917,7 +2181,7 @@ class LibraryWindow:
                 total_h  = bbox[3]
                 canvas_h = canvas.winfo_height()
                 if total_h <= canvas_h:
-                    return   # everything fits — nothing to scroll
+                    return   # everything fits, nothing to scroll
                 # Card y relative to scrollable content frame
                 card_y = card.winfo_rooty() - self._scroll._parent_frame.winfo_rooty()
                 card_h = card.winfo_height()
@@ -1939,56 +2203,64 @@ class LibraryWindow:
             self._on_hotkey_suspend()
         dlg = HotkeyCapture(self.win, current_hotkey=current)
         self.win.wait_window(dlg)
-        # Always resume — if on_save is also called below it will re-register
+        # Always resume, if on_save is also called below it will re-register
         # again, but the pending-flag loop handles that gracefully
         if self._on_hotkey_resume:
             self._on_hotkey_resume()
         if dlg.result is None:
-            return   # cancelled — no change
+            return   # cancelled, no change
 
         new_hk = dlg.result  # '' = clear, str = assign
 
-        # Guard: reject hotkeys reserved for app-wide actions (refine / library / whisper).
-        # These are read from hotkey_cfg so they respect whatever the user set in Settings.
+        # Centralised conflict validator, checks syntax, OS-reserved,
+        # collisions across app/prompts/chains/macros, and surfaces
+        # whiteboard / risky-key warnings.
         if new_hk:
-            _LABEL = {
-                'refine':  'the Refine shortcut',
-                'library': 'the Prompt Library shortcut',
-                'whisper': 'the Whisper / Speech-to-text shortcut',
-            }
-            _reserved_hk = new_hk.strip().lower()
-            for _action, _hk in self.hotkey_cfg.items():
-                if _hk and _hk.strip().lower() == _reserved_hk:
-                    alert(
-                        self.win, 'Hotkey reserved',
-                        f'"{new_hk.upper()}" is {_LABEL.get(_action, "a system shortcut")}.\n\n'
-                        f'To use it here, reassign the system shortcuts in Settings first.',
-                    )
-                    return
-
-        # Check if this hotkey is already used by a different prompt
-        if new_hk:
-            conflict_i = next(
-                (i for i, p in enumerate(self.prompts)
-                 if i != orig_i and p.get('hotkey', '').strip().lower() == new_hk.strip().lower()),
-                None,
+            from hotkey_validator import (
+                validate_hotkey, collect_app_hotkeys, normalize_hotkey,
+                ERROR, WARN)
+            this_action = f'prompt:{self.prompts[orig_i].get("title", "Prompt")}'
+            others = collect_app_hotkeys(
+                {'hotkeys': dict(self.hotkey_cfg or {})},
+                prompts=self.prompts, chains=getattr(self, 'chains', None),
+                macros=getattr(self, '_macros_for_validate', None),
             )
-            if conflict_i is not None:
-                conflict_title = self.prompts[conflict_i].get('title', f'Prompt {conflict_i + 1}')
-                this_title     = self.prompts[orig_i].get('title', f'Prompt {orig_i + 1}')
-                ok = confirm(
-                    self.win,
-                    'Hotkey already in use',
-                    f'"{new_hk.upper()}" is already assigned to "{conflict_title}".\n\n'
-                    f'Reassign it to "{this_title}"?',
-                    action_label='Reassign',
+            others.pop(this_action, None)  # don't compare against ourselves
+            diag = validate_hotkey(new_hk, this_action, other_assignments=others)
+            if diag.severity == ERROR:
+                # Special-case prompt↔prompt collisions so we keep the
+                # existing "reassign?" UX (move the binding from the other
+                # prompt). Other ERROR types (OS-reserved, app/chain/macro
+                # collision) just block.
+                conflict_i = next(
+                    (i for i, p in enumerate(self.prompts)
+                     if i != orig_i and
+                        normalize_hotkey(p.get('hotkey', '')) ==
+                        normalize_hotkey(new_hk)),
+                    None,
                 )
-                if not ok:
+                if conflict_i is not None:
+                    conflict_title = self.prompts[conflict_i].get(
+                        'title', f'Prompt {conflict_i + 1}')
+                    this_title = self.prompts[orig_i].get(
+                        'title', f'Prompt {orig_i + 1}')
+                    ok = confirm(
+                        self.win, 'Hotkey already in use',
+                        f'"{new_hk.upper()}" is already assigned to '
+                        f'"{conflict_title}".\n\nReassign it to '
+                        f'"{this_title}"?', action_label='Reassign')
+                    if not ok:
+                        return
+                    old = dict(self.prompts[conflict_i])
+                    old.pop('hotkey', None)
+                    self.prompts[conflict_i] = old
+                else:
+                    alert(self.win, 'Hotkey conflict', diag.message)
                     return
-                # Remove from the old prompt
-                old = dict(self.prompts[conflict_i])
-                old.pop('hotkey', None)
-                self.prompts[conflict_i] = old
+            elif diag.severity == WARN:
+                if not confirm(self.win, 'Conflicts with common shortcuts',
+                               diag.message + '\n\nAssign anyway?'):
+                    return
 
         updated = dict(self.prompts[orig_i])
         if new_hk == '':
@@ -2033,7 +2305,7 @@ class LibraryWindow:
         if self._drag_src is None:
             return
         if not self._dragging:
-            # Low threshold — feels immediately responsive like Windows
+            # Low threshold, feels immediately responsive like Windows
             if abs(event.x_root - self._drag_x0) > 3 or abs(event.y_root - self._drag_y0) > 3:
                 self._dragging = True
                 self._start_ghost(event.x_root, event.y_root)
@@ -2186,7 +2458,7 @@ class LibraryWindow:
             self._render_cards()
 
         elif dragging and src_pos is not None:
-            # ── Dropped in empty space — check if in the root zone ────────────
+            # ── Dropped in empty space, check if in the root zone ────────────
             try:
                 src_orig = self._filtered_idxs[src_pos]
             except IndexError:
@@ -2205,7 +2477,7 @@ class LibraryWindow:
                 self._highlight(active_card_pos)
 
         elif not dragging and src_pos is not None:
-            # Plain click — select by original index
+            # Plain click, select by original index
             self._select(orig_i)
         else:
             try:
@@ -2248,14 +2520,14 @@ class LibraryWindow:
             active_card_pos = -1
         for i, card in enumerate(self._cards):
             if i == self._drag_src:
-                card.configure(border_color=BORDER2, border_width=2)   # dimmed — being lifted
+                card.configure(border_color=BORDER2, border_width=2)   # dimmed, being lifted
             elif i == self._drag_over:
                 card.configure(border_color=ACCENT, border_width=3)       # target slot
             elif i == active_card_pos:
                 card.configure(border_color=ACCENTL, border_width=3)
             else:
                 card.configure(border_color=BG, border_width=2)
-        # Highlight folder card — strong ACCENT glow when it's the drop target
+        # Highlight folder card, strong ACCENT glow when it's the drop target
         for fname, fcard in self._folder_headers.items():
             try:
                 if fname == self._drag_folder_tgt:
@@ -2335,7 +2607,7 @@ class LibraryWindow:
             self._do_remove_folder(name, delete_prompts=False)
             return
 
-        # Non-empty — three-button dialog
+        # Non-empty, three-button dialog
         choice: list[str] = []   # populated by button callbacks
 
         dlg = ctk.CTkToplevel(self.win)
@@ -2407,7 +2679,7 @@ class LibraryWindow:
         if delete_prompts:
             remaining = [p for p in self.prompts if p.get('folder', '') != name]
             if not remaining:
-                # Deleting this folder would remove every prompt — block it.
+                # Deleting this folder would remove every prompt, block it.
                 alert(self.win, 'Cannot delete',
                       f'All prompts are inside "{name}".\n'
                       'Move some out first, or use "Just delete folder".')
@@ -2461,44 +2733,91 @@ class LibraryWindow:
             self._hint_lbl.configure(text=self._hint_chains_text)
         elif self._active_tab == 'notes':
             self._hint_lbl.configure(text=self._hint_notes_text)
+        elif self._active_tab == 'whiteboard':
+            self._hint_lbl.configure(text=self._hint_whiteboard_text)
+        elif self._active_tab == 'transcribe':
+            self._hint_lbl.configure(text=self._hint_transcribe_text)
+        elif self._active_tab in self._hint_slot_text:
+            self._hint_lbl.configure(text=self._hint_slot_text[self._active_tab])
         else:
             self._hint_lbl.configure(text=self._hint_prompts_text)
 
     def _switch_tab(self, tab: str) -> None:
+        # Bail out fast on no-op clicks.
+        if tab == self._active_tab and tab in self._tab_built:
+            return
+
+        prev = self._active_tab
         self._active_tab = tab
-        for name, btn in self._tab_btns.items():
-            is_active = (name == tab)
-            btn.configure(
-                fg_color=ACCENT if is_active else SURF2,
-                hover_color=ACCENTL if is_active else SURF3,
-            )
-        # Update hint bar text
-        self._sync_hint_bar()
-        # Show search bar only on Prompts tab — re-pack scroll to ensure order
+
+        # ── 1. Tab button colours: only flip the two that changed ─────────────
+        # CTk's configure() is expensive (color tag recompute + repaint).
+        # Looping over all 12 buttons used to cost ~300-500ms per switch.
+        # The only buttons whose visual state actually changes on a switch
+        # are the previously-active one (loses accent) and the new one
+        # (gains accent). Touching just those two is ~10× faster.
+        if prev in self._tab_btns and prev != tab:
+            try: self._tab_btns[prev].configure(
+                fg_color=SURF2, hover_color=SURF3)
+            except Exception: pass
+        if tab in self._tab_btns:
+            try: self._tab_btns[tab].configure(
+                fg_color=ACCENT, hover_color=ACCENTL)
+            except Exception: pass
+
+        # ── 2. Search bar: repack only when crossing the prompts↔other line ──
+        # Going from macros to notes etc shouldn't touch the search bar at
+        # all. pack/forget on every switch was an unnecessary relayout cost.
         if self._search_bar_frame:
-            if tab == 'prompts':
-                self._scroll.pack_forget()
-                self._search_bar_frame.pack(fill='x', padx=0, pady=0)
-                self._scroll.pack(fill='both', expand=True, padx=PAD, pady=PAD)
-                # Sync entry text to match _search_var (in case it drifted)
-                try:
-                    current = self._search_var.get()
-                    self._search_entry.delete(0, 'end')
-                    if current:
-                        self._search_entry.insert(0, current)
-                except Exception:
-                    pass
-            else:
-                self._search_bar_frame.pack_forget()
-        self._render_cards()
-        # Scroll to top AFTER rendering so the new content is visible.
-        # update_idletasks flushes pending <Configure> events so the canvas
-        # scrollregion reflects the new content before we reset the yview.
-        # (Doing this BEFORE render left the view anchored to the old position
-        # whenever the new content was shorter than the previous tab.)
+            prev_was_prompts = (prev == 'prompts')
+            new_is_prompts   = (tab == 'prompts')
+            if prev_was_prompts != new_is_prompts:
+                if new_is_prompts:
+                    self._scroll.pack_forget()
+                    self._search_bar_frame.pack(fill='x', padx=0, pady=0)
+                    self._scroll.pack(fill='both', expand=True, padx=PAD, pady=PAD)
+                    try:
+                        current = self._search_var.get()
+                        self._search_entry.delete(0, 'end')
+                        if current:
+                            self._search_entry.insert(0, current)
+                    except Exception:
+                        pass
+                else:
+                    self._search_bar_frame.pack_forget()
+
+        # ── 3. Save the scroll position of the tab we're leaving ─────────────
         try:
-            self._scroll.update_idletasks()
-            self._scroll._parent_canvas.yview_moveto(0)
+            self._tab_scroll_pos[prev] = self._scroll._parent_canvas.yview()[0]
+        except Exception:
+            pass
+
+        # ── 4. Cache-aware swap to the new tab (already fast) ────────────────
+        is_first_build = (tab not in self._tab_built)
+        self._show_active_tab()
+
+        # ── 5. Hint bar update deferred to next idle cycle ───────────────────
+        # The user's eye is on the content area, not the hint bar. Deferring
+        # this lets the visual swap paint first, then the hint catches up
+        # without blocking. Drops perceived latency on the swap itself.
+        try:
+            self._scroll.after_idle(self._sync_hint_bar)
+        except Exception:
+            self._sync_hint_bar()
+
+        # ── 6. Scroll position: fresh build → top, cached → restore ──────────
+        # update_idletasks forces a synchronous layout flush, ~50-100ms.
+        # We only need it when the content is brand new (canvas scrollregion
+        # hasn't seen these widgets yet). For cached tabs the layout is
+        # already valid, so we skip the flush entirely.
+        try:
+            cv = self._scroll._parent_canvas
+            if is_first_build:
+                self._scroll.update_idletasks()
+                cv.yview_moveto(0)
+            else:
+                saved = self._tab_scroll_pos.get(tab, 0)
+                cv.yview_moveto(saved)
         except Exception:
             pass
 
@@ -2551,7 +2870,7 @@ class LibraryWindow:
         if self._macro_state != 'idle':
             state_labels = {
                 'recording': ('⏺  Recording in progress…', ERR),
-                'ready':     ('⏹  Recording stopped — ready to play', ACCENT),
+                'ready':     ('⏹  Recording stopped, ready to play', ACCENT),
                 'playing':   ('▶  Playback in progress…', OK),
             }
             label_text, label_color = state_labels.get(
@@ -2591,7 +2910,7 @@ class LibraryWindow:
             ctk.CTkLabel(card, text='No macros saved yet',
                          font=(FONT_FAMILY, 15, 'bold'), text_color=TEXT_P).pack()
             ctk.CTkLabel(card,
-                         text='Record any sequence of mouse moves, clicks, and key presses — then replay it any time.',
+                         text='Record any sequence of mouse moves, clicks, and key presses, then replay it any time.',
                          font=(FONT_FAMILY, 12), text_color=TEXT_S,
                          wraplength=400, justify='center').pack(pady=(4, PAD))
 
@@ -2606,7 +2925,7 @@ class LibraryWindow:
             _mhk2 = self.hotkey_cfg.get('macro_record', 'shift+f1').upper()
             steps = [
                 ('1', f'Press  {_mhk2}  to start recording'),
-                ('2', 'Do your actions — mouse, clicks, or typing'),
+                ('2', 'Do your actions, mouse, clicks, or typing'),
                 ('3', f'Press  {_mhk2}  again to stop'),
                 ('4', f'Press  {_mhk2}  once more to play it back'),
                 ('5', 'Choose  Save  to keep it here with a name & hotkey'),
@@ -2830,8 +3149,38 @@ class LibraryWindow:
         if dlg.result is None:
             return   # cancelled
 
+        new_hk = dlg.result
+        if new_hk:
+            try:
+                from hotkey_validator import (
+                    validate_hotkey, collect_app_hotkeys, ERROR, WARN)
+                macros_list = (self._macro_library.macros
+                               if self._macro_library else None)
+                others = collect_app_hotkeys(
+                    {'hotkeys': dict(self.hotkey_cfg or {})},
+                    prompts=self.prompts,
+                    chains=getattr(self, 'chains', None),
+                    macros=macros_list,
+                )
+                this_name = next((m.get('name', mid)
+                                  for m in (macros_list or [])
+                                  if m['id'] == mid), mid)
+                this_action = f'macro:{this_name}'
+                others.pop(this_action, None)
+                diag = validate_hotkey(new_hk, this_action,
+                                       other_assignments=others)
+                if diag.severity == ERROR:
+                    alert(self.win, 'Hotkey conflict', diag.message)
+                    return
+                if diag.severity == WARN:
+                    if not confirm(self.win, 'Conflicts with common shortcuts',
+                                   diag.message + '\n\nAssign anyway?'):
+                        return
+            except Exception:
+                pass
+
         if self._macro_library:
-            self._macro_library.assign_hotkey(mid, dlg.result)
+            self._macro_library.assign_hotkey(mid, new_hk)
         if self._on_macro_hotkeys_changed:
             self._on_macro_hotkeys_changed()
         self._render_cards()
@@ -2847,9 +3196,11 @@ class LibraryWindow:
             self._render_cards()
 
     def refresh_macros(self) -> None:
-        """Public method — re-renders macro cards if Macros tab is active."""
-        if self._active_tab == 'macros':
-            self._render_macro_cards()
+        """Public method, invalidates macros tab cache so the next visit
+        re-renders with current data. Uses _invalidate_tab (which writes to
+        the per-tab container) instead of calling _render_macro_cards
+        directly (which would write to raw self._scroll, missing the cache)."""
+        self._invalidate_tab('macros')
 
     # ── Recorder tab ─────────────────────────────────────────────────────────
 
@@ -2904,7 +3255,7 @@ class LibraryWindow:
             ).pack(pady=(0, PAD))
 
         elif state == 'recording':
-            # Live timer label — updated by ticker
+            # Live timer label, updated by ticker
             ctk.CTkLabel(card, text='⏺  Recording…',
                          font=(FONT_FAMILY, 13, 'bold'), text_color=ERR).pack(pady=(PAD, 2))
             self._rec_time_lbl = ctk.CTkLabel(
@@ -3015,8 +3366,9 @@ class LibraryWindow:
                         remove_from_recordings_index(path)
                     except Exception:
                         pass
-                    if self._active_tab == 'recorder':
-                        self._render_recorder_tab()
+                    # Use _invalidate_tab so the per-tab container gets the
+                    # update, not raw self._scroll.
+                    self._invalidate_tab('recorder')
 
                 ctk.CTkButton(
                     btn_row, text='▶  Play', width=70, height=26,
@@ -3032,7 +3384,7 @@ class LibraryWindow:
                 ).pack(side='left')
 
         else:
-            # No recordings exist — show hint regardless of current recorder state
+            # No recordings exist, show hint regardless of current recorder state
             no_rec = ctk.CTkFrame(self._scroll, fg_color='transparent')
             no_rec.grid(row=1, column=0, columnspan=2, pady=8)
             ctk.CTkLabel(
@@ -3059,18 +3411,26 @@ class LibraryWindow:
     def update_recorder_state(self, state: str,
                                elapsed: float = 0.0,
                                size_mb: float = 0.0) -> None:
-        """Called by main.py when recording state changes or ticks."""
+        """Called by main.py when recording state changes or ticks.
+
+        IMPORTANT: must go through `_invalidate_tab('recorder')` instead of
+        calling `_render_recorder_tab()` directly. The direct render writes
+        into `self._scroll`, but per-tab content actually lives in
+        `_tab_containers['recorder']`. Direct render = widgets land in the
+        wrong place + tab cache stays stale, so a recording saved while
+        another tab is active never shows up on the recorder tab.
+        """
         self._recorder_state   = state
         self._recorder_elapsed = elapsed
         self._recorder_size_mb = size_mb
-        if self._active_tab == 'recorder':
-            if state in ('idle', 'stopping'):
-                # Full re-render so button and list update
-                self._render_recorder_tab()
-            elif state == 'recording':
-                # Just update labels without full re-render if ticker is running
+        if state in ('idle', 'stopping'):
+            # State changed — recorder tab cache is stale, invalidate so
+            # next visit (or current view) rebuilds with the new state.
+            self._invalidate_tab('recorder')
+        elif state == 'recording':
+            if self._active_tab == 'recorder':
                 if self._rec_tab_ticker is None:
-                    self._render_recorder_tab()
+                    self._invalidate_tab('recorder')
                 else:
                     try:
                         m, s = divmod(int(elapsed), 60)
@@ -3079,28 +3439,35 @@ class LibraryWindow:
                             text=f'{size_mb:.1f} MB  /  1,024 MB cap')
                     except Exception:
                         pass
+            else:
+                # Recording started while user is on a different tab.
+                # Invalidate so the recorder tab rebuilds with the live state
+                # when they switch to it.
+                self._invalidate_tab('recorder')
 
     # ── GIF tab ───────────────────────────────────────────────────────────────
 
     def update_gif_state(
         self, state: str, elapsed: float = 0.0, frames: int = 0
     ) -> None:
-        """Called by main.py whenever GIF recorder state changes."""
+        """Called by main.py whenever GIF recorder state changes.
+
+        Same fix as update_recorder_state: use _invalidate_tab not direct render.
+        """
         self._gif_state   = state
         self._gif_elapsed = elapsed
         self._gif_frames  = frames
-        if self._active_tab == 'gif':
-            if state in ('idle', 'encoding'):
-                self._render_gif_tab()
-            elif state == 'recording':
-                if self._gif_tab_ticker is None:
-                    self._render_gif_tab()
-                else:
-                    try:
-                        self._gif_time_lbl.configure(
-                            text=f'{int(elapsed)}s  ·  {frames} frames')
-                    except Exception:
-                        pass
+        if state in ('idle', 'encoding'):
+            self._invalidate_tab('gif')
+        elif state == 'recording':
+            if self._active_tab == 'gif' and self._gif_tab_ticker is not None:
+                try:
+                    self._gif_time_lbl.configure(
+                        text=f'{int(elapsed)}s  ·  {frames} frames')
+                except Exception:
+                    pass
+            else:
+                self._invalidate_tab('gif')
 
     def _render_gif_tab(self) -> None:
         """Render the GIF tab contents inside self._scroll."""
@@ -3170,7 +3537,7 @@ class LibraryWindow:
                 command=_stop,
             ).pack(pady=(0, PAD))
 
-            # Live ticker — update elapsed/frames every second
+            # Live ticker, update elapsed/frames every second
             def _tick():
                 if self._active_tab != 'gif' or self._gif_state != 'recording':
                     self._gif_tab_ticker = None
@@ -3275,7 +3642,7 @@ class LibraryWindow:
             ).pack()
 
     def _render_ask_tab(self) -> None:
-        """Render the Ask tab — type a question or use Shift+F4 on selected text."""
+        """Render the Ask tab, type a question or use Shift+F4 on selected text."""
         for w in self._scroll.winfo_children():
             w.destroy()
         self._cards.clear()
@@ -3348,7 +3715,7 @@ class LibraryWindow:
 
         self._ask_entry.bind('<FocusIn>',  _on_focus_in)
         self._ask_entry.bind('<FocusOut>', _on_focus_out)
-        # CTkTextbox wraps an inner tk.Text widget — bind there too
+        # CTkTextbox wraps an inner tk.Text widget, bind there too
         # so FocusOut fires reliably when the user clicks away
         try:
             self._ask_entry._textbox.bind('<FocusIn>',  _on_focus_in, add='+')
@@ -3416,7 +3783,7 @@ class LibraryWindow:
     # ── Chains tab ────────────────────────────────────────────────────────────
 
     def _render_chains_tab(self) -> None:
-        """Render the Chains tab — ordered list of chains with active toggle, edit, delete."""
+        """Render the Chains tab, ordered list of chains with active toggle, edit, delete."""
         from storage import load_chains, save_chains
 
         for w in self._scroll.winfo_children():
@@ -3448,7 +3815,7 @@ class LibraryWindow:
             self.win.wait_window(dlg)
             if dlg.result:
                 new_chain = dlg.result
-                # Always reload from disk — avoid stale closure (CRITICAL-2)
+                # Always reload from disk, avoid stale closure (CRITICAL-2)
                 _chains = load_chains()
                 if not _chains:
                     new_chain['active'] = True
@@ -3625,147 +3992,52 @@ class LibraryWindow:
     # ── Notes tab ─────────────────────────────────────────────────────────────
 
     def _render_notes_tab(self) -> None:
-        """Render the Notes tab — note list with type icons, color borders, pin, delete."""
-        from storage import load_notes, save_notes as _save_notes
-        from datetime import datetime, timedelta
-
+        """Notes tab is a splash card, the actual note list lives inside the
+        Quick Notes window itself (Shift+F7). Mirrors the Whiteboard tab
+        pattern so the Library tab strip stays consistent and the user is
+        never shown two interfaces for the same content.
+        """
         for w in self._scroll.winfo_children():
             w.destroy()
+        self._cards.clear()
+        self._folder_headers.clear()
+
+        for _c in range(max(2, self._current_cols) + 1):
+            self._scroll.columnconfigure(_c, weight=0)
+        self._scroll.columnconfigure(0, weight=1)
 
         notes_hk = self.hotkey_cfg.get('notes', 'shift+f7').upper()
-        raw      = load_notes()
-        # Sort: pinned first (newest), then unpinned (newest)
-        pinned   = list(reversed([n for n in raw if n.get('pinned')]))
-        unpinned = list(reversed([n for n in raw if not n.get('pinned')]))
-        all_notes = pinned + unpinned
 
         container = ctk.CTkFrame(self._scroll, fg_color='transparent')
-        container.pack(fill='both', expand=True, padx=PAD, pady=PAD)
+        container.grid(row=0, column=0, sticky='ew', padx=PAD, pady=PAD)
         container.columnconfigure(0, weight=1)
 
-        # ── Toolbar ───────────────────────────────────────────────────────────
-        toolbar = ctk.CTkFrame(container, fg_color='transparent')
-        toolbar.grid(row=0, column=0, sticky='ew', pady=(0, PAD_SM))
-        toolbar.columnconfigure(0, weight=1)
+        # ── Header card ───────────────────────────────────────────────────────
+        hdr = ctk.CTkFrame(container, fg_color=SURFACE, corner_radius=RADIUS_SM)
+        hdr.grid(row=0, column=0, sticky='ew')
+        hdr.columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            hdr, text='📝  Quick Notes',
+            font=(FONT_FAMILY, 15, 'bold'), text_color=TEXT_P,
+        ).grid(row=0, column=0, sticky='w', padx=PAD, pady=(PAD, 2))
+        ctk.CTkLabel(
+            hdr,
+            text=(f'Press {notes_hk} anywhere to capture a thought. '
+                  'Text, checklist or voice, runs fully offline. All '
+                  'your saved notes live in the Quick Notes window.'),
+            font=(FONT_FAMILY, 13), text_color=TEXT_P, justify='left',
+            wraplength=900,
+        ).grid(row=1, column=0, sticky='w', padx=PAD, pady=(0, PAD))
 
-        count_str = f'{len(all_notes)} note{"s" if len(all_notes) != 1 else ""}' if all_notes else 'No notes yet'
-        ctk.CTkLabel(toolbar, text=count_str,
-                     font=(FONT_FAMILY, 15, 'bold'), text_color=TEXT_P,
-                     ).grid(row=0, column=0, sticky='w')
-
-        def _new_note():
+        # ── Open button ───────────────────────────────────────────────────────
+        def _open():
             if self._on_new_note:
                 self._on_new_note()
 
-        _btn(toolbar, f'＋ New  ({notes_hk})', _new_note, width=152,
+        _btn(container, f'📝  Open Quick Notes  ({notes_hk})', _open, width=240,
              fg_color=ACCENT, hover=ACCENTL,
-             ).grid(row=0, column=1, sticky='e')
+             ).grid(row=1, column=0, sticky='w', pady=(PAD, 0))
 
-        # ── Empty state ───────────────────────────────────────────────────────
-        if not all_notes:
-            empty = ctk.CTkFrame(container, fg_color=SURF2, corner_radius=RADIUS)
-            empty.grid(row=1, column=0, sticky='ew', pady=PAD)
-            ctk.CTkLabel(
-                empty,
-                text=f'Press {notes_hk} anywhere to capture a thought.\nNotes you save will appear here.',
-                font=(FONT_FAMILY, 13), text_color=TEXT_S, justify='center',
-            ).pack(pady=PAD_LG)
-            return
-
-        # ── Helpers ───────────────────────────────────────────────────────────
-        def _rel(iso: str) -> str:
-            try:
-                dt  = datetime.fromisoformat(iso)
-                now = datetime.now()
-                d   = now - dt
-                if d < timedelta(minutes=1): return 'just now'
-                if d < timedelta(hours=1):   return f'{int(d.total_seconds()//60)}m ago'
-                if d < timedelta(days=1):    return f'{int(d.total_seconds()//3600)}h ago'
-                if d < timedelta(days=7):    return dt.strftime('%A')
-                if now.year == dt.year:      return dt.strftime('%b %-d')
-                return dt.strftime('%b %-d %Y')
-            except Exception:
-                return ''
-
-        type_icon = {'text': '📝', 'checklist': '☑', 'voice': '🎙'}
-
-        # ── Note cards ────────────────────────────────────────────────────────
-        for idx, note in enumerate(all_notes):
-            nid       = note.get('id', '')
-            ntype     = note.get('type', 'text')
-            raw_text  = note.get('text', '').strip()
-            items     = note.get('items', [])
-            color_hex = note.get('color')   # border tint stored by quicknotes
-            is_pinned = note.get('pinned', False)
-            ts        = _rel(note.get('created_at', ''))
-
-            # Build preview
-            if ntype == 'checklist' and items:
-                done    = sum(1 for it in items if it.get('checked'))
-                total   = len(items)
-                snippet = ', '.join(it['text'] for it in items[:3] if it.get('text'))
-                if len(snippet) > 70: snippet = snippet[:69] + '…'
-                subtitle = f'{done}/{total} done'
-                title    = snippet or '—'
-            else:
-                lines    = raw_text.splitlines()
-                title    = lines[0].strip() if lines else '—'
-                subtitle = ' '.join(ln.strip() for ln in lines[1:] if ln.strip())
-                if len(subtitle) > 100: subtitle = subtitle[:99] + '…'
-
-            if len(title) > 80: title = title[:79] + '…'
-
-            card = ctk.CTkFrame(container, fg_color=SURF2, corner_radius=RADIUS)
-            card.grid(row=idx + 1, column=0, sticky='ew', pady=(0, PAD_SM))
-            card.columnconfigure(0, weight=1)
-
-            # Left colour accent bar
-            inner = ctk.CTkFrame(card, fg_color='transparent')
-            inner.grid(row=0, column=0, sticky='ew')
-            inner.columnconfigure(1, weight=1)
-
-            col_start = 0
-            if color_hex:
-                ctk.CTkFrame(inner, fg_color=color_hex, width=4,
-                             corner_radius=2).grid(row=0, column=0, rowspan=2,
-                                                   sticky='ns', padx=(4, 0), pady=4)
-                col_start = 1
-
-            # Top row: type icon + pin + title + timestamp
-            top = ctk.CTkFrame(inner, fg_color='transparent')
-            top.grid(row=0, column=col_start, sticky='ew', padx=(PAD_SM, PAD), pady=(PAD_SM, 2))
-            top.columnconfigure(1, weight=1)
-
-            icon_str = ('📌 ' if is_pinned else '') + type_icon.get(ntype, '📝')
-            ctk.CTkLabel(top, text=icon_str,
-                         font=(FONT_FAMILY, 11), text_color=TEXT_D,
-                         ).grid(row=0, column=0, padx=(0, 6))
-
-            ctk.CTkLabel(top, text=title,
-                         font=(FONT_FAMILY, 13, 'bold'), text_color=TEXT_P, anchor='w',
-                         ).grid(row=0, column=1, sticky='ew')
-
-            ctk.CTkLabel(top, text=ts,
-                         font=(FONT_FAMILY, 10), text_color=TEXT_D,
-                         ).grid(row=0, column=2, padx=(8, 0))
-
-            # Subtitle row
-            if subtitle:
-                ctk.CTkLabel(inner, text=subtitle,
-                             font=(FONT_FAMILY, 12), text_color=TEXT_S, anchor='w',
-                             wraplength=560,
-                             ).grid(row=1, column=col_start, sticky='ew',
-                                    padx=(PAD_SM + 20, PAD), pady=(0, PAD_SM))
-
-            # Delete button — bottom right
-            def _delete(i=nid):
-                remaining = [n for n in load_notes() if n.get('id') != i]
-                threading.Thread(target=lambda: _save_notes(remaining), daemon=True).start()
-                self._render_notes_tab()
-
-            _btn(top, '✕', _delete, width=28,
-                 fg_color='transparent', hover=ERR, text_color=TEXT_D,
-                 ).grid(row=0, column=3, padx=(4, 0))
 
     def _on_bg_right_click(self, event) -> None:
         menu = tk.Menu(self.win, tearoff=0, bg=SURFACE, fg=TEXT_P,
@@ -3807,7 +4079,7 @@ class LibraryWindow:
                         self._on_recorder_toggle()
                 menu.add_command(label='⏹  Stop Recording', command=_do_stop)
             else:
-                return  # 'stopping' — encoding in progress, nothing useful to show
+                return  # 'stopping', encoding in progress, nothing useful to show
 
         elif self._active_tab == 'gif':
             gs = self._gif_state
@@ -3822,7 +4094,7 @@ class LibraryWindow:
                         self._on_gif_toggle()
                 menu.add_command(label='⏹  Stop GIF', command=_do_gif_stop)
             else:
-                return  # encoding — nothing useful to show
+                return  # encoding, nothing useful to show
 
         else:
             return
@@ -3834,8 +4106,181 @@ class LibraryWindow:
 
     # ── Web / Bookmarks tab ───────────────────────────────────────────────────
 
+    # ── Transcribe tab (Shift+F9) ─────────────────────────────────────────────
+
+    def _render_transcribe_tab(self) -> None:
+        """Mount the TurboScribe-style transcription UI inside the scroll area.
+        The full UI lives in transcribe_ui.TranscribePanel, this method is
+        just the wiring."""
+        # Tear down any previous panel (e.g. switching back to this tab)
+        if getattr(self, '_transcribe_panel', None) is not None:
+            try: self._transcribe_panel.destroy()
+            except Exception: pass
+            self._transcribe_panel = None
+
+        for w in self._scroll.winfo_children():
+            w.destroy()
+        self._cards.clear()
+        self._folder_headers.clear()
+
+        for _c in range(max(2, self._current_cols) + 1):
+            self._scroll.columnconfigure(_c, weight=0)
+        self._scroll.columnconfigure(0, weight=1)
+
+        from transcribe_ui import TranscribePanel
+        self._transcribe_panel = TranscribePanel(
+            self._scroll,
+            hotkey_cfg=self.hotkey_cfg,
+            provider_factory=None,           # falls back to engine.build_provider(config)
+            notify_fn=lambda title, msg: alert(self.win, title, msg),
+        )
+
+    # ── Whiteboard tab ────────────────────────────────────────────────────────
+
+    def _render_whiteboard_tab(self) -> None:
+        """Render the Whiteboard tab, hotkey hint + an Open button.
+
+        The Whiteboard itself runs in its own pywebview process (the scene
+        is auto-saved there), so this tab is just a launcher. We keep the
+        layout consistent with the Notes empty-state card.
+        """
+        for w in self._scroll.winfo_children():
+            w.destroy()
+        self._cards.clear()
+        self._folder_headers.clear()
+
+        for _c in range(max(2, self._current_cols) + 1):
+            self._scroll.columnconfigure(_c, weight=0)
+        self._scroll.columnconfigure(0, weight=1)
+
+        wb_hk = self.hotkey_cfg.get('whiteboard', 'shift+f8').upper()
+
+        container = ctk.CTkFrame(self._scroll, fg_color='transparent')
+        container.grid(row=0, column=0, sticky='ew', padx=PAD, pady=PAD)
+        container.columnconfigure(0, weight=1)
+
+        # ── Header card ───────────────────────────────────────────────────────
+        hdr = ctk.CTkFrame(container, fg_color=SURFACE, corner_radius=RADIUS_SM)
+        hdr.grid(row=0, column=0, sticky='ew')
+        hdr.columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            hdr, text='🎨  Whiteboard',
+            font=(FONT_FAMILY, 15, 'bold'), text_color=TEXT_P,
+        ).grid(row=0, column=0, sticky='w', padx=PAD, pady=(PAD, 2))
+        ctk.CTkLabel(
+            hdr,
+            text=(f'Press {wb_hk} anywhere to open the Whiteboard. '
+                  'Sketch diagrams, brainstorm or annotate, runs fully '
+                  'offline. Your scene auto-saves; reopening picks up '
+                  'where you left off.'),
+            font=(FONT_FAMILY, 13), text_color=TEXT_P, justify='left',
+            wraplength=900,
+        ).grid(row=1, column=0, sticky='w', padx=PAD, pady=(0, PAD))
+
+        # ── Open button ───────────────────────────────────────────────────────
+        def _open():
+            if self._on_open_whiteboard:
+                self._on_open_whiteboard()
+
+        _btn(container, f'🎨  Open Whiteboard  ({wb_hk})', _open, width=240,
+             fg_color=ACCENT, hover=ACCENTL,
+             ).grid(row=1, column=0, sticky='w', pady=(PAD, 0))
+
+    def _render_audio_editor_tab(self) -> None:
+        """Render the Audio editor tab, hotkey hint + an Open button.
+
+        The editor itself is a bundled portable Tenacity build relabeled
+        to "Audio Editor", launched as a sibling process. This tab
+        is just a launcher card, same shape as the Whiteboard tab.
+        """
+        for w in self._scroll.winfo_children():
+            w.destroy()
+        self._cards.clear()
+        self._folder_headers.clear()
+
+        for _c in range(max(2, self._current_cols) + 1):
+            self._scroll.columnconfigure(_c, weight=0)
+        self._scroll.columnconfigure(0, weight=1)
+
+        ae_hk = self.hotkey_cfg.get('audio_editor', 'shift+f10').upper()
+
+        container = ctk.CTkFrame(self._scroll, fg_color='transparent')
+        container.grid(row=0, column=0, sticky='ew', padx=PAD, pady=PAD)
+        container.columnconfigure(0, weight=1)
+
+        # ── Header card ───────────────────────────────────────────────────────
+        hdr = ctk.CTkFrame(container, fg_color=SURFACE, corner_radius=RADIUS_SM)
+        hdr.grid(row=0, column=0, sticky='ew')
+        hdr.columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            hdr, text='🎵  Audio editor',
+            font=(FONT_FAMILY, 15, 'bold'), text_color=TEXT_P,
+        ).grid(row=0, column=0, sticky='w', padx=PAD, pady=(PAD, 2))
+        ctk.CTkLabel(
+            hdr,
+            text=(f'Press {ae_hk} anywhere to open the audio editor. '
+                  'Drag in an audio or video file (mp3, wav, flac, ogg, '
+                  'mkv, mp4, mov, m4a) to load it. Trim, cut, fade, '
+                  'amplify, normalise, change speed or pitch, remove '
+                  'noise, then export back out. Runs offline.'),
+            font=(FONT_FAMILY, 13), text_color=TEXT_P, justify='left',
+            wraplength=900,
+        ).grid(row=1, column=0, sticky='w', padx=PAD, pady=(0, PAD))
+
+        # ── Open button ───────────────────────────────────────────────────────
+        def _open():
+            if self._on_open_audio_editor:
+                self._on_open_audio_editor()
+
+        _btn(container, f'🎵  Open audio editor  ({ae_hk})', _open, width=260,
+             fg_color=ACCENT, hover=ACCENTL,
+             ).grid(row=1, column=0, sticky='w', pady=(PAD, 0))
+
+    # ── Placeholder slot tabs (Shift+F11..F12) ────────────────────────────────
+
+    def _render_slot_tab(self, key: str) -> None:
+        """Render a reserved-slot tab. Same shape as the Whiteboard tab so it
+        slots into the existing layout without surprises, a header card
+        explaining the slot is reserved, plus the hotkey for reference."""
+        for w in self._scroll.winfo_children():
+            w.destroy()
+        self._cards.clear()
+        self._folder_headers.clear()
+
+        for _c in range(max(2, self._current_cols) + 1):
+            self._scroll.columnconfigure(_c, weight=0)
+        self._scroll.columnconfigure(0, weight=1)
+
+        # Resolve label + hotkey from the central placeholder table
+        label, default_hk = key, ''
+        for _k, _lbl, _dhk in self._PLACEHOLDER_SLOTS:
+            if _k == key:
+                label, default_hk = _lbl, _dhk
+                break
+        hk_str = self.hotkey_cfg.get(key, default_hk).upper()
+
+        container = ctk.CTkFrame(self._scroll, fg_color='transparent')
+        container.grid(row=0, column=0, sticky='ew', padx=PAD, pady=PAD)
+        container.columnconfigure(0, weight=1)
+
+        hdr = ctk.CTkFrame(container, fg_color=SURFACE, corner_radius=RADIUS_SM)
+        hdr.grid(row=0, column=0, sticky='ew')
+        hdr.columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            hdr, text=f'·  {label}',
+            font=(FONT_FAMILY, 15, 'bold'), text_color=TEXT_P,
+        ).grid(row=0, column=0, sticky='w', padx=PAD, pady=(PAD, 2))
+        ctk.CTkLabel(
+            hdr,
+            text=(f'{hk_str} is reserved for a future feature. Right-click '
+                  'the tab button above to rebind the hotkey now if you '
+                  'want the slot for one of your own shortcuts.'),
+            font=(FONT_FAMILY, 13), text_color=TEXT_P, justify='left',
+            wraplength=900,
+        ).grid(row=1, column=0, sticky='w', padx=PAD, pady=(0, PAD))
+
     def _render_web_tab(self) -> None:
-        """Render the Web bookmarks tab — radio-select active site, Shift+F5 opens it."""
+        """Render the Web bookmarks tab, radio-select active site, Shift+F5 opens it."""
         from storage import load_bookmarks, save_bookmarks
         import webbrowser, threading
 
@@ -3886,7 +4331,7 @@ class LibraryWindow:
         ).grid(row=0, column=0, sticky='w', padx=PAD, pady=(PAD, 2))
         ctk.CTkLabel(
             hdr,
-            text=f'Tick one site — {self.hotkey_cfg.get("web", "shift+f5").upper()} opens it instantly.\nClick the name to open it, Edit to rename/change URL, ✕ to remove.',
+            text=f'Tick one site — {self.hotkey_cfg.get("web", "shift+f5").upper()} opens it instantly.\nClick the name to open it, Edit to rename or change URL, ✕ to remove.',
             font=(FONT_FAMILY, 12), text_color=TEXT_S, justify='left',
         ).grid(row=1, column=0, sticky='w', padx=PAD, pady=(0, PAD))
 
@@ -3902,7 +4347,7 @@ class LibraryWindow:
             row.grid(row=i, column=0, sticky='ew', pady=(0, 4))
             row.columnconfigure(1, weight=1)
 
-            # Radio tick — filled accent bg + checkmark if active, muted empty circle if not
+            # Radio tick, filled accent bg + checkmark if active, muted empty circle if not
             tick_btn = ctk.CTkButton(
                 row,
                 text='✓' if is_active else '○',
@@ -3916,7 +4361,7 @@ class LibraryWindow:
             )
             tick_btn.grid(row=0, column=0, padx=(PAD_SM, 0), pady=PAD_SM)
 
-            # Name button — click to open URL
+            # Name button, click to open URL
             name_fg = ACCENT if is_active else SURF2
             name_btn = ctk.CTkButton(
                 row, text=bm.get('name', 'Untitled'), width=130, height=32,
@@ -3927,7 +4372,7 @@ class LibraryWindow:
             )
             name_btn.grid(row=0, column=1, padx=(6, 4), pady=PAD_SM, sticky='w')
 
-            # URL label — strip https://, http://, and www. for cleaner display
+            # URL label, strip https://, http://, and www. for cleaner display
             _url_display = bm.get('url', '')
             for _pfx in ('https://', 'http://'):
                 if _url_display.startswith(_pfx):
@@ -3956,7 +4401,7 @@ class LibraryWindow:
                 command=lambda idx=i: _delete(idx),
             ).grid(row=0, column=4, padx=(0, PAD_SM), pady=PAD_SM)
 
-            # Edit command — replaces row contents with entry fields
+            # Edit command, replaces row contents with entry fields
             def _start_edit(idx=i, r=row, bm_data=bm):
                 for w in r.winfo_children():
                     w.grid_forget()
@@ -4075,8 +4520,12 @@ class LibraryWindow:
         import keyboard as _kb
 
         cfg_key   = self._TAB_HOTKEY_MAP[tab_name]
-        current   = self.hotkey_cfg.get(cfg_key, '').upper() or '—'
-        tab_label = {'macros': 'Macros', 'recorder': 'Screen', 'gif': 'GIF', 'ask': 'Explain', 'chains': 'Chains'}[tab_name]
+        current   = self.hotkey_cfg.get(cfg_key, '').upper() or ','
+        tab_label = {
+            'macros': 'Macros', 'recorder': 'Screen', 'gif': 'GIF',
+            'ask': 'Explain', 'chains': 'Chains',
+            'web': 'Web', 'notes': 'Notes', 'whiteboard': 'Whiteboard',
+        }[tab_name]
 
         popup = tk.Toplevel(self.win)
         popup.overrideredirect(True)
@@ -4100,7 +4549,7 @@ class LibraryWindow:
                      font=(FONT_FAMILY, 12), text_color=ACCENT)
         hint_lbl.pack(anchor='w', padx=PAD, pady=(0, 4))
 
-        # Confirm row — hidden until a combo is captured
+        # Confirm row, hidden until a combo is captured
         confirm_frame = ctk.CTkFrame(card, fg_color='transparent')
         confirm_lbl   = ctk.CTkLabel(confirm_frame, text='',
                                      font=(FONT_FAMILY, 12, 'bold'), text_color=TEXT_P)
@@ -4292,14 +4741,42 @@ class LibraryWindow:
         dlg.after(50, dlg.deiconify)
 
     def show(self) -> None:
-        try:
-            self._render_cards()
-        except Exception as exc:
-            _log.error('show() _render_cards error: %s', exc, exc_info=True)
+        # Perceived-latency optimisation: deiconify the window FIRST so the
+        # user sees it appear instantly, then build the active tab's content
+        # (if not cached) on the next idle tick. For cached tabs this is
+        # a no-op (the widgets are already laid out). For first-ever opens
+        # the user sees an empty chrome for ~30ms before content fills in,
+        # which feels dramatically faster than waiting for a full render
+        # before the window appears.
+        is_cached = self._active_tab in self._tab_built
+
         self.win.deiconify()
+        self._snap_into_work_area()
         self.win.lift()
         self.win.focus_force()
+
+        if is_cached:
+            # Inline show, no rebuild. Effectively instant.
+            try:
+                self._show_active_tab()
+            except Exception as exc:
+                _log.error('show() _show_active_tab error: %s', exc, exc_info=True)
+        else:
+            # Defer the build so the window paints first.
+            self.win.after_idle(self._safe_show_active_tab)
+
+        # Snap again after DWM has finalised the rect, and disable transition
+        # animations on subsequent show()s.
+        self.win.after(200, self._snap_into_work_area)
         self.win.after(50, self._disable_dwm_transitions)
+
+    def _safe_show_active_tab(self) -> None:
+        """Wrapped tab-show used by deferred (after_idle) paths so an
+        exception in the renderer doesn't poison the Tk event loop."""
+        try:
+            self._show_active_tab()
+        except Exception as exc:
+            _log.error('_safe_show_active_tab error: %s', exc, exc_info=True)
 
     def show_tab(self, tab: str) -> None:
         """Show the library window open on a specific tab."""
@@ -4309,8 +4786,150 @@ class LibraryWindow:
     def hide(self) -> None:
         self.win.withdraw()
 
+    def refresh_hotkeys(self, hotkey_cfg: dict) -> None:
+        """Replace this window's cached hotkey config and refresh every
+        visible label that quotes a hotkey string.
+
+        Called by main.py after _register_hotkeys() so a hot reload of the
+        bindings (e.g. via the tray 'Reload hotkeys' menu, or an IPC
+        reload_hotkeys command) propagates to the UI immediately instead
+        of going stale until the user closes + reopens the window.
+        """
+        self.hotkey_cfg = hotkey_cfg
+        hk = hotkey_cfg
+
+        # ── Rebuild every cached hint-text string ─────────────────────────
+        refine_hk     = hk.get('refine',       'alt+shift+w').upper()
+        macro_hk_h    = hk.get('macro_record', 'shift+f1').upper()
+        recorder_hk_h = hk.get('recorder',     'shift+f2').upper()
+        gif_hk_h      = hk.get('gif_record',   'shift+f3').upper()
+        ask_hk_h      = hk.get('ask',          'shift+f4').upper()
+        web_hk_h      = hk.get('web',          'shift+f5').upper()
+        chain_hk_h    = hk.get('chain',        'shift+f6').upper()
+        notes_hk_h    = hk.get('notes',        'shift+f7').upper()
+        wb_hk_h       = hk.get('whiteboard',   'shift+f8').upper()
+        tr_hk_h       = hk.get('transcribe',   'shift+f9').upper()
+
+        self._hint_prompts_text = (
+            f'Click to activate  ·  Double-click to edit  ·  Right-click for menu  ·  {refine_hk} to refine'
+        )
+        self._hint_macros_text = (
+            f'{macro_hk_h} to record  ·  {macro_hk_h} again to stop  ·  {macro_hk_h} once more to play  ·  Esc / Del to abort'
+        )
+        self._hint_recorder_text = (
+            f'{recorder_hk_h} to start / stop recording  ·  1 GB cap auto-stops  ·  Esc to abort'
+        )
+        self._hint_gif_text = (
+            f'{gif_hk_h} to start / stop GIF  ·  Auto-stops at max duration  ·  Esc to abort'
+        )
+        self._hint_ask_text = (
+            f'{ask_hk_h} to explain, select text, copy a screenshot, or type a question below'
+        )
+        self._hint_web_text = (
+            f'{web_hk_h} to open active bookmark  ·  Click any bookmark to open in browser'
+        )
+        self._hint_chains_text = (
+            f'{chain_hk_h} to run the active chain on selected text  ·  Click ✓ to set a chain active'
+        )
+        self._hint_notes_text = (
+            f'{notes_hk_h} to open Quick Notes  ·  All your saved notes live here'
+        )
+        self._hint_whiteboard_text = (
+            f'{wb_hk_h} to open the Whiteboard  ·  Sketch, diagram, brainstorm, offline'
+        )
+        self._hint_transcribe_text = (
+            f'{tr_hk_h} to open Transcribe  ·  Audio/video → text with speakers & summary'
+        )
+        if hasattr(self, '_hint_slot_text'):
+            for _key, _label, _default_hk in self._PLACEHOLDER_SLOTS:
+                _h = hk.get(_key, _default_hk).upper()
+                self._hint_slot_text[_key] = (
+                    f'{_h} reserved for {_label}  ·  Feature coming soon, right-click the tab to rebind'
+                )
+
+        # ── Refresh visible labels ────────────────────────────────────────
+        # Header: "ALT+SHIFT+W → <active prompt title>"
+        try:
+            if hasattr(self, '_active_lbl') and self._active_lbl.winfo_exists():
+                idx = max(0, min(self.active_idx, len(self.prompts) - 1))
+                title = self.prompts[idx]['title'] if self.prompts else ','
+                self._active_lbl.configure(text=f'{refine_hk}  →  {title}')
+        except Exception:
+            pass
+
+        # Hint bar: re-pick the text for the currently-active tab so the
+        # hot reload shows immediately without a tab switch.
+        try:
+            if hasattr(self, '_sync_hint_bar'):
+                self._sync_hint_bar()
+        except Exception:
+            pass
+
+    # Target window size for the Library, same for every tab so geometry
+    # stays consistent whether the user opens Prompts, Macros, Transcribe,
+    # etc. Tall enough to show the entire Transcribe panel (Source +
+    # Operations + Options + Run + first half of the Result card) without
+    # the bottom getting cut off by the taskbar. These are CHROME-EXCLUSIVE
+    # (Tk client-area) dimensions; the actual window is ~40 px taller and
+    # ~16 px wider due to the OS title bar + borders. _snap_into_work_area
+    # uses Win32 GetWindowRect to account for the chrome accurately.
+    # Tk client-area target. The OS-level window with title bar + borders
+    # is ~32 px taller and ~16 px wider. We aim for a height that, once
+    # chrome is added, leaves a ~20 px safety margin between the window
+    # bottom and the taskbar.
+    _DEFAULT_W = 1280
+    _DEFAULT_H = 920
+    # Hard safety gap kept between the window's OS-level bottom and the
+    # work-area bottom (taskbar top). DPI rounding + DWM extended frame
+    # shadow can push the visible edge under the taskbar otherwise.
+    _SAFETY_GAP = 20
+
     def _center(self) -> None:
+        from win_geometry import center_on_work_area
         self.win.update_idletasks()
-        sw, sh = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
-        w, h   = min(740, sw - 80), min(580, sh - 80)
-        self.win.geometry(f'{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}')
+        x, y, w, h = center_on_work_area(self._DEFAULT_W, self._DEFAULT_H)
+        self.win.geometry(f'{w}x{h}+{x}+{y}')
+
+    def _snap_into_work_area(self) -> None:
+        """If the current window (including OS title bar + borders) crosses
+        the work-area edge in any direction, nudge it back inside with a
+        safety gap. Uses Win32 GetWindowRect / SetWindowPos because Tk's
+        winfo_x/y/width/height are client-area numbers and miss the ~32 px
+        chrome that is exactly what pushes the bottom under the taskbar.
+
+        Called on every show() and again 200 ms later so DWM has time to
+        finalise the window rect after deiconify."""
+        try:
+            import sys as _sys
+            if _sys.platform != 'win32':
+                return
+            import ctypes
+            from ctypes import wintypes
+            from win_geometry import get_work_area
+            self.win.update_idletasks()
+            hwnd = self.win.winfo_id()
+            user32 = ctypes.windll.user32
+            top = user32.GetAncestor(hwnd, 2)   # GA_ROOT = 2
+            if not top: return
+            rect = wintypes.RECT()
+            if not user32.GetWindowRect(top, ctypes.byref(rect)):
+                return
+            wa_x, wa_y, wa_w, wa_h = get_work_area()
+            # Reserve the safety gap by shrinking the usable work area.
+            usable_w = max(100, wa_w)
+            usable_h = max(100, wa_h - self._SAFETY_GAP)
+            cur_w = rect.right - rect.left
+            cur_h = rect.bottom - rect.top
+            new_w = min(cur_w, usable_w)
+            new_h = min(cur_h, usable_h)
+            # Clamp position so the entire rectangle (after sizing) sits
+            # inside the work area minus the safety gap.
+            max_x = wa_x + usable_w - new_w
+            max_y = wa_y + usable_h - new_h
+            new_x = max(wa_x, min(rect.left, max_x))
+            new_y = max(wa_y, min(rect.top,  max_y))
+            if (new_w, new_h, new_x, new_y) != (cur_w, cur_h, rect.left, rect.top):
+                # SWP_NOZORDER | SWP_NOACTIVATE = 0x4 | 0x10 = 0x14
+                user32.SetWindowPos(top, 0, new_x, new_y, new_w, new_h, 0x14)
+        except Exception:
+            pass

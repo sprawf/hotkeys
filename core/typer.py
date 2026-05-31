@@ -1,5 +1,18 @@
 import sys
 
+# Suspend any active macro recording while we inject keystrokes on the user's
+# behalf, otherwise the injection (Ctrl+C / Ctrl+V / Ctrl+Z) gets baked into
+# the macro and replayed as garbage. Import is best-effort so this module
+# stays usable in contexts where the macro package isn't available.
+try:
+    from macros.recorder import suspend_capture as _suspend_macro_capture
+except Exception:
+    from contextlib import contextmanager
+    @contextmanager
+    def _suspend_macro_capture():
+        yield
+
+
 # ── Windows ───────────────────────────────────────────────────────────────────
 
 if sys.platform == 'win32':
@@ -71,35 +84,38 @@ if sys.platform == 'win32':
 
     def copy_selection():
         """Simulate Ctrl+C to copy the current selection into the clipboard."""
-        inputs = [
-            _make_key_input(VK_CONTROL, 0, 0),
-            _make_key_input(VK_C,       0, 0),
-            _make_key_input(VK_C,       0, KEYEVENTF_KEYUP),
-            _make_key_input(VK_CONTROL, 0, KEYEVENTF_KEYUP),
-        ]
-        arr = (INPUT * len(inputs))(*inputs)
-        user32.SendInput(len(inputs), arr, ctypes.sizeof(INPUT))
+        with _suspend_macro_capture():
+            inputs = [
+                _make_key_input(VK_CONTROL, 0, 0),
+                _make_key_input(VK_C,       0, 0),
+                _make_key_input(VK_C,       0, KEYEVENTF_KEYUP),
+                _make_key_input(VK_CONTROL, 0, KEYEVENTF_KEYUP),
+            ]
+            arr = (INPUT * len(inputs))(*inputs)
+            user32.SendInput(len(inputs), arr, ctypes.sizeof(INPUT))
 
     def paste_from_clipboard():
         """Simulate Ctrl+V to paste the current clipboard into the focused window."""
-        inputs = [
-            _make_key_input(VK_CONTROL, 0, 0),
-            _make_key_input(VK_V,       0, 0),
-            _make_key_input(VK_V,       0, KEYEVENTF_KEYUP),
-            _make_key_input(VK_CONTROL, 0, KEYEVENTF_KEYUP),
-        ]
-        _send_inputs(inputs)
+        with _suspend_macro_capture():
+            inputs = [
+                _make_key_input(VK_CONTROL, 0, 0),
+                _make_key_input(VK_V,       0, 0),
+                _make_key_input(VK_V,       0, KEYEVENTF_KEYUP),
+                _make_key_input(VK_CONTROL, 0, KEYEVENTF_KEYUP),
+            ]
+            _send_inputs(inputs)
 
     def undo_last():
-        """Simulate Ctrl+Z via Win32 SendInput — avoids routing through the
+        """Simulate Ctrl+Z via Win32 SendInput, avoids routing through the
         keyboard library's hook, which prevents modifier-state corruption."""
-        inputs = [
-            _make_key_input(VK_CONTROL, 0, 0),
-            _make_key_input(VK_Z,       0, 0),
-            _make_key_input(VK_Z,       0, KEYEVENTF_KEYUP),
-            _make_key_input(VK_CONTROL, 0, KEYEVENTF_KEYUP),
-        ]
-        _send_inputs(inputs)
+        with _suspend_macro_capture():
+            inputs = [
+                _make_key_input(VK_CONTROL, 0, 0),
+                _make_key_input(VK_Z,       0, 0),
+                _make_key_input(VK_Z,       0, KEYEVENTF_KEYUP),
+                _make_key_input(VK_CONTROL, 0, KEYEVENTF_KEYUP),
+            ]
+            _send_inputs(inputs)
 
 # ── macOS / Linux ─────────────────────────────────────────────────────────────
 
@@ -119,45 +135,48 @@ else:
 
     def copy_selection():
         """Simulate Cmd+C on macOS via osascript."""
-        try:
-            subprocess.run(
-                ['osascript', '-e',
-                 'tell application "System Events" to keystroke "c" using command down'],
-                check=True,
-            )
-        except Exception:
+        with _suspend_macro_capture():
             try:
-                import keyboard
-                keyboard.send('command+c')
+                subprocess.run(
+                    ['osascript', '-e',
+                     'tell application "System Events" to keystroke "c" using command down'],
+                    check=True,
+                )
             except Exception:
-                pass
+                try:
+                    import keyboard
+                    keyboard.send('command+c')
+                except Exception:
+                    pass
 
     def paste_from_clipboard():
         """Simulate Cmd+V on macOS via osascript."""
-        try:
-            subprocess.run(
-                ['osascript', '-e',
-                 'tell application "System Events" to keystroke "v" using command down'],
-                check=True,
-            )
-        except Exception:
+        with _suspend_macro_capture():
             try:
-                import keyboard
-                keyboard.send('command+v')
+                subprocess.run(
+                    ['osascript', '-e',
+                     'tell application "System Events" to keystroke "v" using command down'],
+                    check=True,
+                )
             except Exception:
-                pass
+                try:
+                    import keyboard
+                    keyboard.send('command+v')
+                except Exception:
+                    pass
 
     def undo_last():
         """Simulate Cmd+Z on macOS via osascript."""
-        try:
-            subprocess.run(
-                ['osascript', '-e',
-                 'tell application "System Events" to keystroke "z" using command down'],
-                check=True,
-            )
-        except Exception:
+        with _suspend_macro_capture():
             try:
-                import keyboard
-                keyboard.send('command+z')
+                subprocess.run(
+                    ['osascript', '-e',
+                     'tell application "System Events" to keystroke "z" using command down'],
+                    check=True,
+                )
             except Exception:
-                pass
+                try:
+                    import keyboard
+                    keyboard.send('command+z')
+                except Exception:
+                    pass

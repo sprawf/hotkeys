@@ -1,9 +1,115 @@
 """
-Hotkeys — unified text refinement + speech-to-text app.
+Hotkeys, unified text refinement + speech-to-text app.
 Merges PromptRefiner (Groq / Cerebras / local Qwen) with KaiWhisper (faster-whisper).
 One tray icon, both features, keyboard-library hotkeys.
 """
 import os
+import sys
+
+# ── EARLY EXIT for --whiteboard subprocess ────────────────────────────────────
+# When Shift+F8 spawns `Hotkeys.exe --whiteboard`, that subprocess just needs
+# to run whiteboard.main() and exit. It does NOT need engine/library/
+# transcribe/customtkinter/faster_whisper loaded. Loading them all in the
+# subprocess wastes ~10s + ~500MB RAM, AND causes the PARENT process to
+# crash with ACCESS_VIOLATION (no event log entry) for reasons we did not
+# fully isolate — likely a shared handle / heap interaction across the
+# Hotkeys.exe boundary while the subprocess's heavy imports initialize.
+# Short-circuit BEFORE any other import so subprocess is small and isolated.
+if __name__ == '__main__' and '--whiteboard' in sys.argv:
+    try:
+        from whiteboard import main as _wb_main
+        _wb_main()
+    except BaseException:
+        import traceback as _wb_tb
+        try:
+            import ctypes as _wb_ct
+            _wb_ct.windll.user32.MessageBoxW(
+                0, 'Whiteboard crashed:\n\n' + _wb_tb.format_exc()[:1500],
+                'Hotkeys, Whiteboard', 0x10)
+        except Exception:
+            _wb_tb.print_exc()
+    sys.exit(0)
+
+import sys as _sys_for_fh
+import faulthandler as _fh
+import time as _time_for_fh
+
+# ── NATIVE CRASH HANDLER (must be FIRST runnable code) ────────────────────────
+# Python's faulthandler catches segfaults / heap-corruption fastfails / stack
+# overflows the moment they happen and dumps the Python + C call stack of
+# every thread to a file BEFORE the process dies. Without this, a native
+# crash like STATUS_STACK_BUFFER_OVERRUN (0xc0000409) just kills the process
+# with no trace beyond the Windows event log offset. This single hook is the
+# difference between "crashed somewhere" and "crashed on line X of file Y".
+try:
+    _crash_dir = (
+        os.path.join(os.path.dirname(_sys_for_fh.executable), 'data')
+        if getattr(_sys_for_fh, 'frozen', False)
+        else os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'Hotkeys')
+    )
+    os.makedirs(_crash_dir, exist_ok=True)
+    _crash_path = os.path.join(_crash_dir, 'crash.log')
+    # Open append-binary so multiple launches accumulate; faulthandler needs
+    # a real file descriptor, not a buffered stream.
+    _crash_fh = open(_crash_path, 'a', buffering=1)
+    _crash_fh.write(f'\n=== process start {_time_for_fh.strftime("%Y-%m-%d %H:%M:%S")} '
+                    f'pid={os.getpid()} frozen={getattr(_sys_for_fh, "frozen", False)} ===\n')
+    _crash_fh.flush()
+    _fh.enable(file=_crash_fh, all_threads=True)
+    # NOTE: dump_traceback_later(repeat=True) was tried as a diagnostic but
+    # it walks every thread's stack from a background timer thread, which
+    # races with Tk widget creation in C code and causes 0xc0000005 access
+    # violations inside python312.dll. Keep faulthandler.enable for crash
+    # trapping only; rely on app.log + Win32 SEH filter for forensics.
+except Exception as _e:
+    # Crash handler setup itself failed; not fatal. Just continue.
+    pass
+
+# Also install a Windows-level Structured Exception Handler that logs the
+# Windows exception record (code + address + thread) the instant a native
+# fault triggers. faulthandler catches Python-aware signals; SEH catches
+# the lower-level ones (heap-corruption fastfail, access-violation, etc).
+try:
+    if _sys_for_fh.platform == 'win32':
+        import ctypes as _ct_seh
+        import ctypes.wintypes as _wt_seh
+        _LPVOID = _ct_seh.c_void_p
+        _LPTOP_LEVEL_EXCEPTION_FILTER = _ct_seh.WINFUNCTYPE(_ct_seh.c_long, _LPVOID)
+
+        def _seh_filter(ep):
+            try:
+                # EXCEPTION_POINTERS → EXCEPTION_RECORD
+                # First 4 bytes of EXCEPTION_RECORD: ExceptionCode
+                code = _ct_seh.cast(ep, _ct_seh.POINTER(_ct_seh.c_uint))[0] if ep else 0
+                _crash_fh.write(f'\n*** WIN32 SEH: ExceptionCode=0x{code:08x} '
+                                f'thread={os.getpid()} ts={_time_for_fh.strftime("%H:%M:%S")} ***\n')
+                _crash_fh.flush()
+            except Exception:
+                pass
+            return 0   # EXCEPTION_CONTINUE_SEARCH — let faulthandler / OS handle next
+        _SEH_REF = _LPTOP_LEVEL_EXCEPTION_FILTER(_seh_filter)
+        _ct_seh.windll.kernel32.SetUnhandledExceptionFilter(_SEH_REF)
+except Exception:
+    pass
+
+# ── Threading-runtime guards (MUST run before any heavy import) ───────────────
+# When PyInstaller bundles torch + ctranslate2 + onnxruntime + numpy + av into
+# one process, each ships its OWN copy of OpenMP / MKL threading runtimes.
+# Windows loads the first one it sees; the others' C extensions remain bound
+# to their build-time OpenMP, creating an ABI mismatch that corrupts the heap
+# and crashes the process with STATUS_STACK_BUFFER_OVERRUN (0xc0000409) at
+# random points after startup. KMP_DUPLICATE_LIB_OK tells Intel OpenMP to
+# tolerate the duplicate; the per-library NUM_THREADS=1 forces single-thread
+# mode so the runtimes cannot fight over the thread pool. In source mode
+# (pythonw main.py) this never happens because the runtimes load lazily from
+# venv/site-packages with a different process layout, so these guards are
+# strictly defensive and harmless in dev.
+os.environ.setdefault('KMP_DUPLICATE_LIB_OK',  'TRUE')
+os.environ.setdefault('OMP_NUM_THREADS',       '1')
+os.environ.setdefault('MKL_NUM_THREADS',       '1')
+os.environ.setdefault('OPENBLAS_NUM_THREADS',  '1')
+os.environ.setdefault('NUMEXPR_NUM_THREADS',   '1')
+
 import sys
 import time
 import queue
@@ -21,11 +127,11 @@ import mouse
 import pyperclip
 import pystray
 from pathlib import Path
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 
 from storage  import (
     load_config, save_config, load_prompts, save_prompts,
-    appdata_dir, log_path, models_dir, assets_dir, history_path,
+    appdata_dir, log_path, models_dir, assets_dir,
     save_history, load_history, make_whisper_cfg, _HISTORY_MAX_ENTRIES,
     load_chains, save_chains,
 )
@@ -48,6 +154,9 @@ from screen_recorder      import Recorder as ScreenRecorder, show_save_dialog
 from gif_recorder         import GifRecorder, GifSetupDialog, show_gif_save_dialog, add_to_gif_index
 from explain_pill         import AskPill
 from quicknotes           import QuickNotesWindow
+# Legacy Tk whiteboard removed, Shift+F8 now uses whiteboard.py
+# (offline @whiteboard/whiteboard inside Edge WebView2). The old WhiteboardWindow,
+# perfect_freehand.py, and rough.py have been deleted.
 
 ctk.set_appearance_mode('dark')
 ctk.set_default_color_theme('dark-blue')
@@ -98,20 +207,62 @@ def _ocr_is_no_text(text: str) -> bool:
 # ── Splash screen ────────────────────────────────────────────────────────────
 
 class SplashScreen:
-    """Startup pill — bolt logo + spinning ring, same aesthetic as overlay pills."""
+    """Startup pill, bolt logo + spinning ring + progress bar.
 
-    _TRANSP  = '#010101'   # Windows transparentcolor
+    Tracks N weighted steps. Each step contributes its weight to the overall
+    progress when marked done; partial progress within a step can be reported
+    by passing 0.0-1.0 to mark_done. The progress bar fills smoothly across
+    the bottom edge of the pill, with the current step name + percentage
+    shown as the subtitle, so the user always knows what's happening.
+
+    Steps registered up front (in order):
+      • whisper    , load the faster-whisper model from disk
+      • whisper_jit, JIT-warm CTranslate2's CPU kernels
+      • cloud      , open TLS connection to Groq for cloud transcription
+      • provider   , pre-warm the LLM provider (Groq/Cerebras/local)
+
+    Callers use:
+      mark_done('whisper')        # default 1.0, fully done
+      mark_done('whisper', 0.5)   # 50% through this step (partial UI update)
+      mark_error('whisper')       # red border + 'Error' text
+    """
+
+    _TRANSP  = '#010101'   # Windows transparent color
     _RADIUS  = 22
-    _H       = 52
-    _W       = 360
-    _ICO     = 32          # bolt icon size (px)
-    _ICON_CX = 30          # icon centre x
+    _H       = 64          # taller to fit progress bar + 2 text rows
+    _W       = 380         # slightly wider for longer status strings
+    _ICO     = 32
+    _ICON_CX = 30
+    _PB_H    = 4           # progress bar thickness
+    _PB_PAD  = 14          # left/right inset of progress bar inside pill
+
+    # (key, label, weight), weights ≈ relative time on a typical machine
+    _STEPS = (
+        ('whisper',     'Loading Whisper model',     30),
+        ('whisper_jit', 'Warming up speech engine',  35),
+        ('cloud',       'Connecting to cloud',       10),
+        ('provider',    'Connecting AI provider',    25),
+    )
+
+    # Short rotating tips for the JIT-warmup pause. Kept ≤ ~38 chars so
+    # they fit inside the pill at 10 pt without truncation.
+    _TIPS = (
+        'Ctrl+Enter → dictate anywhere',
+        'Alt+Shift+W → rewrite selection',
+        'Shift+F4 → explain selection',
+        'Shift+F1 → record a macro',
+        'Shift+F8 → offline whiteboard',
+        'Shift+F9 → transcribe any file',
+    )
 
     def __init__(self, root: ctk.CTk, provider_label: str) -> None:
         from theme import SURFACE, ACCENT, OK, ERR, TEXT_P, TEXT_S, FONT_FAMILY
         self._root           = root
         self._closed         = False
-        self._done           = {'app': True, 'whisper': False, 'provider': False}
+        # progress[key] in 0.0-1.0; weight[key] is registered at init.
+        self._progress: dict = {k: 0.0 for k, _, _ in self._STEPS}
+        self._weights:  dict = {k: w   for k, _, w in self._STEPS}
+        self._labels:   dict = {k: l   for k, l, _ in self._STEPS}
         self._has_error      = False
         self._provider_label = provider_label
         self._font_family    = FONT_FAMILY
@@ -121,9 +272,15 @@ class SplashScreen:
         self._c_err          = ERR
         self._c_text         = TEXT_P
         self._c_sub          = TEXT_S
+        self._c_pb_fg        = ACCENT
+        self._c_pb_bg        = '#2a2a32'
         self._text_id        = None
         self._sub_id         = None
-        self._icon_img       = None     # keep PhotoImage ref alive
+        self._icon_img       = None
+        self._pb_bg_id       = None
+        self._pb_fg_id       = None
+        self._displayed_pct  = 0.0
+        self._tip_tick       = 0
 
         win = tk.Toplevel(root)
         win.overrideredirect(True)
@@ -141,7 +298,8 @@ class SplashScreen:
 
         self._build_pill(self._c_accent)
         self._build_icon()
-        self._build_text('Loading Whisper…', self._c_sub)
+        self._build_text('Starting up…', self._c_sub)
+        self._build_progress_bar()
 
         win.update_idletasks()
         sw = win.winfo_screenwidth()
@@ -209,9 +367,10 @@ class SplashScreen:
 
     def _build_text(self, sub: str, sub_color: str) -> None:
         tx = self._ICON_CX + self._ICO // 2 + 14
-        cy = self._H // 2
+        # Bias text up slightly to leave space for the progress bar.
+        cy = (self._H - self._PB_H - 6) // 2 + 2
         self._text_id = self._canvas.create_text(
-            tx, cy - 7,
+            tx, cy - 8,
             text='Hotkeys', anchor='w',
             font=(self._font_family, 13, 'bold'),
             fill=self._c_text,
@@ -223,63 +382,140 @@ class SplashScreen:
             fill=sub_color,
         )
 
+    def _build_progress_bar(self) -> None:
+        """Draw the empty progress track inside the bottom edge of the pill."""
+        c = self._canvas
+        y1 = self._H - self._PB_H - 10
+        y2 = y1 + self._PB_H
+        x1 = self._PB_PAD
+        x2 = self._W - self._PB_PAD
+        # Background track
+        self._pb_bg_id = c.create_rectangle(
+            x1, y1, x2, y2,
+            fill=self._c_pb_bg, outline='', tags='pb_bg',
+        )
+        # Foreground fill, starts as a zero-width rect at the left edge.
+        self._pb_fg_id = c.create_rectangle(
+            x1, y1, x1, y2,
+            fill=self._c_pb_fg, outline='', tags='pb_fg',
+        )
+
     def _icon_cx(self) -> int:
         return self._ICON_CX
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def mark_done(self, step: str) -> None:
-        if self._closed:
+    def mark_done(self, step: str, fraction: float = 1.0) -> None:
+        """Mark `step` as `fraction`-done (0.0-1.0). Callers can call this
+        multiple times for partial updates (e.g. mark_done('whisper', 0.4)
+        then mark_done('whisper', 1.0)). Idempotent."""
+        if self._closed or step not in self._progress:
             return
-        self._done[step] = True
-        if all(self._done.values()):
+        self._progress[step] = max(self._progress[step], min(1.0, max(0.0, float(fraction))))
+        self._update_visual()
+        # All done? Flash green + close.
+        if self._is_complete():
             try:
                 self._canvas.itemconfigure('pill', outline=self._c_ok)
+                self._canvas.itemconfigure(self._pb_fg_id, fill=self._c_ok)
                 self._canvas.itemconfigure(self._sub_id,
                                            text='Ready  ✓', fill=self._c_ok)
+                self._canvas.itemconfigure(self._text_id, text='Hotkeys',
+                                           fill=self._c_text)
             except Exception:
                 pass
-            try:
-                play_start()
-            except Exception:
-                pass
+            try: play_start()
+            except Exception: pass
             self._root.after(1400, self._close)
-        else:
-            self._refresh_sub()
 
     def mark_error(self, step: str) -> None:
         if self._closed:
             return
-        self._done[step] = True
         self._has_error = True
         try:
             self._canvas.itemconfigure('pill', outline=self._c_err)
+            self._canvas.itemconfigure(self._pb_fg_id, fill=self._c_err)
             self._canvas.itemconfigure(self._sub_id,
-                                       text='Error — check log', fill=self._c_err)
+                                       text='Error (check log)', fill=self._c_err)
         except Exception:
             pass
-        if all(self._done.values()):
-            self._root.after(2800, self._close)
+        self._root.after(2800, self._close)
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
-    def _refresh_sub(self) -> None:
+    def _is_complete(self) -> bool:
+        return all(v >= 1.0 for v in self._progress.values())
+
+    def _overall_pct(self) -> float:
+        total_w = sum(self._weights.values()) or 1
+        done_w  = sum(self._weights[k] * self._progress[k]
+                      for k in self._progress)
+        return min(1.0, done_w / total_w)
+
+    def _current_step_label(self) -> str:
+        """The first step that isn't yet finished, what the user is waiting
+        on right now."""
+        for k, _, _ in self._STEPS:
+            if self._progress[k] < 1.0:
+                if k == 'provider':
+                    return self._provider_label
+                return self._labels[k]
+        return 'Ready'
+
+    def _update_visual(self) -> None:
         if self._has_error or self._closed:
             return
-        pending = [k for k, v in self._done.items() if not v]
-        if not pending:
-            return
-        step = pending[0]
-        msg = 'Loading Whisper…' if step == 'whisper' else f'{self._provider_label}…'
+        target_pct = self._overall_pct()
+        # Smoothly interpolate the bar fill, the animate loop pushes
+        # _displayed_pct toward target_pct each tick. We just store the
+        # target here.
+        self._target_pct = target_pct
         try:
-            self._canvas.itemconfigure(self._sub_id, text=msg)
+            label = self._current_step_label()
+            # Show percentage so users see progress is real, not faked.
+            pct = int(target_pct * 100)
+            self._canvas.itemconfigure(self._sub_id,
+                                       text=f'{label}…  {pct}%')
         except Exception:
             pass
 
     def _animate(self) -> None:
         if self._closed:
             return
-        self._refresh_sub()
+        # Smoothly fill toward target. Without this the bar jumps in chunks
+        # as steps complete; with it the bar always feels alive.
+        target = getattr(self, '_target_pct', self._overall_pct())
+        if abs(self._displayed_pct - target) > 0.001:
+            self._displayed_pct += (target - self._displayed_pct) * 0.18
+            try:
+                x1 = self._PB_PAD
+                x2 = self._W - self._PB_PAD
+                w  = (x2 - x1) * self._displayed_pct
+                y1 = self._H - self._PB_H - 10
+                y2 = y1 + self._PB_H
+                self._canvas.coords(self._pb_fg_id, x1, y1, x1 + w, y2)
+            except Exception:
+                pass
+
+        # Cycle through tips every 4 s on the longer steps (whisper_jit
+        # dominates startup time, gives the user something to read).
+        self._tip_tick += 1
+        if not self._has_error and self._tip_tick % 32 == 0:
+            try:
+                # Only show the tip if the current step has been "in
+                # progress" for a while and percentage hasn't budged much.
+                if 0.05 < self._displayed_pct < 0.95:
+                    tip_idx = (self._tip_tick // 32) % len(self._TIPS)
+                    label = self._current_step_label()
+                    pct   = int(self._overall_pct() * 100)
+                    if self._tip_tick // 32 % 2 == 0:
+                        text = f'{label}…  {pct}%'
+                    else:
+                        text = self._TIPS[tip_idx]
+                    self._canvas.itemconfigure(self._sub_id, text=text)
+            except Exception:
+                pass
+
         self._root.after(120, self._animate)
 
     def _close(self) -> None:
@@ -335,7 +571,7 @@ class App:
                 self._bundled_defaults: list = _json.load(_f)
         except Exception:
             self._bundled_defaults = []
-        # Start enabled — only grey out immediately after the user clicks
+        # Start enabled, only grey out immediately after the user clicks
         # "Restore Default Prompts", and re-enable as soon as any edit is saved.
         # Checking against bundled defaults at startup was too aggressive: it
         # permanently disabled the button whenever prompts happened to match
@@ -352,6 +588,16 @@ class App:
         self.root.withdraw()
         self.root.title('Hotkeys')
         self.root.protocol('WM_DELETE_WINDOW', self._quit)
+        # Load TkDND extension into the Tk interpreter so any widget can
+        # opt into drag-drop later via drop_target_register(DND_FILES).
+        # We only require it once at startup, not per widget. If the
+        # extension isn't available, drag-drop just won't work but the
+        # rest of the app continues normally.
+        try:
+            from tkinterdnd2 import TkinterDnD
+            TkinterDnD._require(self.root)
+        except Exception as _e:
+            logger.warning(f'TkinterDnD init skipped: {_e}')
 
         # ── Text-refine provider ─────────────────────────────────────────────
         self.provider: Provider = build_provider(self.config)
@@ -381,6 +627,11 @@ class App:
 
         # ── Quick Notes ───────────────────────────────────────────────────────
         self._notes_win: QuickNotesWindow | None = None
+
+        # ── Whiteboard ────────────────────────────────────────────────────────
+        # Tracked subprocess pid for the offline-Whiteboard whiteboard
+        # (window itself is identified by exact title, see _do_open_whiteboard).
+        self._wb_proc_pid: int | None = None
 
         # ── AskPill tracking ──────────────────────────────────────────────────
         # Keeps weak refs to open pills so _hk_escape can close them and
@@ -431,6 +682,10 @@ class App:
         self.library._on_ask             = lambda text: self._q.put(('ask', text))
         # Wire the library's Notes tab "New Note" button → open QuickNotesWindow
         self.library._on_new_note        = self._do_open_notes
+        # Wire the library's Whiteboard tab "Open" button → open Whiteboard
+        self.library._on_open_whiteboard = self._do_open_whiteboard
+        # Wire the library's Audio editor tab "Open" button → toggle Tenacity
+        self.library._on_open_audio_editor = self._do_open_audio_editor
         self.settings = SettingsWindow(self.root, self.config,
                                        on_save=self._on_settings_saved,
                                        on_restore=lambda: self._q.put(('restore_all_defaults', None)))
@@ -505,23 +760,45 @@ class App:
             'chain':              self._do_chain,
             'chain_named':        self._do_chain_named,
             'notes':              lambda _: self._do_open_notes(),
+            'whiteboard':         lambda _: self._do_open_whiteboard(),
+            # Shift+F9, open the Library on the Transcribe tab (file/URL
+            # → diarized transcript + AI summary + multi-format export).
+            'transcribe':         lambda _: self._do_open_transcribe(),
+            # Shift+F10, bundled audio editor (Tenacity, relabeled).
+            'audio_editor':       lambda _: self._do_open_audio_editor(),
         }
 
         self._register_hotkeys()
+        logger.info('DEBUG: _register_hotkeys returned')
         self._register_macro_saved_hotkeys()
+        logger.info('DEBUG: _register_macro_saved_hotkeys returned')
         self._register_chain_hotkeys()
+        logger.info('DEBUG: _register_chain_hotkeys returned')
         self.root.after(2000, self._hotkey_watchdog)
+        logger.info('DEBUG: hotkey_watchdog scheduled')
         start_prtsc_listener(self._hk_screenshot)
+        logger.info('DEBUG: start_prtsc_listener returned')
         self._start_tray()
+        logger.info('DEBUG: _start_tray returned')
+        self._start_ipc()
+        logger.info('DEBUG: _start_ipc returned')
 
-        if not self.config.get('first_run_done'):
-            self.root.after(3000, self._show_first_run_tip)
+        self.root.after(2000, self._check_data_dir_writable)
+
 
         if isinstance(self.provider, LocalProvider):
             threading.Thread(target=self._load_model, daemon=True).start()
 
         threading.Thread(target=self._prewarm, daemon=True).start()
-        threading.Thread(target=lambda: self._audio.start(), daemon=True).start()
+        # NOTE: we used to call `self._audio.start()` here to pre-warm the
+        # input stream so the first Ctrl+Enter had zero latency. That pre-
+        # warm probes every WASAPI device on the system, and on machines
+        # where every device rejects our format (16 kHz / mono / float32)
+        # PortAudio's C library corrupts its internal heap after ~5 failed
+        # opens and crashes the whole process with STATUS_STACK_BUFFER_OVERRUN
+        # (0xc0000409). start_recording() already lazy-opens the stream on
+        # demand, so removing the pre-warm only adds ~100 ms to the first
+        # voice-typing press but makes the app survive mic-less machines.
         threading.Thread(target=self._watch_singleton_socket, daemon=True).start()
 
         self.root.after(30, self._poll)
@@ -537,7 +814,7 @@ class App:
         })
 
     def _suspend_hotkeys(self) -> None:
-        """Unhook all keyboard and mouse bindings — called while HotkeyCapture dialog
+        """Unhook all keyboard and mouse bindings, called while HotkeyCapture dialog
         is open so nothing fires during capture."""
         try:
             keyboard.unhook_all()
@@ -566,7 +843,7 @@ class App:
 
         # Force-stop the keyboard listener thread so it gets a clean slate on
         # the next add_hotkey call.  After multiple hard-kill / restart cycles
-        # the listener thread can become a ghost — new hooks are added but
+        # the listener thread can become a ghost, new hooks are added but
         # never actually fire.
         try:
             if hasattr(keyboard, '_listener') and keyboard._listener is not None:
@@ -582,7 +859,7 @@ class App:
         def _do_register():
             # suppress=False: the library observes keypresses but never consumes
             # them.  suppress=True was causing the library's internal modifier-state
-            # machine to lock up permanently after each suppressed hotkey — Alt and
+            # machine to lock up permanently after each suppressed hotkey, Alt and
             # Shift would appear "stuck" to the library even after the user released
             # them, silently blocking all subsequent hotkeys with no recovery path
             # (even unhook_all + re-registration couldn't fix a broken listener).
@@ -602,7 +879,16 @@ class App:
             keyboard.add_hotkey(hk.get('chain',        'shift+f6'),
                                 self._hk_chain,                                 suppress=False)
             keyboard.add_hotkey(hk.get('notes',        'shift+f7'),
-                                lambda: self._q.put(('notes', None)),           suppress=False)
+                                lambda: self._q.put(('notes',      None)),      suppress=False)
+            keyboard.add_hotkey(hk.get('whiteboard',   'shift+f8'),
+                                lambda: self._q.put(('whiteboard', None)),      suppress=False)
+            keyboard.add_hotkey(hk.get('transcribe',   'shift+f9'),
+                                lambda: self._q.put(('transcribe', None)),      suppress=False)
+            # Shift+F10, bundled audio editor (Tenacity), launched as a
+            # sibling process and relabeled to "Audio Editor" at the
+            # window-title layer. See audio_editor.py.
+            keyboard.add_hotkey(hk.get('audio_editor', 'shift+f10'),
+                                lambda: self._q.put(('audio_editor', None)),    suppress=False)
 
             if ptt:
                 whisper_hk = hk.get('whisper', 'ctrl+enter')
@@ -623,23 +909,6 @@ class App:
 
             keyboard.add_hotkey('escape', self._hk_escape, suppress=False)
 
-            # Ctrl+scroll-up → refine (same action as Alt+Shift+W).
-            # A 500 ms debounce prevents a single scroll gesture from firing
-            # multiple times — _refine_in_progress would stop them anyway, but
-            # debouncing avoids spawning redundant capture threads.
-            _scroll_last = [0.0]
-            def _on_ctrl_scroll(event):
-                if not (hasattr(event, 'delta') and event.delta > 0):
-                    return
-                if not keyboard.is_pressed('ctrl'):
-                    return
-                now = time.time()
-                if now - _scroll_last[0] < 0.5:
-                    return
-                _scroll_last[0] = now
-                self._hk_refine()
-            mouse.hook(_on_ctrl_scroll)
-
             # Per-prompt hotkeys (assigned via right-click → Assign hotkey…)
             for _idx, _p in enumerate(self.prompts):
                 _hk = _p.get('hotkey', '').strip()
@@ -659,7 +928,7 @@ class App:
             _do_register()
             logger.info(f'Hotkeys registered: {hk}  PTT={ptt}')
         except Exception as e:
-            logger.warning(f'Hotkey registration failed ({e}) — retrying in 0.5 s')
+            logger.warning(f'Hotkey registration failed ({e}), retrying in 0.5 s')
             time.sleep(0.5)
             try:
                 keyboard.unhook_all()
@@ -693,7 +962,7 @@ class App:
                     msg = str(e)
                     if 'rate limit' in msg.lower() or '429' in msg or 'quota' in msg.lower():
                         _log.getLogger(__name__).warning(
-                            f'Vision: Groq key …{key[-6:]} rate-limited — trying next key')
+                            f'Vision: Groq key …{key[-6:]} rate-limited, trying next key')
                         last_err = e
                         continue
                     raise
@@ -714,17 +983,212 @@ class App:
         threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
 
     def _hotkey_watchdog(self) -> None:
-        """Periodic safety net: re-register if the keyboard listener thread died."""
+        """Periodic safety net. Two jobs:
+
+        1. **Listener health**: if the keyboard library's listener thread
+           has died, re-register everything so hotkeys keep working.
+        2. **State reconciliation**: walk every state-machine flag that
+           gates a hotkey ('recording', 'in progress', etc.) and check
+           it against the actual underlying object. If the flag says
+           "busy" but the corresponding worker / window / thread is gone,
+           the flag is stale, so reset it. Without this a single missed
+           cleanup poisons that hotkey until the user clicks Reload
+           Hotkeys.
+
+        Runs every 2 s. All work is wrapped in try/except so one bad
+        reconciliation never breaks the loop.
+        """
+        # 1. Listener health
         try:
             listener = getattr(keyboard, '_listener', None)
             if listener is not None:
                 t = getattr(listener, 'thread', None)
                 if t is not None and not t.is_alive():
-                    logger.warning('Hotkey listener thread dead — auto re-registering.')
+                    logger.warning('Hotkey listener thread dead, auto re-registering.')
                     threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
         except Exception:
             pass
+
+        # 2. State reconciliation: any flag set to "busy" but with no
+        #    real underlying object is stale and gets cleared silently.
+        self._reconcile_stuck_states()
+
         self.root.after(2000, self._hotkey_watchdog)
+
+    def _reconcile_stuck_states(self) -> None:
+        """Reset any state flag whose ground-truth object is gone.
+
+        Each block follows the same shape: read the current flag, check
+        whether the object that should accompany it is still alive, and
+        if not, reset the flag plus any matching UI hint. A reset here
+        is silent for the user but lets the next hotkey press succeed.
+        """
+        # ── Screenshot overlay singleton ──────────────────────────────
+        try:
+            from screenshot import (_overlay_lock, _overlay_active,
+                                    _pending_overlay)
+            with _overlay_lock:
+                if _overlay_active[0]:
+                    ov = _pending_overlay[0]
+                    alive = False
+                    try:
+                        if ov is not None:
+                            tk_root = getattr(ov, '_overlay', None) or \
+                                      getattr(ov, '_root', None)
+                            alive = (tk_root is not None
+                                     and tk_root.winfo_exists()
+                                     and tk_root.winfo_ismapped())
+                    except Exception:
+                        alive = False
+                    if not alive:
+                        _overlay_active[0] = False
+                        _pending_overlay[0] = None
+                        logger.info('Watchdog: reset stuck screenshot flag.')
+        except Exception:
+            pass
+
+        # ── Whisper recording ─────────────────────────────────────────
+        # AudioCapture uses `_recording` (underscore-prefixed); we also
+        # check the recording started recently because the audio thread
+        # spins up async after start_recording() and may take a tick to
+        # flip the flag. Without that grace window the watchdog races
+        # the start path and kills the recording within the first 2 s.
+        try:
+            if self._whisper_recording:
+                audio_active = False
+                try:
+                    audio_active = bool(self._audio
+                                        and getattr(self._audio, '_recording', False))
+                except Exception:
+                    audio_active = False
+                started_at = getattr(self, '_whisper_t0', 0.0)
+                fresh = (time.time() - started_at) < 5.0 if started_at else True
+                if not audio_active and not fresh:
+                    self._whisper_recording = False
+                    try: self.whisper_overlay.hide()
+                    except Exception: pass
+                    logger.info('Watchdog: reset stuck whisper recording flag.')
+        except Exception:
+            pass
+
+        # Grace window: a flag flipped within the last `fresh_secs` seconds
+        # is left alone, no matter what the underlying object reports. This
+        # prevents the watchdog from racing the start path (set-flag then
+        # spin-up-async-worker) and killing a hotkey the user just pressed.
+        # The audit said 5 s gives every start path plenty of room.
+        def _fresh(start_t: float, fresh_secs: float = 5.0) -> bool:
+            return bool(start_t) and (time.time() - start_t) < fresh_secs
+
+        # ── Screen recorder ───────────────────────────────────────────
+        try:
+            if (self._recorder_state == 'recording'
+                    and self._screen_recorder is None
+                    and not _fresh(getattr(self, '_recorder_t0', 0.0))):
+                self._recorder_state = 'idle'
+                try: self._update_library_recorder_state()
+                except Exception: pass
+                logger.info('Watchdog: reset stuck screen recorder flag.')
+        except Exception:
+            pass
+
+        # ── GIF recorder ──────────────────────────────────────────────
+        try:
+            if (self._gif_state in ('recording', 'encoding')
+                    and self._gif_recorder is None
+                    and not _fresh(getattr(self, '_gif_t0', 0.0))):
+                self._gif_state = 'idle'
+                try: self._update_library_gif_state()
+                except Exception: pass
+                logger.info('Watchdog: reset stuck GIF recorder flag.')
+        except Exception:
+            pass
+
+        # ── Macro recorder ────────────────────────────────────────────
+        try:
+            if self._macro_state in ('recording', 'playing'):
+                rec = getattr(self, '_macro', None)
+                alive = bool(rec and (rec.is_recording or rec.is_playing))
+                if not alive and not _fresh(getattr(self, '_macro_t0', 0.0)):
+                    try: self._set_macro_state('idle')
+                    except Exception:
+                        self._macro_state = 'idle'
+                    logger.info('Watchdog: reset stuck macro state.')
+        except Exception:
+            pass
+
+        # ── Refine in-flight ──────────────────────────────────────────
+        # If the refine_overlay is hidden and the request gen has not
+        # advanced in >60 s, the in-flight flag is almost certainly
+        # orphaned from a thread that crashed before unlocking.
+        try:
+            if self._refine_in_progress:
+                last_change = getattr(self, '_refine_gen_t', 0.0)
+                if last_change and (time.time() - last_change) > 60.0:
+                    self._refine_in_progress = False
+                    self._refine_gen += 1
+                    logger.info('Watchdog: reset orphaned refine in-flight flag.')
+        except Exception:
+            pass
+
+    def _show_mic_error(self, err: str = '') -> None:
+        """Dialog shown when the input stream can't be opened. We try to
+        infer the actual cause from the error string so the suggested
+        fix matches the failure mode, permissions look very different
+        from sample-rate mismatches, "device gone" looks different again.
+        """
+        import tkinter.messagebox as _mb
+        low = (err or '').lower()
+        # Permission-style errors (Windows blocks the app, etc.)
+        if any(t in low for t in ('access denied', 'permission', 'unauthorized',
+                                  'not allowed', '-9985', '-9988')):
+            body = (
+                'Hotkeys could not access your microphone.\n\n'
+                'To fix this:\n'
+                '  Windows 11/10 → Settings → Privacy & Security\n'
+                '  → Microphone → allow desktop apps to use the mic.\n\n'
+                'Then press the hotkey again.'
+            )
+        # Sample-rate / format issues, by the time we get here, every
+        # fallback (system default, native rate, etc.) has been exhausted
+        # in core/audio.py. Telling the user "pick the built-in mic" is
+        # wrong because that was already tried and also failed.
+        elif any(t in low for t in ('sample rate', '-9997', 'invalid sample',
+                                    'format', 'paformatisunsupported')):
+            body = (
+                "Hotkeys couldn't open any working microphone.\n\n"
+                'The selected mic AND the system default both refused the '
+                'audio format Hotkeys needs.\n\n'
+                'Try:\n'
+                '  • Plugging a different mic in, or\n'
+                '  • Restarting the app you were using your virtual mic '
+                'with (DroidCam, Voicemod, etc.).'
+            )
+        # "Device unavailable", chosen device disappeared AND system
+        # default also unreachable (both were attempted by the audio
+        # engine before we got here).
+        elif any(t in low for t in ('device unavailable', 'no default input',
+                                    '-9996', 'device not')):
+            body = (
+                'The microphone you selected is gone, and the system '
+                "default mic also couldn't be opened.\n\n"
+                'Plug a mic in, then open Settings to confirm which one '
+                'to use.'
+            )
+        else:
+            body = (
+                "Hotkeys couldn't open your microphone.\n\n"
+                'Check that a mic is plugged in and not in use by another '
+                'app, then try again.'
+            )
+        _mb.showerror('Microphone unavailable', body, parent=self.root)
+
+    def _check_data_dir_writable(self) -> None:
+        from storage import appdata_dir
+        appdata_dir()   # triggers the write test and sets _permission_warning
+        warn = getattr(appdata_dir, '_permission_warning', None)
+        if warn:
+            import tkinter.messagebox as _mb
+            _mb.showwarning('Storage warning', warn, parent=self.root)
 
     def _show_first_run_tip(self) -> None:
         if self.config.get('first_run_done'):
@@ -737,14 +1201,14 @@ class App:
             lib_hk    = hk.get('library', 'alt+shift+e').upper()
             self._tray.notify(
                 f'Select text → press {refine_hk} to refine with AI\n'
-                f'Press {lib_hk} to open the Prompt Library.',
+                f'Press {lib_hk} to open the Library.',
                 'Hotkeys is running ⚡',
             )
         except Exception:
             pass
 
     def _reload_hotkeys_manual(self) -> None:
-        """Full reset from tray menu — cancels anything stuck, re-registers hotkeys."""
+        """Full reset from tray menu, cancels anything stuck, re-registers hotkeys."""
         logger.info('Manual reload requested from tray.')
 
         # ── 1. Reload config from disk so hotkeys reflect the latest saved values ──
@@ -766,7 +1230,7 @@ class App:
             self._gif_setup_dlg = None
 
         # ── 3. Close any floating AskPill windows that grabbed the pointer ────────
-        # Build a set of permanent app windows to skip — destroying these would
+        # Build a set of permanent app windows to skip, destroying these would
         # corrupt self.library / self.settings with no recovery path.
         _permanent = set()
         for _attr in ('library', 'settings'):
@@ -844,11 +1308,103 @@ class App:
         except Exception:
             pass
 
-        # ── 4f. Close any floating AskPills ──────────────────────────────────────
+        # ── 4f. Close Whiteboard (save first) ────────────────────────────────────
+        try:
+            if self._wb_win is not None:
+                win = self._wb_win
+                self._wb_win = None
+                try:
+                    win._save_and_close()
+                except Exception:
+                    try:
+                        win.destroy()
+                    except Exception:
+                        pass
+                logger.info('Reload: Whiteboard window closed')
+        except Exception:
+            pass
+
+        # ── 4f-2. Close Whiteboard SUBPROCESS (pywebview) ────────────────────────
+        # The whiteboard runs in its own pywebview process, separate from the
+        # main app. If a previous launch is stuck (frozen UI, debounced save
+        # hanging), a plain destroy() of the in-process window above misses it.
+        # Find any window whose title matches and post WM_CLOSE so its
+        # auto-save flushes before exit.
+        if sys.platform == 'win32':
+            try:
+                import win32gui, win32con
+                def _wb_cb(h, _):
+                    if win32gui.GetWindowText(h) == 'Whiteboard (Shift+F8)':
+                        win32gui.PostMessage(h, win32con.WM_CLOSE, 0, 0)
+                win32gui.EnumWindows(_wb_cb, None)
+            except Exception as e:
+                logger.warning(f'Reload: whiteboard subprocess close failed: {e}')
+
+        # ── 4g. Close any floating AskPills ──────────────────────────────────────
         try:
             self._close_all_ask_pills()
         except Exception:
             pass
+
+        # ── 4h. Cancel any in-flight Refine request ──────────────────────────────
+        # Bumping the generation counter makes every pending callback a no-op
+        # (the engine threads check it before touching UI state). This frees
+        # the user from a hung "Thinking…" pill if the network call is stuck.
+        try:
+            if self._refine_in_progress:
+                self._refine_gen += 1
+                self._refine_in_progress = False
+                logger.info('Reload: in-flight Refine cancelled')
+        except Exception:
+            pass
+
+        # ── 4i. Cancel any active F9 Transcribe job ──────────────────────────────
+        # The Transcribe panel exposes a threading.Event the worker checks at
+        # every step (download / convert / diarize / transcribe / export).
+        # Setting it terminates the job cleanly without leaving temp files.
+        try:
+            panel = getattr(self.library, '_transcribe_panel', None)
+            if panel is not None:
+                ce = getattr(panel, '_cancel', None)
+                if ce is not None:
+                    ce.set()
+                    logger.info('Reload: F9 transcribe job cancel requested')
+        except Exception:
+            pass
+
+        # ── 4j. Close the prompt sticky note if it's floating around ─────────────
+        try:
+            if self._sticky is not None:
+                try:
+                    self._sticky.destroy()
+                except Exception:
+                    pass
+                self._sticky = None
+        except Exception:
+            pass
+
+        # ── 4k. Force-release the screenshot overlay singleton flag ──────────────
+        # Print Screen claims `screenshot._overlay_active[0] = True` before
+        # grabbing the desktop. If the previous overlay crashed, was killed
+        # by the user via Esc-on-the-grab-thread, or unwound without
+        # touching the flag for any reason, every subsequent PrtSc press
+        # silently no-ops on the singleton check and the user thinks the
+        # feature is broken. Reload Hotkeys is the user's panic-recovery
+        # path, so it should reset this flag too.
+        try:
+            from screenshot import (_overlay_lock, _overlay_active,
+                                    _pending_overlay)
+            ov = None
+            with _overlay_lock:
+                ov = _pending_overlay[0]
+                _pending_overlay[0] = None
+                _overlay_active[0]  = False
+            if ov is not None:
+                try: ov.cancel()
+                except Exception: pass
+            logger.info('Reload: screenshot overlay flag reset.')
+        except Exception as e:
+            logger.warning(f'Reload: screenshot flag reset failed: {e}')
 
         # ── 5. Hide all overlays ──────────────────────────────────────────────────
         for ov in (self.refine_overlay, self.whisper_overlay,
@@ -863,6 +1419,21 @@ class App:
         self._register_hotkeys()
         self._register_macro_saved_hotkeys()
         self._register_chain_hotkeys()
+
+        # ── 7. Refresh dependent UI so visible labels match new bindings ──────────
+        # The Library renders hotkey labels next to each prompt / chain / tab;
+        # if the user remapped anything since the last open, those labels are
+        # stale until we explicitly refresh. The tray menu is rebuilt so its
+        # right-aligned shortcut hints also reflect the latest config.
+        try:
+            self.library.refresh_hotkeys(self._hotkey_cfg())
+        except Exception:
+            pass
+        try:
+            self._update_tray()
+        except Exception:
+            pass
+
         self._notify('Hotkeys reset ⚡', 'All hotkeys reloaded and ready.')
 
     def _schedule_rereg(self, delay_ms: int = 80) -> None:
@@ -899,7 +1470,7 @@ class App:
                     break
                 time.sleep(0.015)
         else:
-            # macOS: use keyboard.is_pressed — brief wait for modifier release
+            # macOS: use keyboard.is_pressed, brief wait for modifier release
             try:
                 import keyboard as _kb
                 _deadline = time.time() + 0.5
@@ -938,16 +1509,21 @@ class App:
         self._q.put(('refine', captured))
 
     def _hk_ask(self) -> None:
-        """Shift+F4 — capture selected text and show answer pill."""
+        """Shift+F4, capture selected text and show answer pill."""
         threading.Thread(target=self._capture_and_queue_ask, daemon=True).start()
 
     def _capture_and_queue_ask(self) -> None:
         """Capture question for Shift+F4.
 
-        Priority:
+        Priority (REORDERED 2026-05-31 — selected text wins over stale clipboard):
           0. Screenshot overlay with an active drag selection → crop + OCR.
-          1. Image in clipboard → OCR it, use extracted text as the question.
-          2. Selected text → copy and use as the question.
+          1. **Selected text** (fresh Ctrl+C copy) → use as the question.
+          2. Image in clipboard → OCR it (only if no selection captured).
+
+        The old order had clipboard-image OCR before selection, which meant
+        a stale screenshot lurking in the user's clipboard (e.g. from a
+        browser tab-strip copy hours ago) would override a freshly-selected
+        question like "Why is the sky blue?". Fresh user intent always wins.
         """
         # ── Priority 0: screenshot overlay with active selection ─────────────
         # Check BEFORE the Shift-release wait so the overlay closes immediately.
@@ -970,7 +1546,7 @@ class App:
                             self._q.put(('ask', captured))
                         return
                     except Exception as exc:
-                        logger.warning(f'Ask: overlay OCR failed ({exc}) — falling back')
+                        logger.warning(f'Ask: overlay OCR failed ({exc}), falling back')
 
         # Wait for Shift to release before doing anything with the clipboard
         if sys.platform == 'win32':
@@ -982,29 +1558,10 @@ class App:
                 time.sleep(0.015)
         time.sleep(0.04)
 
-        # ── Priority 1: image in clipboard → OCR → use as question ──────────
-        try:
-            from vision import get_clipboard_image
-            img, err = get_clipboard_image()
-            if img is not None:
-                logger.info('Ask: image in clipboard — OCR-ing before answering')
-                try:
-                    extractor = self._vision_extractor
-                    captured  = extractor(img).strip()
-                    logger.info(f'Ask: OCR gave ({len(captured)} chars): {captured[:80]!r}')
-                    if _ocr_is_no_text(captured):
-                        self._q.put(('ask', _ASK_NO_TEXT))
-                    else:
-                        self._q.put(('ask', captured))
-                    return
-                except Exception as exc:
-                    logger.warning(f'Ask: OCR failed ({exc}) — falling back to selection')
-            elif err:
-                logger.warning(f'Ask: clipboard image error: {err}')
-        except Exception as exc:
-            logger.warning(f'Ask: clipboard check failed: {exc}')
-
-        # ── Priority 2: selected text ─────────────────────────────────────────
+        # ── Priority 1: selected text (CHECK FIRST) ─────────────────────────
+        # Save whatever's in clipboard (could be a stale image), clear, send
+        # Ctrl+C, watch for fresh text to land. If text arrives → that's the
+        # user's selection and wins over any stale clipboard image.
         try:
             prev = pyperclip.paste()
         except Exception:
@@ -1024,13 +1581,51 @@ class App:
             if current and current.strip():
                 captured = current
                 break
-        if not captured:
+
+        if captured:
+            # Restore the previous clipboard contents so we don't leak the
+            # selection into whatever the user had copied before pressing
+            # Shift+F4. (Pyperclip text-only — image clipboard is restored
+            # by the OS since Ctrl+C only overwrites the text format.)
+            logger.info(f'Ask: selected-text captured ({len(captured)} chars): {captured[:80]!r}')
             try:
                 pyperclip.copy(prev)
             except Exception:
                 pass
-        logger.info(f'Ask: captured ({len(captured)} chars): {captured[:80]!r}')
-        self._q.put(('ask', captured))
+            self._q.put(('ask', captured))
+            return
+
+        # No selection captured. Restore prev so the image (if any) survives.
+        try:
+            pyperclip.copy(prev)
+        except Exception:
+            pass
+
+        # ── Priority 2: image in clipboard → OCR (fallback only) ────────────
+        try:
+            from vision import get_clipboard_image
+            img, err = get_clipboard_image()
+            if img is not None:
+                logger.info('Ask: no selection, falling back to clipboard image OCR')
+                try:
+                    extractor = self._vision_extractor
+                    captured  = extractor(img).strip()
+                    logger.info(f'Ask: OCR gave ({len(captured)} chars): {captured[:80]!r}')
+                    if _ocr_is_no_text(captured):
+                        self._q.put(('ask', _ASK_NO_TEXT))
+                    else:
+                        self._q.put(('ask', captured))
+                    return
+                except Exception as exc:
+                    logger.warning(f'Ask: clipboard OCR failed ({exc}); no question available')
+            elif err:
+                logger.warning(f'Ask: clipboard image error: {err}')
+        except Exception as exc:
+            logger.warning(f'Ask: clipboard check failed: {exc}')
+
+        # Nothing usable found.
+        logger.info('Ask: nothing to ask about (no selection, no clipboard image)')
+        self._q.put(('ask', _ASK_NO_TEXT))
 
     def _close_all_ask_pills(self) -> None:
         """Close every tracked AskPill. Safe to call from main thread."""
@@ -1042,8 +1637,8 @@ class App:
         self._ask_pills.clear()
 
     def _do_ask(self, text: str) -> None:
-        """Main-thread handler — open the answer pill."""
-        # Close any existing pill before opening a new one — prevents stacking.
+        """Main-thread handler, open the answer pill."""
+        # Close any existing pill before opening a new one, prevents stacking.
         self._close_all_ask_pills()
 
         def _on_pill_close(pill_ref):
@@ -1053,22 +1648,28 @@ class App:
                 pass
 
         if not text or not text.strip():
-            pill = AskPill(self.root, '', self.provider,
-                           static='Select text first — or type below')
-            pill._on_close = lambda p=pill: _on_pill_close(p)
-            self._ask_pills.append(pill)
+            # Match Refine (Alt+Shift+W) behavior: show the simple "No text
+            # selected" info pill instead of opening a chat-like AskPill.
+            # Less surface, matches user expectation that empty-input hotkeys
+            # behave consistently across features.
+            self.refine_overlay.show_no_selection()
             threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
             return
         if text == _ASK_NO_TEXT:
-            # Image had no readable text — show status pill, no API call
-            pill = AskPill(self.root, '', self.provider,
-                           static='No text found in image')
-            pill._on_close = lambda p=pill: _on_pill_close(p)
-            self._ask_pills.append(pill)
+            # Image had no readable text → tiny toast, same shape as
+            # show_no_selection but with the more accurate message.
+            try:
+                self.refine_overlay.show_error('No text found in image')
+            except Exception:
+                # Fallback to AskPill if the overlay can't render the error.
+                pill = AskPill(self.root, '', self.provider,
+                               static='No text found in image')
+                pill._on_close = lambda p=pill: _on_pill_close(p)
+                self._ask_pills.append(pill)
             threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
             return
         if not self.provider.ready:
-            self.refine_overlay.show_error('API key required — open Settings')
+            self.refine_overlay.show_error('API key required, open Settings')
             threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
             return
         pill = AskPill(self.root, text.strip(), self.provider)
@@ -1082,7 +1683,7 @@ class App:
         from storage import get_active_bookmark
         bm = get_active_bookmark()
         if not bm:
-            self.refine_overlay.show_error('No bookmark set — open Web tab to add one')
+            self.refine_overlay.show_error('No bookmark set, open Web tab to add one')
             return
         url = bm['url']
         if not url.startswith(('http://', 'https://')):
@@ -1092,7 +1693,7 @@ class App:
     # ── Quick Notes ───────────────────────────────────────────────────────────
 
     def _do_open_notes(self) -> None:
-        """Shift+F7 — toggle / restore the Quick Notes overlay."""
+        """Shift+F7, toggle / restore the Quick Notes overlay."""
         if self._notes_win is not None:
             try:
                 if self._notes_win.winfo_exists():
@@ -1128,6 +1729,10 @@ class App:
             self.config['notes_geometry'] = geo
             threading.Thread(target=save_config, args=(self.config,), daemon=True).start()
 
+        def _on_theme_change(theme: str) -> None:
+            self.config['notes_theme'] = theme
+            threading.Thread(target=save_config, args=(self.config,), daemon=True).start()
+
         self._notes_win = QuickNotesWindow(
             self.root,
             transcribe_fn=self._transcriber.transcribe_for_notes,
@@ -1137,12 +1742,203 @@ class App:
             provider=self.provider,
             initial_geometry=self.config.get('notes_geometry', ''),
             on_geometry_change=_on_geometry_change,
+            initial_theme=self.config.get('notes_theme', 'light'),
+            on_theme_change=_on_theme_change,
         )
+
+    # ── Transcribe (Shift+F9) ────────────────────────────────────────────────
+
+    def _do_open_transcribe(self) -> None:
+        """Open the Library window directly on the Transcribe tab. The tab
+        owns the entire transcription pipeline (file/URL → diarized
+        transcript + AI summary + multi-format export); we just route the
+        user there."""
+        try:
+            self.library.show()
+            self.library._switch_tab('transcribe')
+        except Exception as e:
+            logger.warning(f'Open Transcribe failed: {e}')
+            self._notify('Transcribe', f'Could not open: {e}')
+
+    # ── Whiteboard ────────────────────────────────────────────────────────────
+
+    def _do_open_whiteboard(self) -> None:
+        """Shift+F8, toggle the offline-Whiteboard whiteboard subprocess.
+
+        Runs whiteboard.py (pywebview + bundled @whiteboard/whiteboard)
+        as its own process, pywebview's edgechromium backend needs to own the
+        main thread, so it can't co-host inside this Tk app.
+
+        Toggle semantics:
+          • no process    → spawn
+          • foreground    → minimize
+          • minimized     → restore + foreground
+          • background    → foreground
+          • dead          → respawn
+        """
+        import subprocess
+        from pathlib import Path as _Path
+
+        # When frozen, sys.executable IS the app exe, re-launch self with a
+        # sentinel arg that main() catches early and routes into whiteboard
+        # mode (see _maybe_run_whiteboard_mode below). When running from
+        # source, just invoke the .py file with python.
+        frozen = getattr(sys, 'frozen', False)
+        if frozen:
+            spawn_cmd = [sys.executable, '--whiteboard']
+            spawn_cwd = str(_Path(sys.executable).parent)
+        else:
+            script = _Path(__file__).resolve().parent / 'whiteboard.py'
+            if not script.exists():
+                logger.error(f'whiteboard.py missing at {script}')
+                return
+            spawn_cmd = [sys.executable, str(script)]
+            spawn_cwd = str(script.parent)
+
+        # Find the existing window by title, single_instance.py re-execs
+        # pythonw so the window owner is a grandchild we don't directly track.
+        if sys.platform == 'win32':
+            try:
+                import win32gui, win32con
+                found = []
+                # Exact prefix uniquely identifies our pywebview window,
+                # avoids matching unrelated Chrome tabs etc.
+                WB_TITLE = 'Whiteboard (Shift+F8)'
+                def _cb(h, _):
+                    if not win32gui.IsWindow(h): return
+                    if win32gui.GetWindowText(h) == WB_TITLE:
+                        found.append(h)
+                win32gui.EnumWindows(_cb, None)
+                if found:
+                    h = found[0]
+                    if win32gui.IsIconic(h):
+                        win32gui.ShowWindow(h, win32con.SW_RESTORE)
+                        self._force_foreground(h)
+                    elif win32gui.GetForegroundWindow() == h:
+                        win32gui.ShowWindow(h, win32con.SW_MINIMIZE)
+                    else:
+                        self._force_foreground(h)
+                    return
+            except Exception as e:
+                logger.warning(f'whiteboard toggle failed, will respawn: {e}')
+
+        # In dev mode, swap python.exe → pythonw.exe to suppress the console
+        # flash. Frozen exe is already windowed.
+        if not frozen:
+            py_lc = spawn_cmd[0].lower()
+            if py_lc.endswith('python.exe'):
+                pyw = spawn_cmd[0][:-10] + 'pythonw.exe'
+                if _Path(pyw).exists():
+                    spawn_cmd[0] = pyw
+        # Use PowerShell Start-Process as a launcher intermediary. Direct
+        # subprocess.Popen with every isolation flag we tried (DETACHED,
+        # NEW_PROCESS_GROUP, BREAKAWAY_FROM_JOB, DEVNULL stdio) STILL
+        # killed the parent process whenever the child loaded pywebview
+        # / Edge WebView2. PowerShell's Start-Process creates the child
+        # through a PowerShell intermediary which then exits — the final
+        # whiteboard process is orphaned to System and has zero linkage
+        # to us. This is the only launch method we found that survives.
+        if sys.platform == 'win32':
+            arg_str = ' '.join(f'"{a}"' for a in spawn_cmd[1:])
+            ps_script = (
+                f"Start-Process -FilePath '{spawn_cmd[0]}' "
+                + (f"-ArgumentList {arg_str} " if arg_str else '')
+                + f"-WindowStyle Hidden -WorkingDirectory '{spawn_cwd}'"
+            )
+            proc = subprocess.Popen(
+                ['powershell', '-NoProfile', '-WindowStyle', 'Hidden',
+                 '-Command', ps_script],
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                close_fds=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            # PowerShell exits within ~1s; we don't track its pid.
+            self._wb_proc = proc
+            self._wb_proc_pid = None  # actual whiteboard pid is unknown; we find it by window title
+        else:
+            proc = subprocess.Popen(
+                spawn_cmd, cwd=spawn_cwd, close_fds=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            self._wb_proc = proc
+            self._wb_proc_pid = proc.pid
+        logger.info(f'Launched whiteboard via {"powershell intermediary" if sys.platform == "win32" else "direct"} ({"frozen" if frozen else "source"})')
+
+    def _do_open_audio_editor(self) -> None:
+        """Shift+F10, toggle the bundled audio editor (Tenacity portable).
+
+        Launched as a sibling process. The launcher relabels the upstream
+        window title to "Audio Editor" so the front UI is brand-clean.
+        Toggle semantics mirror the whiteboard, see audio_editor.py.
+        Pass our Tk root so the launcher can pop a "drop file here"
+        hint overlay over the editor on first launch.
+        """
+        try:
+            import audio_editor
+            audio_editor.toggle(tk_root=self.root)
+        except Exception as e:
+            logger.error(f'audio editor toggle failed: {e}')
+
+    @staticmethod
+    def _is_whiteboard_foreground() -> bool:
+        """True when the offline-Whiteboard whiteboard owns the foreground.
+
+        Used to gate global app hotkeys: while the user is drawing /
+        text-editing in the whiteboard, the app's hotkeys (refine, whisper,
+        per-prompt F-keys, macros, etc.) should silently no-op so they
+        don't double-fire alongside Whiteboard's own shortcuts. Shift+F8
+        itself is NOT gated, toggling the window must always work.
+        """
+        if sys.platform != 'win32':
+            return False
+        try:
+            import win32gui
+            h = win32gui.GetForegroundWindow()
+            return win32gui.GetWindowText(h) == 'Whiteboard (Shift+F8)'
+        except Exception:
+            return False
+
+    @staticmethod
+    def _force_foreground(hwnd) -> None:
+        """SetForegroundWindow with the AttachThreadInput workaround, Windows
+        ignores plain SetForegroundWindow from a non-foreground process unless
+        we briefly attach to the current foreground thread's input queue.
+
+        Critically, we ONLY call ShowWindow(SW_RESTORE) if the target window
+        is currently minimised. Calling SW_RESTORE on a maximised window
+        un-maximises it (Windows treats SW_RESTORE as "previous non-iconic
+        state"), which is exactly the "title bar double-click resize" effect
+        the user sees after every Ctrl+Enter on a maximised editor.
+        """
+        try:
+            import ctypes
+            u, k = ctypes.windll.user32, ctypes.windll.kernel32
+            fg = u.GetForegroundWindow()
+            fg_t = u.GetWindowThreadProcessId(fg, None) if fg else 0
+            cur = k.GetCurrentThreadId()
+            attached = False
+            if fg_t and fg_t != cur:
+                attached = bool(u.AttachThreadInput(cur, fg_t, True))
+            u.BringWindowToTop(hwnd)
+            # Only restore if the window is actually minimised (iconic);
+            # otherwise leave its size alone. This preserves maximised
+            # state and prevents the "window shrinks after every paste" bug.
+            if u.IsIconic(hwnd):
+                u.ShowWindow(hwnd, 9)  # SW_RESTORE
+            u.SetForegroundWindow(hwnd)
+            if attached:
+                u.AttachThreadInput(cur, fg_t, False)
+        except Exception as e:
+            logger.warning(f'_force_foreground: {e}')
 
     # ── Chain hotkey ─────────────────────────────────────────────────────────
 
     def _hk_chain(self) -> None:
-        """Shift+F6 (or per-chain hotkey) — capture text and run active chain."""
+        """Shift+F6 (or per-chain hotkey), capture text and run active chain."""
         logger.info('Chain hotkey fired.')
         threading.Thread(target=self._capture_and_queue_chain, daemon=True).start()
 
@@ -1195,19 +1991,19 @@ class App:
         self._q.put(('chain', captured))
 
     def _do_chain(self, text: str) -> None:
-        """Main-thread handler — find active chain and start runner thread."""
+        """Main-thread handler, find active chain and start runner thread."""
         if self._refine_in_progress:
-            self.chain_overlay.show_error('Refine in progress — wait for it to finish')
+            self.chain_overlay.show_error('Refine in progress, wait for it to finish')
             threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
             return
         if self._whisper_recording:
-            self.chain_overlay.show_error('Recording in progress — stop first')
+            self.chain_overlay.show_error('Recording in progress, stop first')
             threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
             return
         self.chains = load_chains()
         active_chain = next((c for c in self.chains if c.get('active')), None)
         if not self.chains or active_chain is None:
-            self.chain_overlay.show_error('No active chain — open Chains tab to set one')
+            self.chain_overlay.show_error('No active chain, open Chains tab to set one')
             threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
             return
         if not text or not text.strip():
@@ -1215,7 +2011,7 @@ class App:
             threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
             return
         if not self.provider.ready:
-            self.chain_overlay.show_error('API key required — open Settings')
+            self.chain_overlay.show_error('API key required, open Settings')
             threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
             return
         threading.Thread(
@@ -1225,7 +2021,7 @@ class App:
         ).start()
 
     def _run_chain(self, chain: dict, text: str) -> None:
-        """Background thread — execute all steps sequentially."""
+        """Background thread, execute all steps sequentially."""
         steps = chain.get('steps', [])
         if not steps:
             self.root.after(0, lambda: self.chain_overlay.show_error('Chain has no steps'))
@@ -1244,26 +2040,24 @@ class App:
                 if not result or not result.strip():
                     raise RuntimeError(f'Step {i + 1} ({lbl}) returned empty response')
                 current_text = result.strip()
-            # All steps done — paste result
+            # All steps done, paste result
             name = chain.get('name', 'Chain')
             self.root.after(0, lambda: self.chain_overlay.show_chain_done(name))
             pyperclip.copy(current_text)
             self.root.after(40, paste_from_clipboard)
             self.root.after(150, self._reregister_after_action)
-            logger.info(f'Chain "{name}" complete — {len(steps)} steps')
+            logger.info(f'Chain "{name}" complete, {len(steps)} steps')
         except Exception as ex:
             logger.error(f'Chain error: {ex}')
-            err_msg = str(ex)
-            if '429' in err_msg or 'rate' in err_msg.lower() or 'quota' in err_msg.lower():
-                err_msg = 'Rate limit reached — try again later'
-            elif 'api key' in err_msg.lower() or '401' in err_msg:
-                err_msg = 'Invalid API key — check Settings'
-            short = (err_msg[:48] + '…') if len(err_msg) > 48 else err_msg
-            self.root.after(0, lambda e=short: self.chain_overlay.show_error(f'Chain error: {e}'))
+            from engine import friendly_error_message
+            err_msg = friendly_error_message(
+                ex, feature='Chain',
+                active_provider=self.config.get('active_provider', ''))
+            self.root.after(0, lambda e=err_msg: self.chain_overlay.show_error(e))
             self.root.after(0, self._reregister_after_action)
 
     def _do_chain_named(self, chain: dict) -> None:
-        """Main-thread handler for per-chain hotkeys — captures text then runs that chain."""
+        """Main-thread handler for per-chain hotkeys, captures text then runs that chain."""
         # Reuse the same capture flow but run a specific chain
         threading.Thread(
             target=self._capture_and_queue_chain_named,
@@ -1323,7 +2117,7 @@ class App:
             return
         if not self.provider.ready:
             self.root.after(0, lambda: self.chain_overlay.show_error(
-                'API key required — open Settings'))
+                'API key required, open Settings'))
             self.root.after(0, lambda: threading.Thread(
                 target=self._register_hotkeys_bg, daemon=True).start())
             return
@@ -1385,24 +2179,24 @@ class App:
         cancel_screenshot()
 
     def _hk_escape(self) -> None:
-        # Screenshot overlay has top priority — Esc must always dismiss it,
+        # Screenshot overlay has top priority, Esc must always dismiss it,
         # even if the grab is still in flight (main thread not yet blocked).
         from screenshot import _overlay_active
         if _overlay_active[0]:
             self._q.put(('screenshot:cancel', None))
             return
-        # Macro takes priority — stop recording/playback first.
+        # Macro takes priority, stop recording/playback first.
         if self._macro_state in ('recording', 'playing'):
             self._q.put(('macro:stop', None))
             return
-        # GIF recording — Esc aborts capture.
+        # GIF recording, Esc aborts capture.
         if self._gif_state == 'recording':
             self._q.put(('gif:toggle', None))   # stop → encode → save dialog
             return
         if self._whisper_recording:
             self._q.put(('whisper:cancel', None))
             return
-        # Nothing active — close any floating AskPills.
+        # Nothing active, close any floating AskPills.
         # (Pills no longer register their own global escape hook because
         # keyboard.unhook_all() inside _register_hotkeys would nuke them.)
         if self._ask_pills:
@@ -1419,7 +2213,7 @@ class App:
             return
         prompt = self.prompts[idx]
 
-        # 1. Activate via library._select — updates active_idx, highlight, header
+        # 1. Activate via library._select, updates active_idx, highlight, header
         #    label, and fires on_select (which sets self.active_prompt) all at once.
         try:
             self.library._select(idx)
@@ -1437,7 +2231,7 @@ class App:
                 self._sticky     = None
                 self._sticky_idx = None
 
-        # 2. If the SAME prompt's note is already open — apply & close it (toggle).
+        # 2. If the SAME prompt's note is already open, apply & close it (toggle).
         #    Pressing F1 → F1 is the quick "confirm and continue" flow.
         if self._sticky is not None and self._sticky_idx == idx:
             try:
@@ -1446,7 +2240,7 @@ class App:
                 self._sticky.destroy()
             return
 
-        # 2b. Different prompt's note is open — replace it silently.
+        # 2b. Different prompt's note is open, replace it silently.
         if self._sticky is not None:
             try:
                 self._sticky.destroy()
@@ -1459,7 +2253,7 @@ class App:
         def _on_note_save(updated: dict) -> None:
             # Guard: prompt may have been deleted while the note was open
             if idx >= len(self.prompts):
-                logger.warning(f'Sticky note save: prompt[{idx}] no longer exists — discarding')
+                logger.warning(f'Sticky note save: prompt[{idx}] no longer exists, discarding')
                 return
             updated['hotkey'] = self.prompts[idx].get('hotkey', '')
             self.prompts[idx] = updated
@@ -1505,12 +2299,12 @@ class App:
         self.prompts = prompts
         self._at_default_prompts = False   # any edit re-enables Restore Default Prompts
         self._update_tray()
-        # Save to disk in background — no need to block the UI thread for file I/O
+        # Save to disk in background, no need to block the UI thread for file I/O
         threading.Thread(target=save_prompts, args=(prompts,), daemon=True).start()
         if prompts and self.active_prompt not in prompts:
             self.active_prompt = prompts[0]
         # Re-register hotkeys in background: _register_hotkeys() has a 150 ms
-        # sleep inside it (OS hook flush) — running it here would freeze the UI.
+        # sleep inside it (OS hook flush), running it here would freeze the UI.
         threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
 
     def _on_folders_changed(self, folders: list, folder_colors: dict | None = None) -> None:
@@ -1522,7 +2316,7 @@ class App:
         threading.Thread(target=save_config, args=(self.config,), daemon=True).start()
 
     def _register_hotkeys_bg(self) -> None:
-        """Thread-safe wrapper — guarantees the latest prompt list is always applied.
+        """Thread-safe wrapper, guarantees the latest prompt list is always applied.
 
         Uses a pending flag so rapid saves (e.g. drag-reorder + edit in quick
         succession) never silently lose a registration: if the lock is busy the
@@ -1543,6 +2337,19 @@ class App:
             self._register_chain_hotkeys()
         finally:
             self._hk_reg_lock.release()
+        # Push the new hotkey config to the LibraryWindow so its cached
+        # header label / hint bar / tab tooltips update immediately. Tk
+        # widgets must be touched from the main thread, so marshal via
+        # root.after(), safe whether we were called from a worker or the
+        # main thread.
+        try:
+            if hasattr(self, 'library') and self.library is not None:
+                self.root.after(
+                    0,
+                    lambda: self.library.refresh_hotkeys(self._hotkey_cfg()),
+                )
+        except Exception as e:
+            logger.warning(f'library hotkey-label refresh failed: {e}')
 
     def _on_feature_hotkey_changed(self, cfg_key: str, combo: str) -> None:
         """Called when user right-click-rebinds a feature hotkey from a library tab."""
@@ -1563,7 +2370,7 @@ class App:
             threading.Thread(target=self._load_model, daemon=True).start()
         # Rebuild whisper pipeline with new config
         self._rebuild_whisper_pipeline(new_config)
-        # Re-register hotkeys off the main thread — _register_hotkeys() has a
+        # Re-register hotkeys off the main thread, _register_hotkeys() has a
         # 150 ms sleep inside it (OS hook flush) that would freeze the UI here.
         threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
         self._update_tray()
@@ -1588,7 +2395,7 @@ class App:
         )
         threading.Thread(target=lambda: self._audio.start(), daemon=True).start()
         # Transcriber model is already loaded; create new one only if model changed
-        # (For simplicity, recreate — user is in settings anyway so latency is ok)
+        # (For simplicity, recreate, user is in settings anyway so latency is ok)
         self._transcriber.shutdown()
         self._transcriber = Transcriber(
             cfg=wcfg,
@@ -1604,7 +2411,7 @@ class App:
         if isinstance(self.provider, LocalProvider):
             return   # splash provider step handled by model_ready
         if not self.provider.ready:
-            self._q.put(('prewarm:done', None))   # no API key — mark done immediately
+            self._q.put(('prewarm:done', None))   # no API key, mark done immediately
             return
         try:
             self.provider.refine('Hello', 'Reply with one word: OK')
@@ -1625,15 +2432,47 @@ class App:
 
     # ── Event poll loop ───────────────────────────────────────────────────────
 
+    # Empty gate by design, every app feature works seamlessly inside
+    # the whiteboard:
+    #
+    # • Result-paste features (Whisper, OCR, Macros, Recorder, GIF, Web,
+    #   Notes) end by writing to the clipboard + Ctrl+V; Whiteboard
+    #   natively handles Ctrl+V → text/image element.
+    #
+    # • Text-capture features (Refine, Ask, Chain, Library, per-prompt
+    #   hotkeys) start with Ctrl+C. Whiteboard's Ctrl+C is "smart": a
+    #   selected text element copies its TEXT CONTENT, not its JSON. So
+    #   "select text element → F1 (Refine prompt)" gives a useful flow:
+    #   the refined text comes back as a new text element via Ctrl+V.
+    #
+    # • The only known minor friction is Ctrl+Enter, which is Whisper
+    #   start AND Whiteboard's commit-text-edit. When the user is
+    #   editing text, both fire, Whiteboard commits, Whisper starts
+    #   recording. Esc cancels the accidental recording; we accept the
+    #   trade-off for keeping Whisper available everywhere.
+    #
+    # Structure kept (instead of removed) so future regressions can be
+    # gated narrowly without rewiring the dispatch loop.
+    _WHITEBOARD_GATED_EVENTS: frozenset[str] = frozenset()
+
+    def _is_event_gated(self, event: str) -> bool:
+        """True when this event should be silently swallowed because the
+        whiteboard owns focus. Currently always False, see the comment
+        on _WHITEBOARD_GATED_EVENTS for the design rationale."""
+        return event in self._WHITEBOARD_GATED_EVENTS
+
     def _poll(self) -> None:
         # Reschedule FIRST so a handler that calls wait_window() (which creates
         # a nested Tk event loop) doesn't prevent the next poll from running.
         # Without this, any modal dialog opened from a handler would stop all
-        # queue processing — including tray "Reload hotkeys" — until it closed.
+        # queue processing, including tray "Reload hotkeys", until it closed.
         self.root.after(30, self._poll)
         try:
+            wb_fg = self._is_whiteboard_foreground()
             while True:
                 event, data = self._q.get_nowait()
+                if wb_fg and self._is_event_gated(event):
+                    continue  # Whiteboard owns focus, let Whiteboard handle it
                 handler = self._dispatch.get(event)
                 if handler:
                     try:
@@ -1649,11 +2488,11 @@ class App:
         if self._whisper_recording:
             return   # don't clobber the clipboard mid-recording
         if self._refine_in_progress:
-            return   # already running — ignore rapid double-press
+            return   # already running, ignore rapid double-press
         if not text or not text.strip():
             self.refine_overlay.show_no_selection()
             # Re-register so the keyboard library resets after the suppressed
-            # hotkey — without this, the library's stuck modifier state blocks
+            # hotkey, without this, the library's stuck modifier state blocks
             # all subsequent hotkeys until the next successful paste re-reg.
             threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
             return
@@ -1662,12 +2501,13 @@ class App:
             threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
             return
         if not self.provider.ready:
-            self.refine_overlay.show_error('API key required — open Settings')
+            self.refine_overlay.show_error('API key required, open Settings')
             threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
             return
 
         self._undo_available = False   # new refinement invalidates any prior undo
         self._refine_in_progress = True
+        self._refine_gen_t = time.time()   # stamp for watchdog timeout check
         self._refine_gen += 1
         gen      = self._refine_gen
         self._refine_t0 = time.time()
@@ -1676,7 +2516,7 @@ class App:
         provider = self.provider
 
         def infer() -> None:
-            # 30-second hard timeout — fires refine:timeout on the main thread
+            # 30-second hard timeout, fires refine:timeout on the main thread
             timer = threading.Timer(
                 30.0, lambda: self._q.put(('refine:timeout', gen))
             )
@@ -1694,12 +2534,11 @@ class App:
                 timer.cancel()
                 logger.error(f'Inference error: {e}')
                 if gen == self._refine_gen:
-                    msg = str(e)
-                    if '429' in msg or 'rate' in msg.lower() or 'quota' in msg.lower():
-                        msg = 'Daily limit reached — try again later or add your own API key in Settings'
-                    elif 'api key' in msg.lower() or 'api_key' in msg.lower() or 'unauthorized' in msg.lower() or '401' in msg:
-                        msg = 'Invalid API key — check Settings'
-                    self._q.put(('refine:error', msg[:80]))
+                    from engine import friendly_error_message
+                    msg = friendly_error_message(
+                        e, feature='Refine',
+                        active_provider=self.config.get('active_provider', ''))
+                    self._q.put(('refine:error', msg))
             finally:
                 self._q.put(('refine:unlock', gen))
 
@@ -1709,11 +2548,11 @@ class App:
         elapsed = time.time() - self._refine_t0
         self.refine_overlay.show_done(elapsed)
         pyperclip.copy(result)
-        # Use direct Win32 SendInput (same path as whisper) — avoids routing
+        # Use direct Win32 SendInput (same path as whisper), avoids routing
         # through the keyboard library, which can leave its key-state machine
         # stale (stuck modifier keys) and break subsequent hotkeys.
         self.root.after(40, paste_from_clipboard)
-        # Re-register hotkeys after the paste lands — resets any library state
+        # Re-register hotkeys after the paste lands, resets any library state
         # corruption that injected Ctrl+V events may have caused.
         self.root.after(150, self._reregister_after_action)
         self._undo_available = True
@@ -1730,8 +2569,8 @@ class App:
         self._undo_available = False
         # Ctrl+Z in the focused app undoes our Ctrl+V paste, restoring the
         # original selected text.  We delay 40 ms so the hotkey release clears
-        # before the synthetic key arrives.  Uses Win32 SendInput directly —
-        # not keyboard.send() — to avoid corrupting the library's modifier state.
+        # before the synthetic key arrives.  Uses Win32 SendInput directly,
+        # not keyboard.send(), to avoid corrupting the library's modifier state.
         self.root.after(40, undo_last)
         logger.info('Undo last refinement')
 
@@ -1739,7 +2578,7 @@ class App:
         """Return True if the given prompts match the cached bundled defaults.
 
         Uses self._bundled_defaults (loaded once at startup) so that dev-mode
-        saves — which overwrite prompts.json — don't corrupt the comparison.
+        saves, which overwrite prompts.json, don't corrupt the comparison.
         """
         defaults = getattr(self, '_bundled_defaults', [])
         if not defaults:
@@ -1755,18 +2594,66 @@ class App:
         )
 
     def _do_restore_all_defaults(self) -> None:
-        """Restore prompts, hotkeys, bookmarks, and window sizes to factory defaults."""
+        """Restore prompts, hotkeys, bookmarks, chains, and window sizes to
+        factory defaults. Re-registers all dependent hooks (keyboard,
+        per-chain hotkeys, per-prompt hotkeys) so the live app state is
+        consistent, the user should not need to restart for any reset to
+        take effect."""
         from dialogs import confirm
-        from storage import DEFAULT_CONFIG, _DEFAULT_BOOKMARKS, save_bookmarks, resource_path
+        from storage import (DEFAULT_CONFIG, _DEFAULT_BOOKMARKS, save_bookmarks,
+                             resource_path, DEFAULT_CHAINS, save_chains)
+        from win_geometry import center_on_work_area
         import copy, json
+
+        # ── Race guard: Settings window open ─────────────────────────────────
+        # If Settings is open, any unsaved field plus a later Save would
+        # overwrite our just-reset config and silently undo the reset. Ask
+        # the user to close Settings first rather than corrupting state.
+        try:
+            _sw = getattr(self.settings, 'win', None)
+            if _sw is not None and _sw.winfo_exists() and _sw.winfo_viewable():
+                confirm(
+                    self.root,
+                    'Close Settings first',
+                    'The Settings window is open. Close it before resetting '
+                    'so any unsaved changes don\'t overwrite the reset.',
+                    action_label='OK',
+                )
+                try:
+                    _sw.lift()
+                    _sw.focus_force()
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
+
         if not confirm(self.root,
-                       'Restore to Default',
-                       'This will reset everything back to factory settings:\n'
-                       '  • Prompts → bundled defaults\n'
-                       '  • Hotkeys → factory defaults\n'
-                       '  • Web bookmarks → 6 default sites\n'
-                       '  • Quick Notes window → default size\n\n'
-                       'This cannot be undone.'):
+                       'Reset everything?',
+                       'This puts the whole app back to brand-new state:\n\n'
+                       'Will be reset:\n'
+                       '  • Your AI templates  →  back to the defaults\n'
+                       '  • Template folders + colours  →  cleared\n'
+                       '  • Multi-step workflows  →  back to the defaults\n'
+                       '  • Keyboard shortcuts  →  back to the defaults\n'
+                       '  • Favourite websites  →  back to the defaults\n'
+                       '  • Quick Notes window  →  default size, blank notes\n'
+                       '  • Whiteboard window  →  default size, position, blank canvas\n'
+                       '  • Voice typing  →  cloud on, fast local model, auto noise cleanup,\n'
+                       '       auto microphone (your hardware mic stays selected)\n'
+                       '  • Transcripts history  →  cleared\n'
+                       '  • Action history  →  cleared (past Refine/Ask/Chain outputs)\n'
+                       '  • AI helper choice  →  fastest free option\n'
+                       '  • AI helper models  →  defaults  (your API keys are kept)\n'
+                       '  • Welcome flow  →  shown again on next launch\n'
+                       '  • Launch on startup  →  on\n'
+                       '  • Push-to-talk  →  off\n'
+                       '  • Activity log  →  wiped (a fresh log starts now)\n\n'
+                       "Won't be touched:\n"
+                       '  • Your saved API keys\n'
+                       '  • Your recorded macros\n'
+                       '  • Your screen recordings and GIFs\n\n'
+                       'This can\'t be undone.'):
             return
 
         # ── Prompts ───────────────────────────────────────────────────────────
@@ -1809,23 +2696,291 @@ class App:
             pass
         logger.info('Restore: bookmarks reset.')
 
-        # ── Quick Notes window geometry ───────────────────────────────────────
+        # ── Chains ─────────────────────────────────────────────────────────────
+        # Chains live in chains.json and have factory defaults in DEFAULT_CHAINS.
+        # Per-chain hotkeys are derived from each chain's 'hotkey' field, so
+        # we must re-register them after resetting.
+        try:
+            self.chains = copy.deepcopy(DEFAULT_CHAINS)
+            threading.Thread(target=save_chains, args=(self.chains,),
+                             daemon=True).start()
+            self._register_chain_hotkeys()
+            try:
+                self.library.chains = list(self.chains)
+                if self.library._active_tab == 'chains':
+                    self.library._render_chains_tab()
+            except Exception:
+                pass
+            logger.info(f'Restore: {len(self.chains)} chains written + hotkeys re-registered.')
+        except Exception as e:
+            logger.error(f'Restore: chains reset failed: {e}')
+
+        # ── Quick Notes window: geometry + theme + recentering ───────────────
+        # Use the shared work-area helper so the title bar is never under the
+        # system menu and the bottom edge is never behind the taskbar.
         self.config['notes_geometry'] = ''
+        self.config['notes_theme']    = DEFAULT_CONFIG['notes_theme']
         threading.Thread(target=save_config, args=(self.config,), daemon=True).start()
         if self._notes_win is not None:
             try:
                 from quicknotes import _W, _H
-                sw = self._notes_win.winfo_screenwidth()
-                sh = self._notes_win.winfo_screenheight()
-                x  = (sw - _W) // 2
-                y  = max(40, (sh - _H) // 2)
-                self._notes_win.geometry(f'{_W}x{_H}+{x}+{y}')
+                x, y, w, h = center_on_work_area(_W, _H)
+                self._notes_win.geometry(f'{w}x{h}+{x}+{y}')
+                self._notes_win._set_theme(DEFAULT_CONFIG['notes_theme'])
+            except Exception as e:
+                logger.warning(f'Restore: Notes re-center failed: {e}')
+        logger.info('Restore: Notes geometry + theme reset.')
+
+        # ── Whiteboard: subprocess-aware reset ────────────────────────────────
+        # The whiteboard runs in its own pywebview process. Order matters:
+        # close the live whiteboard FIRST so its debounced auto-save can't
+        # race ahead and overwrite our reset. Then wipe the scene file.
+        # Next Shift+F8 reopens default-centered.
+        if sys.platform == 'win32':
+            try:
+                import win32gui, win32con, win32process
+                closed_pids = set()
+                def _cb(h, _):
+                    if win32gui.GetWindowText(h) == 'Whiteboard (Shift+F8)':
+                        win32gui.PostMessage(h, win32con.WM_CLOSE, 0, 0)
+                        try:
+                            _, pid = win32process.GetWindowThreadProcessId(h)
+                            closed_pids.add(pid)
+                        except Exception:
+                            pass
+                win32gui.EnumWindows(_cb, None)
+                # Wait for the subprocess(es) to actually exit so their final
+                # save can't land after our reset write.
+                if closed_pids:
+                    import psutil
+                    deadline = time.time() + 3.0
+                    while time.time() < deadline:
+                        alive = [pid for pid in closed_pids if psutil.pid_exists(pid)]
+                        if not alive: break
+                        time.sleep(0.15)
+                    logger.info(f'Restore: closed {len(closed_pids)} whiteboard subprocess(es).')
+            except Exception as e:
+                logger.warning(f'Restore: whiteboard close failed: {e}')
+
+        try:
+            from storage import whiteboard_path
+            wb_json = whiteboard_path()
+            try:
+                scene = json.load(open(wb_json, encoding='utf-8'))
+            except Exception:
+                scene = {}
+            scene.setdefault('type', 'excalidraw')
+            scene.setdefault('version', 2)
+            scene.setdefault('source', 'restore-defaults')
+            scene.setdefault('elements', [])
+            scene.setdefault('files', {})
+            app_state = scene.get('appState') or {}
+            app_state['theme']               = 'light'
+            app_state['viewBackgroundColor'] = '#ffffff'
+            # Drop any persisted zoom/scroll so the next open is back at 1:1 origin
+            for k in ('zoom', 'scrollX', 'scrollY'):
+                app_state.pop(k, None)
+            scene['appState'] = app_state
+            tmp = wb_json + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(scene, f)
+            import os as _os; _os.replace(tmp, wb_json)
+        except Exception as e:
+            logger.warning(f'Restore: whiteboard.json theme reset failed: {e}')
+
+        logger.info('Restore: Whiteboard scene theme + size reset.')
+
+        # ── Transcripts: clear stored JSONs + YouTube cache ──────────────────
+        # Restore is the user's "factory reset", wipe past transcripts so a
+        # fresh start has no history. The downloaded YouTube cache is also
+        # purged from BOTH the AppData path (older builds + dist mode) and
+        # the repo-local .transcripts_cache used in dev (no-C-drive rule).
+        # Each delete is best-effort: a file currently being read by an
+        # active transcribe worker will raise PermissionError on Windows
+        # and we skip it rather than fight the lock.
+        try:
+            from storage import transcripts_dir
+            import shutil
+            _repo = os.path.dirname(os.path.abspath(__file__))
+            candidates = [
+                transcripts_dir(),
+                os.path.join(appdata_dir(), 'transcripts_cache'),
+                os.path.join(_repo, '.transcripts_cache'),
+            ]
+            skipped = 0
+            for sub in candidates:
+                if os.path.isdir(sub):
+                    for name in os.listdir(sub):
+                        p = os.path.join(sub, name)
+                        try:
+                            if os.path.isfile(p): os.remove(p)
+                            elif os.path.isdir(p): shutil.rmtree(p, ignore_errors=True)
+                        except Exception:
+                            # File in use by a live worker, leave it; it
+                            # will be cleaned up when the worker finishes.
+                            skipped += 1
+            if skipped:
+                logger.info(f'Restore: transcripts cleared ({skipped} skipped, in use).')
+            else:
+                logger.info('Restore: transcripts cleared.')
+        except Exception as e:
+            logger.warning(f'Restore: transcripts wipe failed: {e}')
+
+        # ── App-level settings ────────────────────────────────────────────────
+        for key in ('active_provider', 'autostart', 'push_to_talk'):
+            self.config[key] = DEFAULT_CONFIG[key]
+        logger.info('Restore: active_provider / autostart / push_to_talk reset.')
+
+        # ── Library folders + colors ──────────────────────────────────────────
+        # User-created folder groupings drift from default unless reset here.
+        # Clearing both the in-memory copy AND the on-disk config keeps the
+        # Library sidebar consistent with "factory state".
+        try:
+            self.folders        = list(DEFAULT_CONFIG.get('folders', []))
+            self.folder_colors  = dict(DEFAULT_CONFIG.get('folder_colors', {}))
+            self.config['folders']       = list(self.folders)
+            self.config['folder_colors'] = dict(self.folder_colors)
+            try:
+                self.library.folders       = list(self.folders)
+                self.library.folder_colors = dict(self.folder_colors)
+                self.library._render_cards()
             except Exception:
                 pass
-        logger.info('Restore: Notes geometry reset.')
+            logger.info('Restore: folders + folder_colors reset.')
+        except Exception as e:
+            logger.warning(f'Restore: folders reset failed: {e}')
+
+        # ── First-run flag, clear so the welcome / onboarding flow can run
+        # again on the next launch, matching genuine "fresh install" behaviour.
+        self.config['first_run_done'] = False
+
+        # ── Quick Notes content, wipe the JSON so the next open is empty.
+        # We do this AFTER closing the notes window above (notes_geometry block)
+        # so an in-flight save can't race ahead of the wipe.
+        try:
+            from storage import notes_path
+            np = notes_path()
+            try:
+                with open(np, 'w', encoding='utf-8') as f:
+                    json.dump([], f)
+                logger.info('Restore: notes.json cleared.')
+            except FileNotFoundError:
+                pass   # never written yet, nothing to clear
+            except Exception as e:
+                logger.warning(f'Restore: notes.json clear failed: {e}')
+        except Exception:
+            pass
+
+        # ── Action history, clear past Refine/Ask/Chain outcomes.
+        try:
+            self._history = []
+            from storage import save_history
+            threading.Thread(target=save_history, args=(self._history,),
+                             daemon=True).start()
+            logger.info('Restore: history cleared.')
+        except Exception as e:
+            logger.warning(f'Restore: history clear failed: {e}')
+
+        # ── Prompt sticky note, close if open. Position state will respawn
+        # centered on next prompt-hotkey fire.
+        try:
+            if self._sticky is not None:
+                try:
+                    self._sticky.destroy()
+                except Exception:
+                    pass
+                self._sticky = None
+        except Exception:
+            pass
+
+        # ── Live overlays + ask pills, hide so the UI is back to baseline ────
+        try:
+            for ov in (self.refine_overlay, self.whisper_overlay,
+                       self.macro_overlay, self.recorder_overlay,
+                       self.gif_overlay, self.chain_overlay):
+                try:
+                    ov.hide()
+                except Exception:
+                    pass
+            self._close_all_ask_pills()
+        except Exception:
+            pass
+
+        # ── app.log, truncate so the user really gets a clean slate.
+        # We rotate handlers off the file first so the active RotatingFileHandler
+        # isn't holding a write lock when we truncate (Windows would otherwise
+        # raise PermissionError). The handler reopens lazily on the next log
+        # call, so no logger setup is needed after.
+        try:
+            lp = log_path()
+            for h in list(logger.handlers):
+                if hasattr(h, 'baseFilename') and os.path.abspath(h.baseFilename) == os.path.abspath(lp):
+                    try:
+                        h.close()
+                    except Exception:
+                        pass
+            try:
+                with open(lp, 'w', encoding='utf-8'):
+                    pass   # truncate
+                # Also remove any rotated siblings (.1 .2 .3) so disk state matches fresh install
+                for i in range(1, 6):
+                    side = lp + f'.{i}'
+                    try:
+                        if os.path.exists(side):
+                            os.remove(side)
+                    except Exception:
+                        pass
+                logger.info('Restore: app.log truncated.')
+            except Exception as e:
+                logger.warning(f'Restore: app.log truncate failed: {e}')
+        except Exception:
+            pass
+
+        # ── Provider models (preserve API keys) ───────────────────────────────
+        for pkey, pdefaults in DEFAULT_CONFIG['providers'].items():
+            if pkey not in self.config.get('providers', {}):
+                continue
+            for field, val in pdefaults.items():
+                if field == 'api_key':
+                    continue   # never wipe API keys
+                self.config['providers'][pkey][field] = val
+        threading.Thread(target=save_config, args=(self.config,), daemon=True).start()
+        logger.info('Restore: provider models reset (API keys preserved).')
+
+        # ── Whisper config, VAD threshold, noise reduction, model, etc. ──────
+        # Without this, anything the user (or a previous reactive support
+        # fix) tweaked under whisper.vad.* / whisper.audio.* / whisper.model.*
+        # would survive a "Restore All Defaults", which the user wouldn't
+        # expect.  Audio device override is preserved if explicitly set
+        # (it's a hardware choice, not a preference).
+        try:
+            from copy import deepcopy
+            wcfg = deepcopy(DEFAULT_CONFIG['whisper'])
+            # Preserve a non-default audio.input_device_index, that's the
+            # user's mic selection, not a preference to reset.
+            user_dev = (self.config.get('whisper') or {}).get(
+                'audio', {}).get('input_device_index')
+            if user_dev is not None:
+                wcfg.setdefault('audio', {})['input_device_index'] = user_dev
+            self.config['whisper'] = wcfg
+            threading.Thread(target=save_config, args=(self.config,),
+                             daemon=True).start()
+            logger.info('Restore: whisper config reset (mic device preserved).')
+        except Exception as e:
+            logger.warning(f'Restore: whisper config reset failed: {e}')
+
+        # ── Brand icon, regenerate if missing so the dist looks identical
+        # to first launch (the .ico itself is deterministic, but the user
+        # may have deleted it manually). _save_brand_ico is idempotent.
+        try:
+            self._save_brand_ico()
+        except Exception:
+            pass
 
         self._update_tray()
-        self._notify('Defaults restored ✓', 'Prompts, hotkeys, bookmarks, and window sizes reset.')
+        self._notify('Everything reset ✓',
+                     'Templates, workflows, shortcuts, bookmarks, windows, '
+                     'voice typing, and AI helpers all back to defaults.')
         logger.info('All defaults restored successfully.')
 
     def _on_refine_timeout(self, gen: int) -> None:
@@ -1833,7 +2988,7 @@ class App:
             return   # already handled by normal completion
         self._refine_in_progress = False
         self._refine_gen += 1   # invalidate so any late result is discarded
-        self.refine_overlay.show_error('Request timed out — try again')
+        self.refine_overlay.show_error('Request timed out, try again')
         logger.warning('Refine request timed out after 30s')
 
     def _on_refine_unlock(self, gen: int) -> None:
@@ -1856,14 +3011,32 @@ class App:
 
     def _whisper_start_recording(self) -> None:
         if self._whisper_recording:
-            return   # already recording — ignore key-repeat in PTT mode
+            return   # already recording, ignore key-repeat in PTT mode
         if not self._whisper_ready:
             self.whisper_overlay.show_whisper_loading()
             return
+        # Capture the window the user was typing into RIGHT NOW, before
+        # anything else can steal focus (a notification toast, the user
+        # accidentally Alt-Tabbing, the recording pill briefly painting,
+        # etc.). We'll re-foreground this HWND right before the paste so
+        # the transcribed text lands where the user expected.
+        try:
+            import win32gui as _wg
+            self._whisper_target_hwnd = _wg.GetForegroundWindow()
+        except Exception:
+            self._whisper_target_hwnd = None
         self._whisper_recording = True
         self._whisper_t0 = time.time()
         self._vad.reset()
-        self._audio.start_recording()
+        try:
+            self._audio.start_recording()
+        except Exception as e:
+            self._whisper_recording = False
+            logger.error(f'Microphone error: {e}')
+            # Forward the actual error so the dialog can show the right
+            # fix instead of the generic "permissions" copy.
+            self._show_mic_error(str(e))
+            return
         play_start()
         self.whisper_overlay.show_recording()
         self._update_tray()
@@ -1877,7 +3050,7 @@ class App:
         self._audio.stop_recording()
         self.whisper_overlay.show_transcribing()
         self._update_tray()
-        logger.info('Whisper recording stopped — transcribing.')
+        logger.info('Whisper recording stopped, transcribing.')
 
     def _whisper_cancel_recording(self) -> None:
         if not self._whisper_recording:
@@ -1900,7 +3073,7 @@ class App:
         self._transcriber.submit(audio)
 
     def _on_transcriber_status(self, status: str) -> None:
-        """Called from transcriber thread — post to main queue."""
+        """Called from transcriber thread, post to main queue."""
         self._q.put(('whisper:status', status))
 
     def _on_transcriber_status_event(self, status: str) -> None:
@@ -1910,20 +3083,49 @@ class App:
         elif status == 'ready':
             self._whisper_ready = True
             self._splash.mark_done('whisper')
-            hk = self._hotkey_cfg().get('whisper', 'ctrl+enter').upper()
-            self._notify('Hotkeys — Whisper ready 🎙', f'Press {hk} to start recording.')
+            pass  # no notification, Whisper ready is silent
+        elif status == 'jit_done':
+            # CTranslate2 CPU kernels are compiled, first real Ctrl+Enter
+            # will skip the ~500-800 ms JIT cost.
+            self._splash.mark_done('whisper_jit')
+        elif status == 'cloud_warm':
+            # TLS handshake to api.groq.com is established, cloud
+            # transcription's first call only pays inference time.
+            self._splash.mark_done('cloud')
         elif status == 'error':
             self._whisper_ready = True  # allow retry
             self._splash.mark_error('whisper')
             self._q.put(('whisper:error', 'Transcription failed'))
 
     def _on_transcription_result(self, text: str, language: str, duration_s: float) -> None:
-        """Called from transcriber thread — post to main queue."""
+        """Called from transcriber thread, post to main queue."""
         self._q.put(('whisper:result', (text, language, duration_s)))
 
     def _on_whisper_result(self, payload) -> None:
         text, language, duration_s = payload
         elapsed = time.time() - self._whisper_t0
+
+        # Sentinel from the transcriber meaning the recorded audio was
+        # silent, no point pasting and no point letting Whisper hallucinate
+        # "Thank you." Surface a clear, actionable message.
+        if text == '__NO_AUDIO__':
+            self.whisper_overlay.show_whisper_cancelled()
+            logger.info('Whisper: no speech detected.')
+            # Pill in the corner is enough; only escalate to a tray
+            # notification if the recording was non-trivially long (so the
+            # user definitely tried to dictate and deserves to know we
+            # heard nothing) AND the mic looks dead, not just quiet.
+            try:
+                if duration_s and duration_s > 4.0:
+                    self._notify(
+                        'No speech detected',
+                        "We did not hear anything in that recording. "
+                        "If your mic is plugged in and unmuted, try again "
+                        "and speak slightly closer to it.",
+                    )
+            except Exception:
+                pass
+            return
 
         if not text:
             self.whisper_overlay.show_whisper_cancelled()
@@ -1935,8 +3137,66 @@ class App:
 
         copy_to_clipboard(out)
         if out_cfg.get('type_text', True):
-            self.root.after(60, paste_from_clipboard)
-        # Re-register after paste for the same reason as refine — injected
+            # Restore focus to the window the user was typing into when
+            # they pressed Ctrl+Enter. Without this, a fraction of users
+            # see "Typed ✓" but no text appears because focus shifted
+            # during recording (notification toast, accidental click,
+            # the source window losing keyboard focus to the recording
+            # pill on some setups, etc.). The Win32 SetForegroundWindow
+            # workaround in _force_foreground bypasses Windows' anti-
+            # focus-stealing rules using AttachThreadInput.
+            hwnd = getattr(self, '_whisper_target_hwnd', None)
+            if hwnd:
+                try:
+                    self._force_foreground(hwnd)
+                except Exception as e:
+                    logger.warning(f'Could not restore focus before paste: {e}')
+            # The user's stop press (Ctrl+Enter) passes through to the
+            # focused window because our hotkey is suppress=False (the
+            # keyboard library's modifier-state machine locks up on
+            # suppressed hotkeys). That means the focused text editor
+            # received an Enter and the cursor is now one line below
+            # where the user wanted their text. Send a single Backspace
+            # to undo the newline before the paste, restoring the
+            # original cursor position. Wrapped in macro-suspend so the
+            # synthetic Backspace does not pollute an active recording.
+            whisper_hk = (self.config.get('hotkeys') or {}).get('whisper', '')
+            if 'enter' in whisper_hk.lower():
+                def _undo_stray_enter():
+                    try:
+                        from macros.recorder import suspend_capture
+                        import ctypes
+                        from ctypes import wintypes
+                        VK_BACK = 0x08
+                        KEYEVENTF_KEYUP = 0x0002
+                        INPUT_KEYBOARD = 1
+                        class KEYBDINPUT(ctypes.Structure):
+                            _fields_ = [('wVk', wintypes.WORD),
+                                        ('wScan', wintypes.WORD),
+                                        ('dwFlags', wintypes.DWORD),
+                                        ('time', wintypes.DWORD),
+                                        ('dwExtraInfo', ctypes.c_ulonglong)]
+                        class _U(ctypes.Union):
+                            _fields_ = [('ki', KEYBDINPUT),
+                                        ('_pad', ctypes.c_byte * 32)]
+                        class INPUT(ctypes.Structure):
+                            _anonymous_ = ('u',)
+                            _fields_ = [('type', wintypes.DWORD), ('u', _U)]
+                        with suspend_capture():
+                            dn = INPUT(type=INPUT_KEYBOARD)
+                            dn.ki = KEYBDINPUT(VK_BACK, 0, 0, 0, 0)
+                            up = INPUT(type=INPUT_KEYBOARD)
+                            up.ki = KEYBDINPUT(VK_BACK, 0, KEYEVENTF_KEYUP, 0, 0)
+                            arr = (INPUT * 2)(dn, up)
+                            ctypes.windll.user32.SendInput(
+                                2, arr, ctypes.sizeof(INPUT))
+                    except Exception as e:
+                        logger.warning(f'undo-stray-enter failed: {e}')
+                self.root.after(80, _undo_stray_enter)
+            # Slight extra delay so the foreground swap has time to land
+            # before SendInput fires Ctrl+V.
+            self.root.after(160, paste_from_clipboard)
+        # Re-register after paste for the same reason as refine, injected
         # Ctrl+V can leave the keyboard library's state stale.
         self.root.after(150, self._reregister_after_action)
 
@@ -1962,7 +3222,7 @@ class App:
     # ── Macro record & replay ─────────────────────────────────────────────────
 
     def _on_macro_hotkey(self, _=None) -> None:
-        """Shift+F1 — cycles: idle→recording, recording→ready, ready→playing."""
+        """Shift+F1, cycles: idle→recording, recording→ready, ready→playing."""
         state = self._macro_state
         if state == 'idle':
             self._macro_start_recording()
@@ -1980,16 +3240,17 @@ class App:
         self.library._sync_hint_bar()
 
     def _macro_reset(self) -> None:
-        """Abort any active recording/playback and return to idle — called from Library reset button."""
+        """Abort any active recording/playback and return to idle, called from Library reset button."""
         self._macro.force_stop()
         self._macro.clear()
         self._macro_unregister_stop_keys()
         self._set_macro_state('idle')
         self.macro_overlay._close()
         self.library.refresh_macros()
-        logger.info('Macro session discarded — reset to idle')
+        logger.info('Macro session discarded, reset to idle')
 
     def _macro_start_recording(self) -> None:
+        self._macro_t0 = time.time()   # stamp for watchdog grace window
         self._set_macro_state('recording')
         self._macro.start_recording(
             on_cap_reached=lambda: self._q.put(('macro:cap', None))
@@ -2005,15 +3266,15 @@ class App:
         self._macro_unregister_stop_keys()
         if n > 0:
             self.macro_overlay.show_macro_ready(n)
-            logger.info(f'Macro recording stopped — {n} events, {self._macro.duration:.2f}s')
+            logger.info(f'Macro recording stopped, {n} events, {self._macro.duration:.2f}s')
         else:
             self.macro_overlay._close()
-            logger.info('Macro recording stopped — no events captured')
+            logger.info('Macro recording stopped, no events captured')
 
     def _on_macro_cap(self) -> None:
-        """5 000-event hard cap reached — auto-stop recording and notify user."""
+        """5 000-event hard cap reached, auto-stop recording and notify user."""
         from macros.recorder import _MAX_EVENTS
-        logger.warning(f'Macro recording capped at {_MAX_EVENTS} events — auto-stopped')
+        logger.warning(f'Macro recording capped at {_MAX_EVENTS} events, auto-stopped')
         self._macro.stop_recording()
         n = self._macro.event_count
         self._set_macro_state('ready' if n > 0 else 'idle')
@@ -2021,12 +3282,13 @@ class App:
         self.macro_overlay.show_macro_ready(n)
         self._notify(
             'Macro recording capped ⚠',
-            f'Reached the {_MAX_EVENTS:,}-event limit — recording stopped automatically.',
+            f'Reached the {_MAX_EVENTS:,}-event limit, recording stopped automatically.',
         )
 
     def _macro_start_playback(self) -> None:
         if not self._macro.event_count:
             return
+        self._macro_t0 = time.time()   # stamp for watchdog grace window
         self._set_macro_state('playing')
         self._macro_register_stop_keys()
         self.macro_overlay.show_macro_playing()
@@ -2067,9 +3329,9 @@ class App:
             logger.info(f'Macro saved: "{name}" ({meta["event_count"]} events) hotkey={hk!r}')
             self._register_macro_saved_hotkeys()
             self.library.refresh_macros()
-            # Confirmation pill — replaces the "done" pill
+            # Confirmation pill, replaces the "done" pill
             self.macro_overlay.show_macro_saved(name, hk)
-        # Clear after save (or discard) — not before, otherwise save gets empty events
+        # Clear after save (or discard), not before, otherwise save gets empty events
         self._macro.clear()
 
     def _on_library_macro_play(self, meta: dict) -> None:
@@ -2079,6 +3341,7 @@ class App:
         rec = self._macro_library.load_recorder(meta['id'])
         # Replace the live recorder temporarily for playback
         self._macro = rec
+        self._macro_t0 = time.time()   # stamp for watchdog grace window
         self._set_macro_state('playing')
         self._macro_register_stop_keys()
         self.macro_overlay.show_macro_playing()
@@ -2089,7 +3352,7 @@ class App:
         logger.info(f'Macro playback (saved): "{meta["name"]}"')
 
     def _macro_saved_play_done(self) -> None:
-        """Playback of a saved macro finished — don't offer save again."""
+        """Playback of a saved macro finished, don't offer save again."""
         self._set_macro_state('idle')
         self._macro_unregister_stop_keys()
         self.macro_overlay.show_macro_done()
@@ -2130,7 +3393,7 @@ class App:
         logger.info('Macro playback force-stopped')
 
     def _on_macro_emergency_stop(self, _=None) -> None:
-        """Esc or Del — abort recording or playback immediately."""
+        """Esc or Del, abort recording or playback immediately."""
         state = self._macro_state
         if state not in ('recording', 'playing'):
             return
@@ -2143,7 +3406,7 @@ class App:
                 self.root.after(0, lambda: self.macro_overlay.show_macro_ready(n))
             else:
                 self.root.after(0, self.macro_overlay._close)
-            logger.info(f'Macro recording aborted by stop key — {n} events kept')
+            logger.info(f'Macro recording aborted by stop key, {n} events kept')
         else:   # playing
             self._set_macro_state('ready')
             self._macro_unregister_stop_keys()
@@ -2168,14 +3431,14 @@ class App:
     # ── Screen recorder ───────────────────────────────────────────────────────
 
     def _on_recorder_toggle(self) -> None:
-        """Shift+F2 or Library tab button — starts or stops screen recording."""
+        """Shift+F2 or Library tab button, starts or stops screen recording."""
         if self._recorder_state == 'idle':
             self._recorder_start()
         elif self._recorder_state == 'recording':
             self._recorder_stop()
 
     def _recorder_start(self) -> None:
-        """Start recording immediately (full screen, no mic, 30 fps) — no setup dialog."""
+        """Start recording immediately (full screen, no mic, 30 fps), no setup dialog."""
         self._screen_recorder = ScreenRecorder(
             hwnd=0,
             mon=None,
@@ -2190,7 +3453,12 @@ class App:
         except Exception as exc:
             logger.error(f'Screen recorder failed to start: {exc}')
             from dialogs import alert
-            alert(self.root, 'Recorder error', str(exc))
+            # Sanitize raw exception text, drop the Python class prefix
+            # and trim long stack-trace-like content.
+            _txt = str(exc).strip() or 'Unknown recorder failure.'
+            alert(self.root, 'Screen recorder failed',
+                  f'{_txt[:240]}\n\nClose any window blocking screen capture '
+                  'and try again.')
             self._screen_recorder = None
             return
 
@@ -2223,7 +3491,7 @@ class App:
         self._recorder_state  = 'idle'
         self.recorder_overlay._close()
         self._update_library_recorder_state()
-        logger.info(f'Screen recording stopped — {rec.bytes_written/1024**2:.1f} MB')
+        logger.info(f'Screen recording stopped, {rec.bytes_written/1024**2:.1f} MB')
 
         if rec.error:
             from dialogs import alert
@@ -2238,7 +3506,7 @@ class App:
             except Exception:
                 pass
             alert(self.root, 'Recording failed',
-                  'The output file is empty — the encoder produced no data.\n\n'
+                  'The output file is empty, the encoder produced no data.\n\n'
                   'This can happen if the recording was stopped too quickly\n'
                   'or if the screen capture failed to initialise.')
             return
@@ -2263,8 +3531,8 @@ class App:
                 self.library.update_recorder_state('idle')
 
     def _on_recorder_cap(self) -> None:
-        """1 GB cap hit — auto-stop."""
-        logger.info('Screen recording: 1 GB cap reached — stopping')
+        """1 GB cap hit, auto-stop."""
+        logger.info('Screen recording: 1 GB cap reached, stopping')
         from dialogs import alert
         self._recorder_stop()
         self.root.after(500, lambda: alert(
@@ -2289,18 +3557,18 @@ class App:
     # ── GIF recorder ─────────────────────────────────────────────────────────
 
     def _on_gif_toggle(self) -> None:
-        """Shift+F3 / button press — start or stop GIF recording."""
+        """Shift+F3 / button press, start or stop GIF recording."""
         if self._gif_setup_dlg is not None:
-            return  # setup dialog already open — ignore duplicate presses
+            return  # setup dialog already open, ignore duplicate presses
         if self._gif_state == 'idle':
             self._gif_start()
         elif self._gif_state == 'recording':
             self._gif_stop()
-        # 'encoding' — ignore, let it finish
+        # 'encoding', ignore, let it finish
 
     def _gif_start(self) -> None:
         """Show setup dialog, then begin capturing."""
-        self._gif_setup_dlg = True   # sentinel — set before Toplevel creation
+        self._gif_setup_dlg = True   # sentinel, set before Toplevel creation
         try:
             mapped = self.library.win.winfo_ismapped()
             parent = self.library.win if mapped else self.root
@@ -2337,7 +3605,10 @@ class App:
         except Exception as exc:
             logger.error(f'GIF recorder failed to start: {exc}')
             from dialogs import alert
-            alert(self.root, 'GIF error', str(exc))
+            _txt = str(exc).strip() or 'Unknown GIF recorder failure.'
+            alert(self.root, 'GIF recorder failed',
+                  f'{_txt[:240]}\n\nClose any window blocking screen capture '
+                  'and try again.')
             self._gif_recorder = None
             return
 
@@ -2365,7 +3636,7 @@ class App:
         self.gif_overlay._close()
         self._update_library_gif_state()
         elapsed = int(dur)
-        logger.info(f'GIF recording complete — {elapsed}s, {tmp_path}')
+        logger.info(f'GIF recording complete, {elapsed}s, {tmp_path}')
 
         if not tmp_path or not os.path.exists(tmp_path):
             return
@@ -2399,10 +3670,10 @@ class App:
         alert(self.root, 'GIF error', msg)
 
     def _on_gif_cap(self) -> None:
-        """Max duration cap reached — auto-stop."""
+        """Max duration cap reached, auto-stop."""
         if self._gif_recorder is None:
             return
-        logger.info('GIF recording: max duration reached — stopping')
+        logger.info('GIF recording: max duration reached, stopping')
         dur_s = int(self._gif_recorder.max_duration_s)
         self.gif_overlay.show_gif_capped(dur_s)
         self._gif_state = 'encoding'
@@ -2465,37 +3736,124 @@ class App:
         glow = _grad_mask(bolt_mask.filter(_IF.GaussianBlur(12)), '#7dd3fc', '#1e40af')
         base = Image.alpha_composite(base, glow)
 
-        # Sharp bolt — sky blue top → deep navy bottom
+        # Sharp bolt, sky blue top → deep navy bottom
         base = Image.alpha_composite(base, _grad_mask(bolt_mask, '#bae6fd', '#0f2a6e'))
 
         # Downsample to final 64×64
         return base.resize((64, 64), Image.LANCZOS)
 
+    # ── IPC socket (localhost:58765) ──────────────────────────────────────────
+
+    def _start_ipc(self) -> None:
+        threading.Thread(target=self._ipc_loop, daemon=True, name='ipc').start()
+
+    def _ipc_loop(self) -> None:
+        import socket as _sock
+        _VALID = {'library', 'notes', 'refine', 'ask', 'recorder',
+                  'gif_record', 'macro_record', 'web', 'chain', 'whiteboard',
+                  'transcribe', 'audio_editor',
+                  # Destructive actions still go through the confirm dialog
+                  # before they touch state, safe to expose for scripting.
+                  'restore_all_defaults', 'reload_hotkeys'}
+        # 'whisper' is a toggle that already handles start/stop based on
+        # state, route it through _hk_whisper instead of a queued event.
+        _DIRECT_CALL = {'whisper': lambda: self._hk_whisper()}
+        try:
+            with _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM) as srv:
+                srv.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
+                srv.bind(('127.0.0.1', 58765))
+                srv.listen(5)
+                while True:
+                    try:
+                        conn, _ = srv.accept()
+                        with conn:
+                            cmd = conn.recv(64).decode().strip()
+                            logger.info(f'IPC: received {cmd!r}')
+                            if cmd in _VALID:
+                                self._q.put((cmd, None))
+                                logger.info(f'IPC: queued {cmd!r}')
+                            elif cmd in _DIRECT_CALL:
+                                self.root.after(0, _DIRECT_CALL[cmd])
+                                logger.info(f'IPC: dispatched {cmd!r}')
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.warning(f'IPC listener failed: {e}')
+
+    def _save_brand_ico(self) -> str:
+        """Materialize the brand .ico in %APPDATA% if missing. Same icon
+        the PyInstaller build embeds as the .exe resource (see
+        brand_icon.save_ico in the spec)."""
+        from pathlib import Path
+        ico_path = Path(appdata_dir()) / 'app_icon.ico'
+        try:
+            if not ico_path.exists():
+                from brand_icon import save_ico
+                save_ico(str(ico_path))
+            return str(ico_path)
+        except Exception as e:
+            logger.warning(f'_save_brand_ico failed: {e}')
+            return ''
+
     def _start_tray(self) -> None:
-        self._tray = pystray.Icon(
-            'Hotkeys', self._make_icon(), self._tooltip(), self._make_menu(),
-        )
-        t = threading.Thread(target=self._run_tray, daemon=True)
-        t.start()
-        logger.info('Tray started.')
+        # Make our brand icon available to every Tk Toplevel we'll spawn,
+        # Notes, Library, Settings, History, etc. all inherit `default`.
+        try:
+            ico = self._save_brand_ico()
+            if ico:
+                self.root.iconbitmap(default=ico)
+                logger.info(f'Brand icon installed: {ico}')
+        except Exception as e:
+            logger.warning(f'iconbitmap default failed: {e}')
+
+        # Build the pystray Icon defensively — any of _make_icon /
+        # _tooltip / _make_menu can raise in frozen mode if a resource
+        # is missing, and we want the rest of the app to keep working
+        # rather than the whole process exiting silently.
+        try:
+            logger.info('DEBUG: about to _make_icon')
+            _icon_img = self._make_icon()
+            logger.info('DEBUG: _make_icon done')
+            _tip = self._tooltip()
+            logger.info('DEBUG: _tooltip done')
+            _menu = self._make_menu()
+            logger.info('DEBUG: _make_menu done')
+            self._tray = pystray.Icon('Hotkeys', _icon_img, _tip, _menu)
+            logger.info('DEBUG: pystray.Icon constructed')
+            t = threading.Thread(target=self._run_tray, daemon=True)
+            t.start()
+            logger.info('Tray started.')
+        except Exception as e:
+            logger.exception(f'Tray init failed: {e}')
+            self._tray = None
 
     def _run_tray(self) -> None:
         """Run the pystray event loop. On macOS, AppKit must be invoked carefully
-        from a background thread — log any failure clearly instead of crashing silently."""
+        from a background thread, log any failure clearly instead of crashing silently."""
         try:
             self._tray.run()
         except Exception as e:
             logger.error(f'Tray crashed: {e}')
             # On macOS pystray may fail if AppKit isn't available on this thread.
-            # The app continues working (hotkeys, transcription) — only the tray icon is lost.
+            # The app continues working (hotkeys, transcription), only the tray icon is lost.
             if sys.platform == 'darwin':
                 logger.error(
-                    'macOS tray error — this usually means pystray could not access AppKit. '
+                    'macOS tray error, this usually means pystray could not access AppKit. '
                     'The app will keep running but the menu bar icon will be missing. '
                     'Check that pyobjc-framework-Cocoa is installed: pip install pyobjc-framework-Cocoa'
                 )
 
     def _make_menu(self) -> pystray.Menu:
+        """Build the right-click tray menu.
+
+        Two-section layout designed for scannability:
+          • TOP, what you can DO (the user-facing features)
+          • MIDDLE, what you can RECORD
+          • BOTTOM, settings / history / reset / quit
+        Status line under the header shows online/cloud state at a glance.
+        Every action lists its hotkey on the right so users learn the
+        bindings without opening Settings.
+        """
         def prov_item(key: str, label: str) -> pystray.MenuItem:
             return pystray.MenuItem(
                 label,
@@ -2505,96 +3863,161 @@ class App:
             )
 
         hk = self._hotkey_cfg()
-        w_state = '🔴 Recording...' if self._whisper_recording else '🎙 Whisper'
+        recording = bool(self._whisper_recording)
 
-        lib_hk      = hk.get('library',      'alt+shift+e').upper()
-        notes_hk    = hk.get('notes',         'shift+f7').upper()
-        whisper_hk  = hk.get('whisper',       'ctrl+enter').upper()
-        refine_hk   = hk.get('refine',        'alt+shift+w').upper()
-        recorder_hk = hk.get('recorder',      'shift+f2').upper()
-        gif_hk      = hk.get('gif_record',    'shift+f3').upper()
-        macro_hk    = hk.get('macro_record',  'shift+f1').upper()
-        ask_hk      = hk.get('ask',           'shift+f4').upper()
-        web_hk      = hk.get('web',           'shift+f5').upper()
-        chain_hk    = hk.get('chain',         'shift+f6').upper()
+        lib_hk        = hk.get('library',      'alt+shift+e').upper()
+        notes_hk      = hk.get('notes',         'shift+f7').upper()
+        whisper_hk    = hk.get('whisper',       'ctrl+enter').upper()
+        refine_hk     = hk.get('refine',        'alt+shift+w').upper()
+        recorder_hk   = hk.get('recorder',      'shift+f2').upper()
+        gif_hk        = hk.get('gif_record',    'shift+f3').upper()
+        macro_hk      = hk.get('macro_record',  'shift+f1').upper()
+        ask_hk        = hk.get('ask',           'shift+f4').upper()
+        web_hk        = hk.get('web',           'shift+f5').upper()
+        chain_hk      = hk.get('chain',         'shift+f6').upper()
+        whiteboard_hk = hk.get('whiteboard',    'shift+f8').upper()
+        transcribe_hk = hk.get('transcribe',    'shift+f9').upper()
+        audio_edit_hk = hk.get('audio_editor',  'shift+f10').upper()
 
-        return pystray.Menu(
-            pystray.MenuItem(f'Hotkeys  v{VERSION}', None, enabled=False),
-            pystray.Menu.SEPARATOR,
-            # ── Quick actions ─────────────────────────────────────────────────
+        # Status line, at-a-glance "what's happening" + the value prop.
+        # Designed so a layperson seeing this menu for the first time
+        # understands the app in 3 seconds: "press a key, AI does the rest"
+        # is the entire elevator pitch on one line. When recording, swap
+        # to feedback so the user knows the mic is hot.
+        if recording:
+            status_line = '🔴  Recording your voice…'
+        else:
+            status_line = 'Press a key — your AI does the rest'
+
+        # ── WHAT YOU CAN DO ──────────────────────────────────────────────────
+        # Every label here is an OUTCOME verb ("Speak to type") not an
+        # internal feature name ("Start dictation"). A first-time user
+        # reading these should understand what each one does without ever
+        # opening Settings or a tutorial.
+        do_items = [
             pystray.MenuItem(
-                f'📝  Quick Notes  ({notes_hk})',
-                lambda: self._q.put(('notes', None)),
+                f'{"🛑  Stop recording" if recording else "🎙  Speak to type"}'
+                f'           {whisper_hk}',
+                lambda: self._q.put(('whisper:start', None) if not recording
+                                    else ('whisper:stop', None)),
             ),
             pystray.MenuItem(
-                f'📚  Library  ({lib_hk})',
-                lambda: self._q.put(('library', None)),
-            ),
-            pystray.MenuItem(
-                f'✨  Refine selection  ({refine_hk})',
+                f'✨  Transform my text             {refine_hk}',
                 self._hk_refine,
             ),
             pystray.MenuItem(
-                f'💬  Explain  ({ask_hk})',
+                f'💬  Explain or answer something   {ask_hk}',
                 lambda: self._q.put(('ask', '')),
             ),
             pystray.MenuItem(
-                f'🌐  Open bookmark  ({web_hk})',
+                f'📝  Jot a quick note              {notes_hk}',
+                lambda: self._q.put(('notes', None)),
+            ),
+            pystray.MenuItem(
+                f'📚  Open Library                  {lib_hk}',
+                lambda: self._q.put(('library', None)),
+            ),
+            pystray.MenuItem(
+                f'🎬  Turn audio or video into text {transcribe_hk}',
+                lambda: self._q.put(('transcribe', None)),
+            ),
+            pystray.MenuItem(
+                f'🎨  Sketch on a whiteboard        {whiteboard_hk}',
+                lambda: self._q.put(('whiteboard', None)),
+            ),
+            pystray.MenuItem(
+                f'🎵  Open audio editor             {audio_edit_hk}',
+                lambda: self._q.put(('audio_editor', None)),
+            ),
+            pystray.MenuItem(
+                f'🌐  Jump to a favourite site      {web_hk}',
                 lambda: self._q.put(('web', None)),
             ),
             pystray.MenuItem(
-                f'🔗  Run chain  ({chain_hk})',
+                f'🔗  Run a multi-step workflow     {chain_hk}',
                 lambda: self._q.put(('chain', None)),
             ),
-            pystray.Menu.SEPARATOR,
-            # ── Recording shortcuts ───────────────────────────────────────────
-            pystray.MenuItem('🎬  Recordings', pystray.Menu(
+        ]
+
+        # ── RECORD ──────────────────────────────────────────────────────────
+        record_items = [
+            pystray.MenuItem(
+                f'📸  Take a screenshot             PRINTSCREEN',
+                lambda: self._hk_screenshot(),
+            ),
+            pystray.MenuItem(
+                f'⏺  Record my screen              {recorder_hk}',
+                lambda: self._q.put(('recorder:toggle', None)),
+            ),
+            pystray.MenuItem(
+                f'🎞  Capture a GIF                 {gif_hk}',
+                lambda: self._q.put(('gif:toggle', None)),
+            ),
+            pystray.MenuItem(
+                f'⚡  Record a clicks/keys macro    {macro_hk}',
+                lambda: self._q.put(('macro:hotkey', None)),
+            ),
+        ]
+
+        # ── APP ─────────────────────────────────────────────────────────────
+        app_items = [
+            pystray.MenuItem('🤖  AI Brain', pystray.Menu(
+                *([prov_item('local', 'Qwen 2.5 1.5B  (Local · Free)')]
+                  if local_provider_available() else []),
+                # Cerebras serves Llama on dedicated inference hardware,
+                # it's measurably the fastest for Refine / Ask / Chain.
+                # Groq is still fast but second; it's also the only one
+                # that exposes a Whisper endpoint, so dictation + F9
+                # transcribe always route through Groq regardless of which
+                # one is picked here.
+                prov_item('cerebras', 'Cerebras  (fastest)'),
+                prov_item('groq',     'Groq  (also fast)'),
+            )),
+            pystray.MenuItem('🎤  Dictation mode', pystray.Menu(
                 pystray.MenuItem(
-                    f'{w_state}  ({whisper_hk})',
-                    lambda: self._q.put(('whisper:start', None) if not self._whisper_recording
-                                        else ('whisper:stop', None)),
-                ),
-                pystray.MenuItem(
-                    'Push-to-talk mode',
+                    'Push-to-talk',
                     self._toggle_ptt,
                     checked=lambda item: self.config.get('push_to_talk', False),
                 ),
-                pystray.Menu.SEPARATOR,
-                pystray.MenuItem(
-                    f'⏺  Screen record  ({recorder_hk})',
-                    lambda: self._q.put(('recorder:toggle', None)),
-                ),
-                pystray.MenuItem(
-                    f'🎞  GIF record  ({gif_hk})',
-                    lambda: self._q.put(('gif:toggle', None)),
-                ),
-                pystray.MenuItem(
-                    f'⚡  Macro record  ({macro_hk})',
-                    lambda: self._q.put(('macro:hotkey', None)),
-                ),
             )),
+            pystray.MenuItem('🕒  History',
+                             lambda: self._q.put(('history', None))),
+            pystray.MenuItem('⚙  Settings…',
+                             lambda: self._q.put(('settings', None))),
+        ]
+
+        # ── RESET / RELOAD ──────────────────────────────────────────────────
+        # Layperson-friendly labels, "Stop everything" is the panic button,
+        # findable when something feels stuck. "Reset everything" is the
+        # factory-reset, intentionally further down the menu.
+        reset_items = [
+            pystray.MenuItem('🛑  Stop everything & reload hotkeys',
+                             lambda: self._q.put(('reload_hotkeys', None))),
+            pystray.MenuItem('↺  Reset everything…',
+                             lambda: self._q.put(('restore_all_defaults', None))),
+        ]
+
+        return pystray.Menu(
+            # Header with name and live status
+            pystray.MenuItem(f'Hotkeys  v{VERSION}', None, enabled=False),
+            pystray.MenuItem(status_line, None, enabled=False),
             pystray.Menu.SEPARATOR,
-            # ── App ───────────────────────────────────────────────────────────
-            pystray.MenuItem('AI Engine', pystray.Menu(
-                *([prov_item('local', 'Qwen 2.5 1.5B (Local · Free)')] if local_provider_available() else []),
-                prov_item('groq',     'Groq'),
-                prov_item('cerebras', 'Cerebras'),
-            )),
-            pystray.MenuItem('History',  lambda: self._q.put(('history', None))),
-            pystray.MenuItem('Settings', lambda: self._q.put(('settings', None))),
+            pystray.MenuItem('— What you can do —', None, enabled=False),
+            *do_items,
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem('⚙  Advanced', pystray.Menu(
-                pystray.MenuItem('↺  Restore All Defaults',
-                                 lambda: self._q.put(('restore_all_defaults', None))),
-                pystray.MenuItem('↺  Reload hotkeys',
-                                 lambda: self._q.put(('reload_hotkeys', None))),
-            )),
-            pystray.MenuItem('Quit', self._quit),
+            pystray.MenuItem('— Capture what you see —', None, enabled=False),
+            *record_items,
+            pystray.Menu.SEPARATOR,
+            *app_items,
+            pystray.Menu.SEPARATOR,
+            *reset_items,
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem('Quit Hotkeys', self._quit),
         )
 
     def _switch_provider(self, key: str) -> None:
         if self.config.get('active_provider') == key:
-            return   # already on this provider — nothing to do
+            return   # already on this provider, nothing to do
         self.config['active_provider'] = key
         save_config(self.config)
         self.provider = build_provider(self.config)
@@ -2633,7 +4056,7 @@ class App:
     def _watch_singleton_socket(self) -> None:
         """Background thread: waits for a new instance to signal QUIT.
 
-        The TCP connection itself is proof a new instance is running — we
+        The TCP connection itself is proof a new instance is running, we
         do not do a secondary PID check, because in dist builds the process
         name / cmdline heuristic is unreliable during the brief startup window.
         """
@@ -2646,7 +4069,7 @@ class App:
                     conn.recv(16)
                 finally:
                     conn.close()
-                logger.info('New instance launched — shutting down gracefully.')
+                logger.info('New instance launched, shutting down gracefully.')
                 self.root.after(0, self._quit)
                 return
             except Exception:
@@ -2663,8 +4086,24 @@ class App:
         _killer.daemon = True
         _killer.start()
 
+        # Singleton socket — SO_LINGER (1, 0) + shutdown() forces an
+        # immediate TCP RST instead of FIN, so port 58765 is released
+        # right away with no TIME_WAIT window. Without this, the next
+        # launch can occasionally see "port already in use" for up to
+        # 2 minutes on Windows even though we're already gone.
         try:
             if _singleton_sock:
+                try:
+                    import struct as _struct
+                    _singleton_sock.setsockopt(
+                        socket.SOL_SOCKET, socket.SO_LINGER,
+                        _struct.pack('ii', 1, 0))
+                except Exception:
+                    pass
+                try:
+                    _singleton_sock.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
                 _singleton_sock.close()
         except Exception:
             pass
@@ -2677,10 +4116,27 @@ class App:
             self._transcriber.shutdown()
         except Exception:
             pass
+        # Audio editor (Tenacity) might still be a live child process.
+        # Without this it survives our quit as a phantom — user closes
+        # the Hotkeys tray and finds an "Audio Editor" window still
+        # open, with no obvious way to relate it to Hotkeys.
+        try:
+            import audio_editor as _ae
+            _ae.get_launcher().shutdown()
+        except Exception:
+            pass
+        # Belt-and-suspenders tray icon removal. pystray.stop() usually
+        # fires Shell_NotifyIcon(NIM_DELETE) but if it doesn't, the
+        # icon stays in the tray as a ghost until you hover over it.
+        # We explicitly remove via Win32 immediately after pystray.stop.
         try:
             self._tray.visible = False
             self._tray.stop()
-            time.sleep(0.6)   # let pystray finish Shell_NotifyIcon(NIM_DELETE)
+            time.sleep(0.6)   # let pystray finish its own NIM_DELETE first
+            try:
+                _sweep_ghost_tray_icons()
+            except Exception:
+                pass
         except Exception:
             pass
         _killer.cancel()
@@ -2750,7 +4206,7 @@ def _find_other_hotkeys_pids() -> list[int]:
             name = (proc.info['name'] or '').lower()
 
             if is_frozen:
-                # Dist build: just match by executable name — no cmdline needed
+                # Dist build: just match by executable name, no cmdline needed
                 if name in FROZEN_NAMES:
                     candidates[proc.pid] = proc.info.get('ppid') or 0
             else:
@@ -2771,7 +4227,7 @@ def _sweep_ghost_tray_icons() -> None:
     """Simulate mouse movement across the Windows notification-area toolbars.
 
     When Windows receives WM_MOUSEMOVE over a tray slot whose owner process is
-    dead, it removes that icon automatically — no user hover needed.
+    dead, it removes that icon automatically, no user hover needed.
     Covers both the visible tray and the overflow (hidden icons) area.
     """
     if sys.platform != 'win32':
@@ -2824,7 +4280,7 @@ def _ensure_single_instance(_depth: int = 0) -> None:
         mutex = kernel32.CreateMutexW(None, True, MUTEX_NAME)
         err   = kernel32.GetLastError()
 
-        if err == 183:      # ERROR_ALREADY_EXISTS — another launch is starting
+        if err == 183:      # ERROR_ALREADY_EXISTS, another launch is starting
             kernel32.CloseHandle(mutex)
             if _depth >= 3:
                 sys.exit(1)
@@ -2898,7 +4354,7 @@ def _mac_ensure_accessibility() -> None:
         )
         _is_trusted = lambda: bool(_libax.AXIsProcessTrusted())
     except Exception:
-        return   # Can't check — proceed; keyboard will fail naturally if needed
+        return   # Can't check, proceed; keyboard will fail naturally if needed
 
     if _is_trusted():
         return
@@ -2910,12 +4366,12 @@ def _mac_ensure_accessibility() -> None:
                'x-apple.systempreferences:'
                'com.apple.preference.security?Privacy_Accessibility'])
 
-    # Build a blocking CTk dialog — auto-closes the moment permission is granted
+    # Build a blocking CTk dialog, auto-closes the moment permission is granted
     _setup_root = ctk.CTk()
     _setup_root.withdraw()
 
     _win = ctk.CTkToplevel(_setup_root)
-    _win.title('Hotkeys — One-time Setup')
+    _win.title('Hotkeys, One-time Setup')
     _win.resizable(False, False)
     _win.attributes('-topmost', True)
     _win.geometry('460x340')
@@ -2927,7 +4383,7 @@ def _mac_ensure_accessibility() -> None:
     ctk.CTkLabel(_win,
                  text=(
                      'Hotkeys needs one permission to work.\n'
-                     'System Settings has opened for you — just:\n'
+                     'System Settings has opened for you, just:\n'
                  ),
                  font=ctk.CTkFont(size=14)).pack()
 
@@ -2966,7 +4422,30 @@ def _mac_ensure_accessibility() -> None:
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+def _set_app_user_model_id():
+    """Tell Windows to treat us as a distinct app, not pythonw.exe,
+    so the taskbar / Alt+Tab / jump list use OUR icon and grouping
+    instead of falling back to the generic Python logo.
+
+    Must run BEFORE any window is created. AUMID is process-wide;
+    the whiteboard subprocess sets the same string so its window
+    groups under the same app entry."""
+    if sys.platform != 'win32':
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            'Hotkeys.App.1')
+    except Exception:
+        pass
+
+
 if __name__ == '__main__':
+    _set_app_user_model_id()
+    # NOTE: the --whiteboard short-circuit moved to the TOP of this file so
+    # the subprocess does not waste time importing heavy modules. That fork
+    # exits before this code ever runs in subprocess mode.
+
     # pystray uses multiprocessing on Windows and spawns a child process with
     # the exact same command line (pythonw.exe main.py).  That child re-imports
     # __main__, so __name__ == '__main__' is True inside it too.  We MUST skip
@@ -2982,5 +4461,5 @@ if __name__ == '__main__':
         signal.signal(signal.SIGTERM, lambda *_: app._quit())
         signal.signal(signal.SIGINT,  lambda *_: app._quit())
         app.run()
-    # else: we are pystray's multiprocessing worker — do nothing here;
+    # else: we are pystray's multiprocessing worker, do nothing here;
     # multiprocessing's spawn handler will call the real target function.
