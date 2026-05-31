@@ -478,8 +478,17 @@ def transcribe_file(
     if compute_type == 'auto':
         compute_type = 'float16' if device == 'cuda' else 'int8'
 
+    # Loading the model into memory takes ~30s for large-v3 on CPU and
+    # produces no progress events of its own, the UI watchdog will pulse
+    # but a labelled phase tells the user what's actually happening.
+    _safe_progress(on_progress, 'load_model', 0.0)
     wm = _get_or_load_whisper(model_path, device, compute_type, log)
+    _safe_progress(on_progress, 'load_model', 1.0)
     log(f'Transcribing {src.name}…')
+    # Marks the gap between model-ready and first-segment-emitted (VAD
+    # runs here, plus Whisper's first decode pass). Without this the UI
+    # bar would sit at 0% under the 'transcribe' label for 5-30s.
+    _safe_progress(on_progress, 'analyze', 0.0)
 
     # Music mode tunes Whisper for sung vocals over instrumental: aggressive
     # VAD treats singing as non-speech and strips it (3:28 song → 11 s kept

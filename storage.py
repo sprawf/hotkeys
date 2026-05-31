@@ -247,6 +247,10 @@ DEFAULT_CONFIG: dict = {
         # Bundled audio editor (Tenacity portable, relabeled to "Audio
         # Editor" at the window-title layer). See audio_editor.py.
         'audio_editor': 'shift+f10',
+        # URL downloader (YouTube / SoundCloud / Vimeo / Twitter / 1000+
+        # sites yt-dlp supports). Select a URL in any app → press hotkey →
+        # downloads best-quality video into ~/Downloads.
+        'download_url': 'ctrl+alt+d',
     },
     'providers': {
         'local':    {'model_id': 'Qwen/Qwen2.5-1.5B-Instruct-GGUF'},

@@ -936,12 +936,24 @@ class QuickNotesWindow(ctk.CTkToplevel):
                     hints = [
                         'Click + New or start typing →',
                         'Ctrl+V here to paste as note',
+                        'Ctrl+V an image → OCR into a note',
                         'Right-click for more options',
                     ]
                     for h in hints:
                         tk.Label(hint_frame, text=h,
                                  bg=_LIST, fg=_T3, font=(FONT_FAMILY, 10),
                                  anchor='w').pack(fill='x', pady=(4, 0))
+                    # Voice-memo discovery tip — only shown in the empty
+                    # state, where a new user is most likely to look for
+                    # ways to add their first note.
+                    tip = tk.Label(
+                        hint_frame,
+                        text='💡  While dictating (Ctrl+Enter), say "memo"\n'
+                             '   at the start or end → saves as a note',
+                        bg=_LIST, fg=_T2, font=(FONT_FAMILY, 10, 'italic'),
+                        justify='left', anchor='w',
+                    )
+                    tip.pack(fill='x', pady=(12, 0))
             else:
                 total = len(notes)
                 for note in notes[:_MAX_RENDERED]:

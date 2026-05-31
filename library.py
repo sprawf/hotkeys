@@ -4027,7 +4027,18 @@ class LibraryWindow:
                   'your saved notes live in the Quick Notes window.'),
             font=(FONT_FAMILY, 13), text_color=TEXT_P, justify='left',
             wraplength=900,
-        ).grid(row=1, column=0, sticky='w', padx=PAD, pady=(0, PAD))
+        ).grid(row=1, column=0, sticky='w', padx=PAD, pady=(0, PAD_SM))
+
+        # Voice-memo tip — visible alongside the regular "Press Shift+F7" hint
+        # so users discover the hands-free save flow without opening docs.
+        ctk.CTkLabel(
+            hdr,
+            text=('💡  Tip: while dictating with Ctrl+Enter, say "memo" '
+                  'at the start or end of your sentence to save it as a '
+                  'note instead of typing it into the focused app.'),
+            font=(FONT_FAMILY, 12, 'italic'), text_color=TEXT_S, justify='left',
+            wraplength=900,
+        ).grid(row=2, column=0, sticky='w', padx=PAD, pady=(0, PAD))
 
         # ── Open button ───────────────────────────────────────────────────────
         def _open():
@@ -4175,7 +4186,16 @@ class LibraryWindow:
                   'where you left off.'),
             font=(FONT_FAMILY, 13), text_color=TEXT_P, justify='left',
             wraplength=900,
-        ).grid(row=1, column=0, sticky='w', padx=PAD, pady=(0, PAD))
+        ).grid(row=1, column=0, sticky='w', padx=PAD, pady=(0, PAD_SM))
+
+        # Voice-command discoverability tip — same pattern as the Notes tab.
+        ctk.CTkLabel(
+            hdr,
+            text=('💡  Tip: while dictating with Ctrl+Enter, say "whiteboard" '
+                  'to open this from any app, hands-free.'),
+            font=(FONT_FAMILY, 12, 'italic'), text_color=TEXT_S, justify='left',
+            wraplength=900,
+        ).grid(row=2, column=0, sticky='w', padx=PAD, pady=(0, PAD))
 
         # ── Open button ───────────────────────────────────────────────────────
         def _open():
@@ -4225,7 +4245,16 @@ class LibraryWindow:
                   'noise, then export back out. Runs offline.'),
             font=(FONT_FAMILY, 13), text_color=TEXT_P, justify='left',
             wraplength=900,
-        ).grid(row=1, column=0, sticky='w', padx=PAD, pady=(0, PAD))
+        ).grid(row=1, column=0, sticky='w', padx=PAD, pady=(0, PAD_SM))
+
+        # Voice-command discoverability tip.
+        ctk.CTkLabel(
+            hdr,
+            text=('💡  Tip: while dictating with Ctrl+Enter, say "audio" '
+                  'to open this from any app, hands-free.'),
+            font=(FONT_FAMILY, 12, 'italic'), text_color=TEXT_S, justify='left',
+            wraplength=900,
+        ).grid(row=2, column=0, sticky='w', padx=PAD, pady=(0, PAD))
 
         # ── Open button ───────────────────────────────────────────────────────
         def _open():

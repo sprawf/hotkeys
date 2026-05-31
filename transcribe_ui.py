@@ -194,12 +194,17 @@ _MODEL_TIER = {
     'large-v3':       'Most accurate',
 }
 
-def _discover_model_choices() -> dict:
+def _discover_model_choices(for_translate: bool = False) -> dict:
     """Return {friendly_label: model_id} for the Model dropdown.
 
     We always include the full ladder (base, small, large-v3-turbo,
     large-v3) so the user can pick any of them; ones that are not yet on
     disk get an "(~XYZ MB download)" suffix so picking is informed.
+
+    When for_translate=True, large-v3-turbo is omitted: that model is a
+    decoder-pruned finetune that silently ignores task='translate' and
+    returns source-language text. Hiding it from the dropdown prevents
+    the surprise.
     """
     try:
         from transcribe.engine import (_whisper_models_available,
@@ -209,6 +214,8 @@ def _discover_model_choices() -> dict:
         on_disk = {'base'}
         _MODEL_SIZES_MB = {}
     all_ids = ['base', 'small', 'large-v3-turbo', 'large-v3']
+    if for_translate:
+        all_ids = [m for m in all_ids if m != 'large-v3-turbo']
     out = {}
     for mid in all_ids:
         base = _MODEL_LABELS.get(mid, mid)
@@ -313,7 +320,8 @@ OPERATIONS = [
     # ── Get video ────────────────────────────────────────────────────────────
     {'key':'dl_video', 'cat':'Get video',
      'label':'🎬  Download video',
-     'desc':'Save the video (with audio) from a URL.',
+     'desc':'Save the video (with audio) from a URL.\n'
+            'Tip: select / copy any URL and press Ctrl+Alt+D from any app.',
      'needs':'url',
      'options':['video_format','out_dir']},
 
@@ -668,17 +676,28 @@ class TranscribePanel:
             return
 
         if 'model' in wanted:
-            # Tooltip lists only the bare specs per tier, the dropdown
-            # labels already describe what each tier IS (Fast / Balanced /
-            # Accurate). Repeating that in the tooltip is noise; what the
-            # user can't see from the label is size + speed.
-            choices = _discover_model_choices()
+            # Translate-to-English silently misbehaves on large-v3-turbo
+            # (decoder-pruned finetune returns source-language text), so
+            # hide it from the dropdown when the user picked Translate.
+            is_translate = op.get('key') == 'translate'
+            choices = _discover_model_choices(for_translate=is_translate)
+            # Keep model_var pointing at something valid. If the user had
+            # large-v3-turbo selected and then switched to Translate, snap
+            # to the first remaining choice so the dropdown shows a real
+            # entry instead of a phantom label.
+            if self.model_var.get() not in choices:
+                self.model_var.set(next(iter(choices.keys())))
             tip_lines = []
             for friendly, mid in choices.items():
                 t = _MODEL_TOOLTIPS.get(mid)
                 if t:
                     tier = _MODEL_TIER.get(mid, friendly)
                     tip_lines.append(f'{tier}  →  {t}')
+            if is_translate:
+                tip_lines.append('')
+                tip_lines.append('Note: "Accurate" (large-v3-turbo) is hidden '
+                                 'here because it cannot translate, only '
+                                 'transcribe in the source language.')
             self._opt_dropdown(row, 'Model:',
                                list(choices.keys()),
                                self.model_var, width=260,
@@ -1450,7 +1469,11 @@ class TranscribePanel:
         out: dict = {}
         wanted = set(op['options'])
         if 'model' in wanted:
-            out['model'] = _discover_model_choices()[self.model_var.get()]
+            # Look up in the same list the dropdown was built from so a
+            # Translate-mode label (sans large-v3-turbo) still resolves.
+            choices = _discover_model_choices(for_translate=(op.get('key') == 'translate'))
+            out['model'] = choices.get(self.model_var.get()) \
+                           or _discover_model_choices().get(self.model_var.get(), 'base')
         if 'language' in wanted:
             out['language'] = next(
                 (c for lbl, c in _LANGUAGES if lbl == self.lang_var.get()),
@@ -1961,6 +1984,24 @@ class TranscribePanel:
                     return
         except queue.Empty:
             pass
+
+        # Keep the elapsed-time line ticking even when no phase events
+        # arrive (model load can sit silent for 30+s on large-v3, and
+        # there's also a gap between VAD finishing and the first Whisper
+        # segment). Without this, the UI looks frozen.
+        try:
+            if getattr(self, '_job_t0', 0) and self._worker and self._worker.is_alive():
+                elapsed = time.time() - self._job_t0
+                since_phase = time.time() - getattr(self, '_last_phase_t', self._job_t0)
+                spinner = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+                tick = spinner[int(time.time() * 8) % len(spinner)]
+                if since_phase > 3.0:
+                    meta = f'Elapsed: {_fmt_duration(elapsed)}  ·  {tick} still working…'
+                else:
+                    meta = f'Elapsed: {_fmt_duration(elapsed)}'
+                self.progress_meta.configure(text=meta)
+        except Exception:
+            pass
         if self._worker and self._worker.is_alive() and not self._destroyed:
             self._poll_id = self.parent.after(150, self._poll)
         else:
@@ -1970,6 +2011,8 @@ class TranscribePanel:
         names = {
             'download':       '⬇  Downloading',
             'download_model': '🧠 Downloading AI model (one-time)',
+            'load_model':     '🧠 Loading model into memory…',
+            'analyze':        '🎚️ Analyzing audio…',
             'transcribe':     '📝 Transcribing',
             'diarize':        '🎤 Identifying speakers',
             'summary':        '✨ AI summary',
@@ -1983,6 +2026,7 @@ class TranscribePanel:
         self.progress_bar.set(max(0.0, min(1.0, float(pct))))
         elapsed = time.time() - self._job_t0
         self.progress_meta.configure(text=f'Elapsed: {_fmt_duration(elapsed)}')
+        self._last_phase_t = time.time()
 
     # ── Termination handlers ─────────────────────────────────────────────────
 
@@ -2187,8 +2231,17 @@ class TranscribePanel:
 
         def _forward(event):
             try:
-                # Tk on Windows: event.delta is ±120 per notch.
-                canvas.yview_scroll(int(-1 * event.delta / 120), 'units')
+                # Tk on Windows: event.delta is ±120 per notch. CTk's canvas
+                # uses a 1px scroll-increment, so yview_scroll('units') is
+                # painfully slow. Instead move by a fraction of the visible
+                # viewport per notch — matches Windows' standard 3-line
+                # scroll feel without depending on the canvas's font metrics.
+                notches = -1 * event.delta / 120  # +/-1 per wheel click
+                top, bottom = canvas.yview()
+                view_frac = max(0.05, bottom - top)
+                # 15% of the visible viewport per notch ≈ Windows default.
+                canvas.yview_moveto(max(0.0, min(1.0 - view_frac,
+                                                  top + notches * view_frac * 0.15)))
             except Exception:
                 pass
             return 'break'
@@ -2402,6 +2455,12 @@ class TranscribePanel:
     def _do_export(self, fmt: str) -> None:
         if not self._current_job: return
         stem = Path(self._current_job.source).stem or 'transcript'
+        # When source is a URL (e.g. https://youtube.com/watch?v=ID),
+        # Path(url).stem returns 'watch?v=ID' — the '?' is an illegal
+        # Windows filename char and the Save dialog silently rejects it
+        # on click. Strip < > : " / \ | ? * and any control chars.
+        import re as _re
+        stem = _re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', stem).strip(' ._') or 'transcript'
         path = filedialog.asksaveasfilename(
             parent=self.parent.winfo_toplevel(),
             title=f'Export {fmt.upper()}',

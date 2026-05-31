@@ -133,6 +133,7 @@ def download_url(
     *,
     on_progress: Callable[[float], None] | None = None,
     on_log:      Callable[[str], None]  | None = None,
+    on_phase:    Callable[[str], None]  | None = None,
 ) -> Path:
     """User-facing downloader: saves `url` to `dest_dir` using the yt-dlp
     format string `fmt` (see DOWNLOAD_FORMATS for the curated menu). Returns
@@ -143,11 +144,15 @@ def download_url(
     delivered.
     """
     return _download(url, dest_dir, fmt,
-                     on_progress=on_progress, on_log=on_log)
+                     on_progress=on_progress, on_log=on_log,
+                     on_phase=on_phase)
 
 
 def _download(url: str, dest_dir, fmt: str, *,
-              on_progress, on_log) -> Path:
+              on_progress, on_log, on_phase=None) -> Path:
+    """on_phase(label) is called with short status strings like 'merging',
+    'transcoding', or 'done' so callers can update UI text separately
+    from the progress bar."""
     try:
         import yt_dlp
     except ImportError as e:
@@ -157,16 +162,42 @@ def _download(url: str, dest_dir, fmt: str, *,
     dest = Path(dest_dir).expanduser().resolve()
     dest.mkdir(parents=True, exist_ok=True)
 
+    # Smooth two-stream (bestvideo+bestaudio) into a single 0→1 bar by
+    # weighting each unique stream as an equal slice. Without this the
+    # pill bounces: video 0→100%, audio 0→100% — looks broken.
+    state = {'streams': {}, 'order': []}
+
     def _hook(d):
-        if not on_progress: return
         try:
-            if d.get('status') == 'downloading':
+            status = d.get('status')
+            fname = d.get('filename') or d.get('info_dict', {}).get('filepath') or 'stream'
+            if fname not in state['streams']:
+                state['order'].append(fname)
+            if status == 'downloading':
                 total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
                 done  = d.get('downloaded_bytes') or 0
-                if total > 0:
-                    on_progress(done / total)
-            elif d.get('status') == 'finished':
-                on_progress(1.0)
+                state['streams'][fname] = (done / total) if total > 0 else 0.0
+            elif status == 'finished':
+                state['streams'][fname] = 1.0
+            if on_progress and state['order']:
+                # Average across all streams seen so far. While first stream
+                # downloads, denominator is 1 → real percent. When second
+                # stream starts, denominator becomes 2 → first sits at 50%
+                # contribution and the pill keeps climbing past it.
+                vals = [state['streams'].get(f, 0.0) for f in state['order']]
+                # Assume max 2 streams (video+audio) so denominator stabilizes
+                denom = max(2, len(state['order']))
+                on_progress(sum(vals) / denom)
+        except Exception:
+            pass
+
+    def _pp_hook(d):
+        try:
+            status = d.get('status')
+            pp = (d.get('postprocessor') or '').lower()
+            if status == 'started' and ('merger' in pp or 'ffmpeg' in pp):
+                if on_phase: on_phase('merging')
+                if on_progress: on_progress(1.0)
         except Exception:
             pass
 
@@ -177,8 +208,14 @@ def _download(url: str, dest_dir, fmt: str, *,
         'quiet':            True,
         'no_warnings':      True,
         'progress_hooks':   [_hook],
+        'postprocessor_hooks': [_pp_hook],
         'extract_flat':     False,
         'allow_unplayable_formats': False,
+        # Force yt-dlp to delete the per-stream source files after a
+        # successful merge — defaults to False already in yt-dlp but
+        # being explicit so the .fNNN.mp4 / .fNNN.m4a fragments don't
+        # linger if a previous defaults change ever flips this.
+        'keepvideo':        False,
         # Sanitize titles for Windows (strips < > : " | ? * \ /) so a
         # video named   AC/DC: "Live!?"   doesn't crash the rename step.
         'windowsfilenames': True,

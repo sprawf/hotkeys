@@ -176,6 +176,7 @@ VERSION = '1.0.0'
 
 # Sentinel passed to _do_ask when image OCR finds no text
 _ASK_NO_TEXT = '\x00IMAGE_NO_TEXT'
+_DOWNLOAD_NO_URL = '\x00DOWNLOAD_NO_URL'
 
 # Phrases the vision model returns when an image has no readable text
 _NO_TEXT_PHRASES = (
@@ -766,6 +767,8 @@ class App:
             'transcribe':         lambda _: self._do_open_transcribe(),
             # Shift+F10, bundled audio editor (Tenacity, relabeled).
             'audio_editor':       lambda _: self._do_open_audio_editor(),
+            # Ctrl+Alt+D, downloads URL from selection/clipboard via yt-dlp.
+            'download_url':       lambda url: self._do_download_url(url),
         }
 
         self._register_hotkeys()
@@ -889,6 +892,8 @@ class App:
             # window-title layer. See audio_editor.py.
             keyboard.add_hotkey(hk.get('audio_editor', 'shift+f10'),
                                 lambda: self._q.put(('audio_editor', None)),    suppress=False)
+            keyboard.add_hotkey(hk.get('download_url', 'ctrl+alt+d'),
+                                self._hk_download_url,                          suppress=False)
 
             if ptt:
                 whisper_hk = hk.get('whisper', 'ctrl+enter')
@@ -1867,6 +1872,181 @@ class App:
             self._wb_proc = proc
             self._wb_proc_pid = proc.pid
         logger.info(f'Launched whiteboard via {"powershell intermediary" if sys.platform == "win32" else "direct"} ({"frozen" if frozen else "source"})')
+
+    # ── URL downloader (Ctrl+Alt+D) ─────────────────────────────────────────
+
+    def _hk_download_url(self) -> None:
+        """Ctrl+Alt+D, capture URL from selection or clipboard, queue download."""
+        threading.Thread(target=self._capture_and_queue_download, daemon=True).start()
+
+    def _capture_and_queue_download(self) -> None:
+        """Capture URL the same way Refine / Ask capture text (selection
+        first, then clipboard), then validate it's a URL. If no URL is found
+        the user gets a clear 'no URL' message — no download attempted."""
+        # Wait for modifier release
+        if sys.platform == 'win32':
+            _u32 = ctypes.windll.user32
+            _deadline = time.time() + 0.5
+            while time.time() < _deadline:
+                if not (_u32.GetAsyncKeyState(0x10) & 0x8000 or  # Shift
+                        _u32.GetAsyncKeyState(0x11) & 0x8000 or  # Ctrl
+                        _u32.GetAsyncKeyState(0x12) & 0x8000):   # Alt
+                    break
+                time.sleep(0.015)
+        time.sleep(0.04)
+
+        # Selection first
+        try:
+            prev = pyperclip.paste()
+        except Exception:
+            prev = ''
+        try:
+            pyperclip.copy('')
+        except Exception:
+            pass
+        copy_selection()
+        captured = ''
+        for _ in range(25):
+            time.sleep(0.03)
+            try:
+                cur = pyperclip.paste()
+            except Exception:
+                continue
+            if cur and cur.strip():
+                captured = cur
+                break
+
+        # Restore clipboard. We extract URLs from BOTH the selection and
+        # the previous clipboard text in case the user copied a URL
+        # earlier rather than selecting it just now.
+        candidates = []
+        if captured.strip():
+            candidates.append(captured.strip())
+        if prev and prev.strip() and prev.strip() != captured.strip():
+            candidates.append(prev.strip())
+        try:
+            pyperclip.copy(prev)
+        except Exception:
+            pass
+
+        import re as _re
+        url_re = _re.compile(r'https?://[^\s<>"\'\)]+', _re.IGNORECASE)
+        url = None
+        for src in candidates:
+            m = url_re.search(src)
+            if m:
+                url = m.group(0).rstrip('.,;:!?)]}')
+                break
+
+        if not url:
+            logger.info('Download URL: no URL found in selection or clipboard')
+            self._q.put(('download_url', _DOWNLOAD_NO_URL))
+            return
+
+        logger.info(f'Download URL queued: {url[:80]}')
+        self._q.put(('download_url', url))
+
+    def _do_download_url(self, url) -> None:
+        """Main-thread handler: kicks off the yt-dlp download on a worker
+        thread so we never block the UI. Pill progresses 0→1.0 then
+        flips to 'Saved' / 'Failed' when the worker reports back."""
+        if url is _DOWNLOAD_NO_URL:
+            # Reuse the refine overlay for the simple toast
+            try:
+                self.refine_overlay.show_error('No URL in selection / clipboard')
+            except Exception:
+                pass
+            threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
+            return
+        if not isinstance(url, str):
+            return
+
+        # Dedupe in-flight downloads — spamming Ctrl+Alt+D on the same
+        # selected URL would otherwise spawn N parallel yt-dlp workers,
+        # each writing to the same outtmpl. With nooverwrites=True the
+        # extras get `(1)`, `(2)` suffixes, so you'd end up with multiple
+        # copies of the same video.
+        if not hasattr(self, '_downloads_in_flight'):
+            self._downloads_in_flight = set()
+            self._downloads_lock = threading.Lock()
+        with self._downloads_lock:
+            if url in self._downloads_in_flight:
+                try:
+                    self.refine_overlay.show_error('Already downloading this URL')
+                except Exception:
+                    pass
+                threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
+                return
+            self._downloads_in_flight.add(url)
+
+        # Start the visual pill before kicking off the download so the user
+        # sees feedback immediately even on slow disks.
+        try:
+            self.refine_overlay.show_download_starting()
+        except Exception:
+            pass
+
+        threading.Thread(
+            target=self._download_url_worker,
+            args=(url,),
+            daemon=True,
+            name='url-download',
+        ).start()
+        threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
+
+    def _download_url_worker(self, url: str) -> None:
+        """Background download via yt-dlp into ~/Downloads."""
+        try:
+            from pathlib import Path as _P
+            import re as _re, time as _time
+            dest_dir = _P.home() / 'Downloads'
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            logger.info(f'Download URL: {url[:80]} → {dest_dir}')
+
+            # Sweep orphaned per-stream fragments from a previous run that
+            # was killed mid-merge — files like "Title [id].f137.mp4" and
+            # ".f140.m4a" sitting next to the merged file (or alone).
+            try:
+                cutoff = _time.time() - 24 * 3600
+                frag_re = _re.compile(r'\.f\d+\.(mp4|m4a|webm|opus|aac)$', _re.I)
+                for f in dest_dir.iterdir():
+                    if f.is_file() and frag_re.search(f.name) and f.stat().st_mtime < cutoff:
+                        f.unlink(missing_ok=True)
+                        logger.info(f'Swept stale fragment: {f.name}')
+            except Exception as sweep_exc:
+                logger.debug(f'Fragment sweep skipped: {sweep_exc}')
+
+            # Best video+audio (MP4) — same preset Transcribe's Shift+F9
+            # uses for "download original media" mode.
+            fmt = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
+
+            def _progress(p: float) -> None:
+                self.root.after(0, self.refine_overlay.show_download_progress, p)
+
+            def _phase(label: str) -> None:
+                if label == 'merging':
+                    self.root.after(0, self.refine_overlay.show_download_merging)
+
+            from transcribe.youtube import download_url as _dl
+            out_path = _dl(url, dest_dir, fmt,
+                           on_progress=_progress, on_log=None, on_phase=_phase)
+
+            name = out_path.name if hasattr(out_path, 'name') else str(out_path).rsplit('\\', 1)[-1]
+            self.root.after(0, self.refine_overlay.show_download_done, name)
+            logger.info(f'Download URL: complete → {out_path}')
+        except Exception as exc:
+            msg = str(exc)
+            if len(msg) > 80:
+                msg = msg[:77] + '…'
+            logger.warning(f'Download URL failed: {exc}')
+            self.root.after(0, self.refine_overlay.show_error,
+                            f'Download failed: {msg}')
+        finally:
+            try:
+                with self._downloads_lock:
+                    self._downloads_in_flight.discard(url)
+            except Exception:
+                pass
 
     def _do_open_audio_editor(self) -> None:
         """Shift+F10, toggle the bundled audio editor (Tenacity portable).
@@ -3132,6 +3312,47 @@ class App:
             logger.info('Whisper: no speech detected.')
             return
 
+        # Log the actual transcript so we can diagnose mishears.
+        # ("Memo, …" is sometimes transcribed as plain "…" by Whisper base
+        # because the soft "M" gets clipped by VAD.) Truncate to 200 chars
+        # so we don't fill the log with full dictations on every call.
+        _preview = text[:200] + ('…' if len(text) > 200 else '')
+        logger.info(f'Whisper transcript: {_preview!r}')
+
+        # ── Voice-command short-circuit: single-word app commands ────────────
+        # If the dictation is exactly one of our known command words
+        # (e.g. "library"), open that feature instead of typing the word.
+        # Checked BEFORE memo so single-word "library" doesn't fall through
+        # to the memo logic. Single-word only — multi-word phrases still
+        # paste normally so users can dictate "library books" etc.
+        if self._maybe_run_voice_command(text):
+            return
+
+        # ── Voice-command short-circuit: "memo" at start or end ──────────────
+        # Detect BEFORE pasting. If triggered, save to Quick Notes and skip
+        # the normal paste path entirely — the user doesn't want the trigger
+        # word typed into whatever app has focus.
+        _note_body = self._extract_voice_note_body(text)
+        if _note_body is not None:
+            self._save_voice_note(_note_body)
+            self.whisper_overlay.show_whisper_saved_to_notes()
+            # Still push the FULL transcript (with trigger phrase) into history,
+            # so the user can audit what they said.
+            self._history.append({
+                'text':     text,
+                'language': language,
+                'duration': round(duration_s, 2),
+                'ts':       datetime.datetime.now().isoformat(timespec='seconds'),
+                'source':   'voice-to-notes',
+            })
+            if len(self._history) > _HISTORY_MAX_ENTRIES:
+                self._history = self._history[-_HISTORY_MAX_ENTRIES:]
+            _snap = list(self._history)
+            threading.Thread(target=save_history, args=(_snap,), daemon=True).start()
+            logger.info(f'voice-to-notes: saved ({len(_note_body)} chars), '
+                        f'transcript was {len(text)} chars')
+            return
+
         out_cfg = self.config.get('whisper', {}).get('output', {})
         out  = text + (' ' if out_cfg.get('add_trailing_space', True) else '')
 
@@ -3214,6 +3435,137 @@ class App:
         _snap = list(self._history)
         threading.Thread(target=save_history, args=(_snap,), daemon=True).start()
         logger.info(f'Whisper complete: {len(text)} chars in {elapsed:.2f}s')
+
+    # ── Single-word voice commands ────────────────────────────────────────────
+    # Maps a (cleaned, lowercased) single-word dictation to a tuple of
+    # (event-queue command, user-facing pill label). Only matched when the
+    # transcript contains exactly that one word (ignoring punctuation), so
+    # the user can still dictate longer sentences containing these words.
+    _VOICE_COMMANDS = {
+        'library':    ('library',      'Library opened'),
+        'whiteboard': ('whiteboard',   'Whiteboard opened'),
+        'audio':      ('audio_editor', 'Audio editor opened'),
+    }
+
+    def _maybe_run_voice_command(self, text: str) -> bool:
+        """If *text* is a recognized single-word command, dispatch it and
+        return True (caller skips paste). Otherwise return False."""
+        import re as _re
+        # Strip surrounding punctuation Whisper adds, then lowercase.
+        cleaned = _re.sub(r'[^\w]', '', text.strip(), flags=_re.UNICODE).lower()
+        if not cleaned:
+            return False
+        entry = self._VOICE_COMMANDS.get(cleaned)
+        if entry is None:
+            return False
+        cmd, label = entry
+        try:
+            self._q.put((cmd, None))
+        except Exception as exc:
+            logger.warning(f'voice-command {cmd!r} queue failed: {exc}')
+            return False
+        # Visual feedback
+        try:
+            self.whisper_overlay.show_whisper_command_fired(label)
+        except Exception:
+            pass
+        # Also save to history so it's discoverable
+        self._history.append({
+            'text':     text,
+            'language': 'voice-command',
+            'duration': 0,
+            'ts':       datetime.datetime.now().isoformat(timespec='seconds'),
+            'source':   f'voice-command:{cmd}',
+        })
+        if len(self._history) > _HISTORY_MAX_ENTRIES:
+            self._history = self._history[-_HISTORY_MAX_ENTRIES:]
+        _snap = list(self._history)
+        threading.Thread(target=save_history, args=(_snap,), daemon=True).start()
+        logger.info(f'voice-command fired: {cmd!r}')
+        return True
+
+    @staticmethod
+    def _extract_voice_note_body(text: str) -> str | None:
+        """Detect the "save to Quick Notes" voice command in *text*.
+
+        Trigger word: literally "memo" — case-insensitive, word-bounded
+        so "memorial" / "memos" / mid-sentence usages never trigger.
+        Position: must be the FIRST or LAST word (with optional leading
+        / trailing punctuation that Whisper likes to insert).
+
+        Returns the body with the trigger word stripped, or None if no
+        trigger. Returns '' if the user said only "memo" alone.
+        """
+        import re as _re
+        # First word is exactly "memo" (with optional surrounding punctuation).
+        PREFIX_RE = _re.compile(
+            r'^[\s,;:!\.\-]*memo\b[\s,;:!\.\-]*',
+            _re.IGNORECASE,
+        )
+        # Last word is exactly "memo" (with optional surrounding punctuation).
+        SUFFIX_RE = _re.compile(
+            r'[\s,;:!\.\-]*\bmemo[\s,;:!\.\-]*[\s\.\!\?]*$',
+            _re.IGNORECASE,
+        )
+
+        body = text
+        triggered = False
+        m = PREFIX_RE.match(body)
+        if m:
+            body = body[m.end():]
+            triggered = True
+        m = SUFFIX_RE.search(body)
+        if m:
+            body = body[:m.start()]
+            triggered = True
+
+        if not triggered:
+            return None
+
+        body = body.strip().strip(' .,;:!?-').strip()
+        if not body:
+            return ''
+        return body
+
+    def _save_voice_note(self, body: str) -> None:
+        """Persist *body* as a fresh Quick Notes entry. Triggers a live
+        refresh of the Quick Notes window if it's open, and pings a tray
+        notification so the user knows the save happened even if their
+        cursor is far from the whisper overlay pill."""
+        if not body:
+            logger.info('voice-to-notes: empty body, skipping save')
+            return
+        try:
+            from storage import load_notes, save_notes
+            import uuid
+            notes = load_notes()
+            notes.append({
+                'id':         str(uuid.uuid4()),
+                'text':       body,
+                'items':      [{'text': '', 'checked': False}],
+                'voice':      '',
+                'color':      None,
+                'pinned':     False,
+                'created_at': datetime.datetime.now().isoformat(timespec='seconds'),
+                'source':     'voice',
+            })
+            save_notes(notes)
+            # Live-refresh open Quick Notes window
+            _win = getattr(self, '_notes_win', None)
+            if _win is not None:
+                try:
+                    _win._invalidate_notes_cache()
+                    self.root.after(0, _win._refresh_list)
+                except Exception:
+                    pass
+            # NOTE: deliberately no Windows toast notification here. The
+            # near-cursor "📝 Saved to Notes" pill (shown by the caller) is
+            # the user-facing confirmation. The Windows toast comes through
+            # as "Python ▸ Saved to Quick Notes" which looks unbranded and
+            # interrupts the user's window; the near-cursor pill is enough
+            # and matches the rest of the app's notification language.
+        except Exception as exc:
+            logger.warning(f'voice-to-notes persist failed: {exc}')
 
     def _on_whisper_error(self, msg: str) -> None:
         self.whisper_overlay.show_whisper_error(msg)

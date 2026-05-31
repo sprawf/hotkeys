@@ -83,6 +83,47 @@ class OverlayWindow:
         if self._win:
             self._win.after(750, self._close)
 
+    # ── URL downloader pills (Ctrl+Alt+D) ────────────────────────────────────
+
+    def show_download_starting(self) -> None:
+        """Initial pill — shown the moment the URL is captured, before
+        yt-dlp's first progress hook fires (which can take a few seconds
+        while it resolves the format manifest)."""
+        self._close()
+        self._build('📥  Downloading…  0%', _TEXT_CLR, ACCENT)
+
+    def show_download_progress(self, frac: float) -> None:
+        """Update the percentage in the in-flight download pill. Safe to
+        call from a worker thread via Tk's after()."""
+        pct = max(0, min(100, int(frac * 100)))
+        if self._win is None:
+            self._build(f'📥  Downloading…  {pct}%', _TEXT_CLR, ACCENT)
+        else:
+            self._set_text(f'📥  Downloading…  {pct}%')
+            self._set_bar(ACCENT)
+
+    def show_download_merging(self) -> None:
+        """Streams arrived, ffmpeg is now muxing video + audio. Without
+        a distinct pill, users think the app hung at 100% and kill it
+        (leaving the .fNNN fragments behind)."""
+        if self._win is None:
+            self._build('🔀  Merging video + audio…', _TEXT_CLR, ACCENT)
+        else:
+            self._set_text('🔀  Merging video + audio…')
+            self._set_bar(ACCENT)
+
+    def show_download_done(self, filename: str) -> None:
+        """Replace the progress pill with a 'Saved <name>' confirmation,
+        auto-dismiss after a few seconds."""
+        short = filename if len(filename) <= 40 else filename[:37] + '…'
+        if self._win is None:
+            self._build(f'✓  Saved  {short}', _TEXT_CLR, OK)
+        else:
+            self._set_text(f'✓  Saved  {short}')
+            self._set_bar(OK)
+        if self._win:
+            self._win.after(3500, self._close)
+
     def show_error(self, msg: str) -> None:
         self._tick = False
         short = (msg[:48] + '…') if len(msg) > 48 else msg
@@ -129,6 +170,33 @@ class OverlayWindow:
         self._set_bar(OK)
         if self._win:
             self._win.after(900, self._close)
+
+    def show_whisper_command_fired(self, label: str) -> None:
+        """Shown when a dictation matched a recognized voice command (like
+        "library") and was dispatched as an action instead of being typed.
+        Label is the user-facing action name, e.g. "Library opened"."""
+        self._tick = False
+        if self._win is None:
+            self._build(f'⚡  {label}', _TEXT_CLR, OK)
+        else:
+            self._set_text(f'⚡  {label}')
+            self._set_bar(OK)
+        if self._win:
+            self._win.after(1200, self._close)
+
+    def show_whisper_saved_to_notes(self) -> None:
+        """Shown instead of show_whisper_done when the user's dictation
+        triggered the "save to notes" voice command. Distinct icon + text
+        so the user immediately knows the dictation went to Quick Notes
+        instead of pasting normally."""
+        self._tick = False
+        if self._win is None:
+            self._build('📝  Saved to Notes', _TEXT_CLR, OK)
+        else:
+            self._set_text('📝  Saved to Notes')
+            self._set_bar(OK)
+        if self._win:
+            self._win.after(1500, self._close)
 
     def show_whisper_error(self, msg: str) -> None:
         self._tick = False
