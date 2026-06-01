@@ -472,20 +472,21 @@ class QuickNotesWindow(ctk.CTkToplevel):
             # work area; shrink it so the title bar and bottom edge always
             # stay visible.
             try:
-                # Reject geometries that are SUSPICIOUSLY SMALL (e.g. the
-                # user accidentally dragged the corner down to the
-                # 600×400 minsize and the small size got persisted). We
-                # don't want to silently restore a useless tiny window on
-                # every reopen — fall back to the Whiteboard-matched
-                # default size instead. The user can still legitimately
-                # resize smaller; we just don't PERSIST resizes below
-                # this threshold (see _on_geometry_change save hook).
+                # Parse the full WxH+X+Y from the saved string directly.
+                # We can't trust winfo_width()/winfo_x() here — the window
+                # is still withdrawn, so Tk reports its internal default
+                # frame size (~200x200) instead of the just-applied geo.
+                # That round-trip was clamping the real saved size down
+                # to ~200x200, which minsize(600,400) then bumped to the
+                # smallest legal window.
                 import re as _re
-                _m = _re.match(r'(\d+)x(\d+)', self._initial_geometry)
-                if _m:
-                    _sw, _sh = int(_m.group(1)), int(_m.group(2))
-                    # If saved size is < 80% of default, treat as garbage
-                    # and fall through to default centering.
+                _full = _re.match(r'(\d+)x(\d+)([+-]\d+)([+-]\d+)',
+                                  self._initial_geometry)
+                if _full:
+                    _sw, _sh = int(_full.group(1)), int(_full.group(2))
+                    _sx, _sy = int(_full.group(3)), int(_full.group(4))
+                    # Reject suspiciously tiny saves so we don't restore
+                    # a useless minsize-shaped window forever.
                     if _sw < int(_W * 0.8) or _sh < int(_H * 0.8):
                         logger.info(
                             f'Quick Notes: ignoring tiny saved geometry '
@@ -493,18 +494,17 @@ class QuickNotesWindow(ctk.CTkToplevel):
                             f'({_W}x{_H}) — likely an accidental resize.'
                         )
                         self._initial_geometry = ''
-                if self._initial_geometry:
-                    self.geometry(self._initial_geometry)
-                    self.update_idletasks()
-                    wx, wy = self.winfo_x(), self.winfo_y()
-                    ww, wh = self.winfo_width(), self.winfo_height()
-                    # Shrink if too tall/wide for this monitor's work area.
-                    ww = min(ww, wa_w)
-                    wh = min(wh, wa_h)
-                    # Then reposition so the window fits inside the work area.
-                    x = max(wa_x, min(wx, wa_x + wa_w - ww))
-                    y = max(wa_y, min(wy, wa_y + wa_h - wh))
-                    self.geometry(f'{ww}x{wh}+{x}+{y}')
+                    else:
+                        # Clamp to the current monitor's work area using
+                        # the parsed values, not winfo_*.
+                        _sw = min(_sw, wa_w)
+                        _sh = min(_sh, wa_h)
+                        _sx = max(wa_x, min(_sx, wa_x + wa_w - _sw))
+                        _sy = max(wa_y, min(_sy, wa_y + wa_h - _sh))
+                        self.geometry(f'{_sw}x{_sh}+{_sx}+{_sy}')
+                else:
+                    # Malformed save string — wipe so the default path runs.
+                    self._initial_geometry = ''
             except Exception:
                 self._initial_geometry = ''
         if not self._initial_geometry:
@@ -1891,25 +1891,7 @@ class QuickNotesWindow(ctk.CTkToplevel):
         self._content_host.pack(fill='both', expand=True)
 
         self._show_panel()
-
-        # ── OCR overlays, placed on _content_host so they float above the editor ──
-        # Status strip (pinned to bottom of content host)
-        self._ocr_status_frame = tk.Frame(self._content_host, bg='#1a1a1a')
-        self._ocr_status_lbl = tk.Label(
-            self._ocr_status_frame, text='', bg='#1a1a1a', fg=_T2,
-            font=(FONT_FAMILY, 10), anchor='w', padx=10,
-        )
-        self._ocr_status_lbl.pack(side='left', fill='x', expand=True)
-        self._ocr_dismiss_btn = tk.Button(
-            self._ocr_status_frame, text='✕', bg='#1a1a1a', fg=_T3,
-            activebackground=_HOVER, activeforeground=_T1,
-            relief='flat', font=(FONT_FAMILY, 9), bd=0, cursor='hand2',
-            command=self._ocr_hide_status,
-        )
-        # Preview thumbnail strip (sits above status)
-        self._ocr_preview_frame = tk.Frame(self._content_host, bg='#1e1e1e')
-        self._ocr_thumb_lbl = tk.Label(self._ocr_preview_frame, bg='#1e1e1e', anchor='w')
-        self._ocr_thumb_lbl.pack(side='left', padx=10)
+        self._build_ocr_overlays()
 
         # Bottom bar
         tk.Frame(parent, bg=_DIV, height=1).pack(fill='x')
@@ -1974,6 +1956,38 @@ class QuickNotesWindow(ctk.CTkToplevel):
         for w in self._content_host.winfo_children():
             w.destroy()
         self._panel_unified()
+        # _content_host's children were all destroyed including the OCR
+        # overlay widgets (status strip + preview thumbnail). Without
+        # rebuilding them, self._ocr_status_lbl points at a dead widget
+        # and any subsequent paste / OCR call fails silently with
+        # "invalid command name". Rebuild every time the panel rebuilds.
+        self._build_ocr_overlays()
+
+    def _build_ocr_overlays(self) -> None:
+        """(Re)construct the OCR status banner + preview thumbnail as
+        children of self._content_host. Called once from the editor's
+        initial build and again on every _show_panel() rebuild so the
+        widget refs stay live across navigation."""
+        # Visibility state always resets — the place_forget'd state of
+        # any prior widgets died with them.
+        self._ocr_status_visible  = False
+        self._ocr_preview_visible = False
+
+        self._ocr_status_frame = tk.Frame(self._content_host, bg='#1a1a1a')
+        self._ocr_status_lbl = tk.Label(
+            self._ocr_status_frame, text='', bg='#1a1a1a', fg=_T2,
+            font=(FONT_FAMILY, 10), anchor='w', padx=10,
+        )
+        self._ocr_status_lbl.pack(side='left', fill='x', expand=True)
+        self._ocr_dismiss_btn = tk.Button(
+            self._ocr_status_frame, text='✕', bg='#1a1a1a', fg=_T3,
+            activebackground=_HOVER, activeforeground=_T1,
+            relief='flat', font=(FONT_FAMILY, 9), bd=0, cursor='hand2',
+            command=self._ocr_hide_status,
+        )
+        self._ocr_preview_frame = tk.Frame(self._content_host, bg='#1e1e1e')
+        self._ocr_thumb_lbl = tk.Label(self._ocr_preview_frame, bg='#1e1e1e', anchor='w')
+        self._ocr_thumb_lbl.pack(side='left', padx=10)
 
     # ── Unified panel ─────────────────────────────────────────────────────────
 
@@ -2319,12 +2333,31 @@ class QuickNotesWindow(ctk.CTkToplevel):
                 save_notes(notes)
                 logger.info('Quick note saved')
 
-        # Persist geometry so next open restores size/position
+        # Persist geometry so next open restores size/position.
+        # Matching guard to the load-side 80% check: refuse to PERSIST a
+        # geometry smaller than 80% of the default. Without this, an
+        # accidental corner-drag below the default size would write a
+        # tiny geometry to config; the load guard catches it on next
+        # open and falls back to default, but the same tiny value is
+        # rewritten on close, so the cycle never breaks until config
+        # is hand-edited. Now: only "real" sizes get saved.
         if self._on_geometry_change:
             try:
                 self.update_idletasks()
                 geo = self.geometry()   # e.g. "1216x796+120+80"
-                self._on_geometry_change(geo)
+                import re as _re
+                _m = _re.match(r'(\d+)x(\d+)', geo)
+                if _m:
+                    _sw, _sh = int(_m.group(1)), int(_m.group(2))
+                    if _sw < int(_W * 0.8) or _sh < int(_H * 0.8):
+                        logger.info(
+                            f'Quick Notes: not persisting tiny geometry '
+                            f'({_sw}x{_sh}); keeping previous saved size.'
+                        )
+                    else:
+                        self._on_geometry_change(geo)
+                else:
+                    self._on_geometry_change(geo)
             except Exception:
                 pass
         if self._on_close:
