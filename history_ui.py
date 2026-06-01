@@ -1,7 +1,10 @@
 """Transcription History viewer, shows past whisper results with copy & search."""
 import datetime
+import logging
 import threading
 from typing import Callable
+
+logger = logging.getLogger(__name__)
 
 import customtkinter as ctk
 import pyperclip
@@ -207,13 +210,44 @@ class HistoryWindow:
     # ── Public API ────────────────────────────────────────────────────────────
 
     def show(self, history: list) -> None:
-        """Refresh entries from the given history list and show the window."""
+        """Refresh entries from the given history list and show the window.
+
+        Self-heals if the window or its scroll frame has been destroyed
+        underneath us (e.g. by an upstream cleanup of root, or some
+        legacy code path). Without this guard, clicking Tray → History
+        a second time after the window was destroyed throws
+        'bad window path name' inside _render_entries and the menu
+        item silently appears to do nothing.
+        """
+        try:
+            alive = bool(self.win.winfo_exists() and self._scroll.winfo_exists())
+        except Exception:
+            alive = False
+        if not alive:
+            try: self._build()
+            except Exception:
+                logger.exception('HistoryWindow: rebuild failed')
+                return
+
         self._history = list(history)
-        self._search_var.set('')
-        self._render_entries()
-        self.win.deiconify()
-        self.win.lift()
-        self.win.focus_force()
+        try:
+            self._search_var.set('')
+            self._render_entries()
+        except Exception:
+            logger.exception('HistoryWindow.show: render failed, retrying after rebuild')
+            try:
+                self._build()
+                self._search_var.set('')
+                self._render_entries()
+            except Exception:
+                logger.exception('HistoryWindow: second render also failed')
+                return
+        try:
+            self.win.deiconify()
+            self.win.lift()
+            self.win.focus_force()
+        except Exception:
+            logger.exception('HistoryWindow: show focus failed')
 
     def hide(self) -> None:
         self.win.withdraw()

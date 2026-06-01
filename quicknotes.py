@@ -2384,6 +2384,30 @@ class QuickNotesWindow(ctk.CTkToplevel):
         self.bind('<Control-S>', self._save_and_close)
         self.bind('<Control-m>', lambda _: self._toggle_rec())
         self.bind('<Control-M>', lambda _: self._toggle_rec())
+
+        # Window-level Ctrl+V → paste-as-note. Originally bound only to
+        # the list canvas + paste-zone label, but that meant the user
+        # had to click those widgets first to give them keyboard focus.
+        # Clicking the search bar or any other widget broke Ctrl+V.
+        # Now firing regardless of focus, with a guard that lets the
+        # in-editor Ctrl+V keep working (text/image paste into the note
+        # textbox itself is handled by _smart_paste / event_generate).
+        def _window_ctrl_v(event):
+            w = event.widget
+            try:
+                cls = w.winfo_class() if w else ''
+            except Exception:
+                cls = ''
+            # If focus is inside a text-input widget (the note editor,
+            # search bar, etc.), let the native paste handler run so the
+            # user can paste text/images into the field as usual.
+            if cls in ('Text', 'Entry', 'TEntry', 'CTkEntry', 'CTkTextbox'):
+                return None
+            # Otherwise treat the keypress as "paste as note" and route
+            # through the same handler the paste-zone label uses.
+            return self._paste_to_list()
+        self.bind('<Control-v>', _window_ctrl_v, add='+')
+        self.bind('<Control-V>', _window_ctrl_v, add='+')
         # Gesture undo at window level
         self.bind('<Control-z>', self._gesture_ctrl_z)
         self.bind('<Control-Z>', self._gesture_ctrl_z)

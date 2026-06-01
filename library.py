@@ -1661,24 +1661,50 @@ class LibraryWindow:
 
     def _show_active_tab(self) -> None:
         """Tab-switch entry: hide non-active containers, show the active one.
-        If first visit, build it. Never rebuilds an already-built tab."""
-        # Hide every cached container that isn't the active tab.
+        If first visit, build it. Never rebuilds an already-built tab.
+
+        Wrapped in defensive recovery: if the render for the new tab
+        raises, the user must never be stranded with a blank pane.
+        We rebuild the previous tab (if any) so at least something is
+        visible while the failure gets investigated via the log.
+        """
+        target = self._active_tab
+
+        # Hide every cached container that isn't the target tab. Track
+        # which ones we hid so we can re-grid them on render failure.
+        hidden = []
         for k, c in self._tab_containers.items():
-            if k != self._active_tab:
-                try: c.grid_remove()
-                except Exception: pass
+            if k != target:
+                try:
+                    c.grid_remove()
+                    hidden.append((k, c))
+                except Exception:
+                    pass
 
-        # Get or create the container for the active tab.
-        if self._active_tab not in self._tab_containers:
-            container = ctk.CTkFrame(self._scroll, fg_color='transparent')
-            container.columnconfigure(0, weight=1)
-            self._tab_containers[self._active_tab] = container
+        # Get or create the container for the target tab.
+        if target not in self._tab_containers:
+            try:
+                container = ctk.CTkFrame(self._scroll, fg_color='transparent')
+                container.columnconfigure(0, weight=1)
+                self._tab_containers[target] = container
+            except Exception as exc:
+                logger.error(f'Tab switch: failed to create container for {target!r}: {exc}')
+                # Re-grid the most recent previously-active tab so the user
+                # sees something.
+                for k, c in hidden:
+                    try: c.grid(row=0, column=0, sticky='nsew')
+                    except Exception: pass
+                    break
+                return
 
-        container = self._tab_containers[self._active_tab]
-        container.grid(row=0, column=0, sticky='nsew')
+        container = self._tab_containers[target]
+        try:
+            container.grid(row=0, column=0, sticky='nsew')
+        except Exception as exc:
+            logger.error(f'Tab switch: failed to grid {target!r}: {exc}')
 
         # Already built? Just show, no work.
-        if self._active_tab in self._tab_built:
+        if target in self._tab_built:
             return
 
         # First visit: build the widgets. Swap self._scroll → container so the
@@ -1686,11 +1712,34 @@ class LibraryWindow:
         # build into the container without modification.
         real_scroll = self._scroll
         self._scroll = container
+        build_ok = False
         try:
             self._render_cards_impl()
+            build_ok = True
+        except Exception as exc:
+            # Loud log so we can find the actual cause from user reports
+            # of "tab went blank". The defensive recovery below at least
+            # gets them back to a working pane.
+            logger.exception(f'Tab switch: _render_cards_impl raised on {target!r}: {exc}')
         finally:
             self._scroll = real_scroll
-        self._tab_built.add(self._active_tab)
+
+        if build_ok:
+            self._tab_built.add(target)
+        else:
+            # Render failed — invalidate so the next click retries from
+            # scratch, and re-grid the most recent prior tab so the user
+            # isn't staring at a blank pane.
+            self._tab_built.discard(target)
+            try: container.grid_remove()
+            except Exception: pass
+            for k, c in hidden:
+                try:
+                    c.grid(row=0, column=0, sticky='nsew')
+                    self._active_tab = k
+                    break
+                except Exception:
+                    pass
 
     def _prewarm_tab(self, tab_key: str) -> None:
         """Build *tab_key*'s widget tree into a hidden container so its
