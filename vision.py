@@ -14,7 +14,10 @@ _EXTRACT_PROMPT = (
     'Extract all text from this image exactly as it appears. '
     'Do not translate, summarize, reformat, or add any commentary. '
     'Return only the extracted text and nothing else. '
-    'Preserve the original language and formatting as closely as possible.'
+    'Preserve the original language and formatting as closely as possible. '
+    'If the image contains no readable text at all, return the single '
+    'token NO_TEXT_FOUND and nothing else — do not describe the image, '
+    'do not write "there is no text", just output NO_TEXT_FOUND.'
 )
 
 

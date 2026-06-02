@@ -229,6 +229,28 @@ def _robust_post(url: str, payload: dict, headers: dict,
     import subprocess as _sub
     import os as _os
 
+    # ── Fast reachability probe ─────────────────────────────────────────────
+    # When offline (or the host is blocked at the network layer), httpx's
+    # connect can hang well past the timeout — same class of bug as the
+    # cloud-Whisper hang. A 0.5 s non-blocking TCP probe to the target
+    # host:port catches "offline" in well under a second instead of waiting
+    # 30 s × 2 verify levels × possible curl fallback before the chain
+    # finally raises and falls back to Qwen.
+    try:
+        from urllib.parse import urlparse as _urlparse
+        import socket as _sock
+        _p = _urlparse(url)
+        _host = _p.hostname
+        _port = _p.port or (443 if _p.scheme == 'https' else 80)
+        if _host:
+            _s = _sock.create_connection((_host, _port), timeout=0.5)
+            try: _s.close()
+            except Exception: pass
+    except Exception as _probe_err:
+        # Skip the expensive httpx/curl fallback chain and surface the
+        # offline-ness immediately so the caller can fall back to Qwen.
+        raise RuntimeError(f'Cloud unreachable: {_probe_err}') from _probe_err
+
     last_exc: Exception | None = None
 
     # ── Levels 1 & 2: httpx ──────────────────────────────────────────────────

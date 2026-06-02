@@ -71,6 +71,12 @@ class PromptStickyNote:
         hdr = tk.Frame(self._inner, bg=self._dark, height=36)
         hdr.pack(fill='x')
         hdr.pack_propagate(False)
+        # Bare header pixels (between the drag grip on the left and the
+        # close button on the right) should also be draggable so the
+        # whole title-bar region feels consistent — without this the
+        # space in the middle of the header feels "dead."
+        hdr.bind('<ButtonPress-1>', self._drag_start)
+        hdr.bind('<B1-Motion>',     self._drag_move)
 
         # Drag grip, explicit handle so Entry/Button don't block dragging
         grip = tk.Label(hdr, text='⠿', bg=self._dark,

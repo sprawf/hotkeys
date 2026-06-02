@@ -376,6 +376,10 @@ class Transcriber:
 
     # Last-success cache, purely diagnostic, used for logging
     _CLOUD_RECENT_OK: bool = True
+    # Friendly message describing the most recent cloud transcription
+    # failure. main.py reads + clears this after each transcription so
+    # it can show the user a one-shot pill explaining the fallback.
+    _cloud_last_error: str | None = None
     # Shared requests.Session keeps the TCP/TLS connection to api.groq.com
     # open between calls. First call still pays the handshake cost; we
     # pre-warm it in a background thread at startup (see _prewarm_cloud).
@@ -427,6 +431,26 @@ class Transcriber:
             return bool(getattr(audio_cfg, 'cloud_enabled', True))
         except Exception:
             return True
+
+    def _cloud_reachable(self, host: str = 'api.groq.com',
+                         port: int = 443, timeout: float = 0.5) -> bool:
+        """Fast non-blocking TCP probe to detect whether the cloud
+        Whisper host is reachable RIGHT NOW. Returns True on successful
+        connect, False on any failure (DNS resolution failure, network
+        unreachable, refused, timeout).
+
+        Used as a pre-flight before the much slower requests.Session.post
+        call — without this, an offline / blocked session can hang the
+        write phase indefinitely while the pill shows 'Transcribing…'.
+        """
+        import socket
+        try:
+            s = socket.create_connection((host, port), timeout=timeout)
+            try: s.close()
+            except Exception: pass
+            return True
+        except Exception:
+            return False
 
     @staticmethod
     def _audio_to_wav_bytes(audio: np.ndarray, sample_rate: int = _SR) -> bytes:
@@ -654,6 +678,23 @@ class Transcriber:
         if not self._cloud_enabled() or audio is None or len(audio) == 0:
             return self._transcribe(audio, _already_denoised=denoised_here)
 
+        # ── Fast reachability probe ──────────────────────────────────────────
+        # requests' timeout=3.0 covers connect + read, but the pre-warmed
+        # TCP socket in the pool can write into a dead network for minutes
+        # before the kernel decides the connection is gone — and that whole
+        # time the worker thread is hung, the pill shows "Transcribing…",
+        # and the user thinks the app is broken. A 0.5 s non-blocking TCP
+        # probe to api.groq.com:443 catches the offline / DNS-fail case
+        # before we touch the slow session pool path. If the probe fails,
+        # we skip the cloud attempt entirely and go straight to local —
+        # the user sees the "Cloud unreachable" pill within a second.
+        if not self._cloud_reachable():
+            self._cloud_last_error = 'Cloud unreachable — using local model'
+            self._CLOUD_RECENT_OK = False
+            logger.info('Cloud reachability probe failed (offline / DNS) — '
+                        'skipping cloud, going to local.')
+            return self._transcribe(audio, _already_denoised=denoised_here)
+
         # Cloud timeout budget, short, because local is the safety net.
         # 3 s covers 99 % of Groq calls; anything slower → just go local.
         cloud_timeout = float(getattr(self._cfg.audio, 'cloud_timeout_s', 3.0))
@@ -682,6 +723,29 @@ class Transcriber:
         except Exception as e:
             dt = time.perf_counter() - t0
             self._CLOUD_RECENT_OK = False
+            # Surface the cloud failure reason so main.py can show a pill.
+            # Friendly mapping for the common cases users actually hit on
+            # Windows: PermissionError 13 = AV / firewall blocking the
+            # request; ConnectionRefused = network down; Timeout = slow link.
+            msg = str(e)
+            msg_l = msg.lower()
+            # Only set the user-visible message for genuine OFFLINE /
+            # UNREACHABLE conditions — those are worth surfacing because
+            # the user might want to know their internet's down. For
+            # AV-blocked / permission-denied / other "cloud reachable but
+            # refusing" cases, the local fallback runs transparently and
+            # produces a correct result, so we stay silent.
+            if 'name resolution' in msg_l or 'getaddrinfo' in msg_l:
+                self._cloud_last_error = 'Cloud unreachable (DNS) — using local model'
+            elif 'connection' in msg_l and ('refus' in msg_l or 'reset' in msg_l):
+                self._cloud_last_error = 'Cloud refused connection — using local model'
+            elif 'timeout' in msg_l or 'timed out' in msg_l:
+                self._cloud_last_error = 'Cloud timed out — using local model'
+            else:
+                # AV blocks (PermissionError 13), unknown errors, etc:
+                # log for debugging but do not pop a pill — local result
+                # speaks for itself.
+                self._cloud_last_error = None
             logger.warning(
                 f'Cloud transcription failed in {dt*1000:.0f}ms, falling back '
                 f'to local Whisper. ({type(e).__name__}: {e})'
@@ -691,6 +755,27 @@ class Transcriber:
     def _transcribe(self, audio: np.ndarray, *,
                     _already_denoised: bool = False):
         t_start = time.perf_counter()
+
+        # ── Fast bail on near-empty audio ────────────────────────────────────
+        # If the recording is shorter than 250 ms OR has no signal above the
+        # noise floor, faster-whisper still pads to 30 s of silence and runs
+        # the full encoder + decoder, which costs ~10 s on CPU. Returning
+        # the silent sentinel immediately saves the user a long, pointless
+        # "transcribing…" wait and matches the cloud path's __NO_AUDIO__
+        # short-circuit.
+        try:
+            duration = len(audio) / float(_SR)
+            if duration < 0.25:
+                logger.info(f'Local transcribe: audio is {duration*1000:.0f}ms, '
+                            'too short — skipping inference.')
+                return '__NO_AUDIO__', 'silent', duration
+            peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+            if peak < 0.005:   # essentially digital silence
+                logger.info(f'Local transcribe: audio peak {peak:.4f} '
+                            'below noise floor — skipping inference.')
+                return '__NO_AUDIO__', 'silent', duration
+        except Exception:
+            pass
 
         # Noise reduction is now auto-adaptive. With the toggle ON, the
         # transcriber samples the recording's noise floor and only spends

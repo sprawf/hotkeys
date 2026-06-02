@@ -149,7 +149,12 @@ class ScreenshotOverlay:
     _TOOLS = ('marker', 'line', 'arrow', 'rect', 'pen', 'text')
 
     def __init__(self, root=None, on_done=None,
+                 on_extract_text=None, on_translate=None,
                  _preloaded_shot=None, _preloaded_dim=None):
+        # on_extract_text(img: PIL.Image) — fires on context-menu "Extract text".
+        # on_translate(img: PIL.Image)    — fires on context-menu "Translate to English".
+        # Both run AFTER the overlay closes, so the caller can pop a result window
+        # without competing for the topmost flag.
         # take_screenshot() sets _overlay_active BEFORE spawning the grab
         # thread, so we only apply the singleton guard here for the legacy
         # direct-call path (no preloaded images).
@@ -160,6 +165,8 @@ class ScreenshotOverlay:
                 _overlay_active[0] = True
 
         self._on_done        = on_done
+        self._on_extract_text = on_extract_text
+        self._on_translate    = on_translate
         self._own_root       = (root is None)  # True if we created our own tk.Tk()
         self._root_ref       = root            # None means we'll create our own
         self._preloaded_shot = _preloaded_shot
@@ -852,6 +859,12 @@ class ScreenshotOverlay:
         if has_sel:
             menu.add_command(label='  Copy',   command=self._copy)
             menu.add_command(label='  Save',   command=self._save)
+            if self._on_extract_text is not None:
+                menu.add_command(label='  🔤  Extract text',
+                                 command=self._extract_text_action)
+            if self._on_translate is not None:
+                menu.add_command(label='  🌐  Translate to English',
+                                 command=self._translate_action)
             menu.add_separator()
         # Exit is always present, this is the last-resort escape if Esc/Del
         # are somehow not responding (e.g. focus was stolen by another app).
@@ -1175,6 +1188,28 @@ class ScreenshotOverlay:
         # Schedule on the screenshot mainloop thread (same as _pick_color)
         self._root.after(0, _do)
 
+    def _extract_text_action(self) -> None:
+        """Context-menu "Extract text" — render the selection, hand it to the
+        OCR callback, then close the overlay so the result popup gets focus."""
+        img = self._render()
+        cb = self._on_extract_text
+        self._close()
+        if img and cb:
+            try: cb(img)
+            except Exception as e:
+                print(f'Screenshot extract-text callback error: {e}')
+
+    def _translate_action(self) -> None:
+        """Context-menu "Translate to English" — same flow as extract, but
+        routes through the translate callback (which OCRs THEN translates)."""
+        img = self._render()
+        cb = self._on_translate
+        self._close()
+        if img and cb:
+            try: cb(img)
+            except Exception as e:
+                print(f'Screenshot translate callback error: {e}')
+
     def _select_all(self) -> None:
         self._sx, self._sy = 0, 0
         self._cx, self._cy = self._vw - 1, self._vh - 1
@@ -1237,12 +1272,15 @@ def cancel_screenshot() -> bool:
     return False
 
 
-def _create_overlay(root, on_done, shot, dim_img) -> None:
+def _create_overlay(root, on_done, shot, dim_img,
+                    on_extract_text=None, on_translate=None) -> None:
     """Called on the main thread once the background grab completes."""
     if not _overlay_active[0]:
         return   # was cancelled while the grab was in flight
     try:
         ov = ScreenshotOverlay(root, on_done=on_done,
+                               on_extract_text=on_extract_text,
+                               on_translate=on_translate,
                                _preloaded_shot=shot, _preloaded_dim=dim_img)
         _pending_overlay[0] = ov
     except Exception:
@@ -1250,7 +1288,8 @@ def _create_overlay(root, on_done, shot, dim_img) -> None:
             _overlay_active[0] = False
 
 
-def take_screenshot(root=None, on_done=None) -> None:
+def take_screenshot(root=None, on_done=None,
+                    on_extract_text=None, on_translate=None) -> None:
     """Grab the screen in a background thread, then build the overlay on the main thread.
 
     ImageGrab.grab(all_screens=True) on a large or multi-monitor desktop can
@@ -1303,11 +1342,16 @@ def take_screenshot(root=None, on_done=None) -> None:
                 with _overlay_lock:
                     _overlay_active[0] = False
                 return
-            root.after(0, lambda: _create_overlay(root, on_done, shot, dim_img))
+            root.after(0, lambda: _create_overlay(
+                root, on_done, shot, dim_img,
+                on_extract_text=on_extract_text, on_translate=on_translate))
 
         threading.Thread(target=_grab, daemon=True, name='screenshot-grab').start()
     else:
         # Legacy fallback: no root supplied, run everything in a thread
         # (creates its own Tk root inside ScreenshotOverlay).
-        threading.Thread(target=lambda: ScreenshotOverlay(None, on_done=on_done),
-                         daemon=True, name='screenshot-overlay').start()
+        threading.Thread(
+            target=lambda: ScreenshotOverlay(
+                None, on_done=on_done,
+                on_extract_text=on_extract_text, on_translate=on_translate),
+            daemon=True, name='screenshot-overlay').start()

@@ -57,7 +57,14 @@ class AskPill:
     """
 
     def __init__(self, root: tk.Tk, question: str, provider,
-                 static: str = None, on_close=None) -> None:
+                 static: str = None, on_close=None,
+                 prepared_answer: str = None) -> None:
+        """
+        prepared_answer : if set, skip the LLM call and render this string as
+                          the answer directly. Used by features like the
+                          screenshot "Translate to English" flow where the
+                          OCR + translate has already happened upstream.
+        """
         self._root      = root
         self._question  = (question or '').strip()
         self._provider  = provider
@@ -96,6 +103,13 @@ class AskPill:
             # Status-only pill, no API call, auto-closes after 5 s
             self._render_single(f'ℹ  {static}', WARN)
             self._win.after(5_000, self._close)
+        elif prepared_answer is not None:
+            # Pre-computed answer (e.g. screenshot translation result).
+            # Render straight into the multi-line answer pill so the look
+            # and behaviour match a regular Ask Claude reply: same fonts,
+            # same auto-dismiss, click-to-copy, Escape to close.
+            self._answer = (prepared_answer or '').strip()
+            self._render_answer(self._answer)
         else:
             # Loading pill then fetch
             self._render_single('⏳  Asking…', ACCENT)

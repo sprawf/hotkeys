@@ -896,20 +896,51 @@ class App:
                                 self._hk_download_url,                          suppress=False)
 
             if ptt:
-                whisper_hk = hk.get('whisper', 'ctrl+enter')
-                ptt_key    = whisper_hk.split('+')[-1]
-                keyboard.on_press_key(
-                    ptt_key,
-                    lambda _: self._q.put(('whisper:start', None)),
-                    suppress=False,
-                )
-                keyboard.on_release_key(
-                    ptt_key,
-                    lambda _: self._q.put(('whisper:stop', None)),
-                    suppress=False,
-                )
-                logger.info(f'PTT mode: key={ptt_key!r}')
+                # Push-to-talk reads the full whisper hotkey (e.g. ctrl+enter)
+                # and only starts recording while ALL modifiers are held AND
+                # the trigger key is pressed. Releasing EITHER part stops the
+                # recording. Without this, bare Enter would trigger recording
+                # every time the user pressed it in a chat app — useless.
+                whisper_hk = hk.get('whisper', 'ctrl+enter').lower()
+                parts = [p.strip() for p in whisper_hk.split('+') if p.strip()]
+                trigger_key = parts[-1] if parts else 'enter'
+                required_mods = parts[:-1]   # e.g. ['ctrl'] for ctrl+enter
+
+                def _mods_held() -> bool:
+                    try:
+                        return all(keyboard.is_pressed(m) for m in required_mods)
+                    except Exception:
+                        return False
+
+                def _on_press(_evt):
+                    # Only fire if every required modifier is currently held.
+                    if not required_mods or _mods_held():
+                        self._q.put(('whisper:start', None))
+
+                def _on_release(_evt):
+                    self._q.put(('whisper:stop', None))
+
+                keyboard.on_press_key(trigger_key, _on_press, suppress=False)
+                keyboard.on_release_key(trigger_key, _on_release, suppress=False)
+
+                # Releasing the modifier (e.g. letting Ctrl up while still
+                # holding Enter) also stops the recording — so the user can
+                # cancel by simply lifting Ctrl without releasing Enter.
+                for _mod in required_mods:
+                    keyboard.on_release_key(
+                        _mod,
+                        lambda _e: self._q.put(('whisper:stop', None)),
+                        suppress=False,
+                    )
+
+                logger.info(f'PTT mode: hold {whisper_hk!r} '
+                            f'(trigger={trigger_key!r}, mods={required_mods})')
             else:
+                # suppress=False — the original behaviour. We tried suppress=True
+                # to stop WhatsApp / Discord seeing the bare Enter and inserting
+                # a newline, but it interfered with games and other apps that
+                # legitimately use Ctrl+Enter. The newline cost in chat apps is
+                # acceptable; the game compatibility is not.
                 keyboard.add_hotkey(hk.get('whisper', 'ctrl+enter'), self._hk_whisper, suppress=False)
 
             keyboard.add_hotkey('escape', self._hk_escape, suppress=False)
@@ -1019,6 +1050,7 @@ class App:
         self._reconcile_stuck_states()
 
         self.root.after(2000, self._hotkey_watchdog)
+
 
     def _reconcile_stuck_states(self) -> None:
         """Reset any state flag whose ground-truth object is gone.
@@ -2351,7 +2383,355 @@ class App:
             self._q.put(('whisper:stop', None))
 
     def _hk_screenshot(self) -> None:
-        self.root.after(0, lambda: take_screenshot(self.root))
+        self.root.after(0, lambda: take_screenshot(
+            self.root,
+            on_extract_text=self._screenshot_extract_text,
+            on_translate=self._screenshot_translate,
+        ))
+
+    def _screenshot_extract_text(self, img) -> None:
+        """Context-menu "Extract text" from screenshot. OCR the image,
+        copy result to clipboard, show in result popup."""
+        threading.Thread(
+            target=self._screenshot_ocr_worker,
+            args=(img, False),
+            daemon=True, name='screenshot-ocr',
+        ).start()
+
+    def _screenshot_translate(self, img) -> None:
+        """Context-menu "Translate to English" from screenshot. OCR the image,
+        translate the extracted text via the configured LLM provider, copy
+        result to clipboard, show in result popup."""
+        threading.Thread(
+            target=self._screenshot_ocr_worker,
+            args=(img, True),
+            daemon=True, name='screenshot-translate',
+        ).start()
+
+    def _screenshot_ocr_worker(self, img, translate: bool) -> None:
+        """Background worker: OCR image -> (optionally) translate -> show popup.
+        Runs off the Tk thread because the Groq vision API and provider.refine
+        are both network-bound."""
+        title = 'Translate to English' if translate else 'Extract text'
+        kind = 'translate' if translate else 'extract'
+
+        # ── Dedupe rapid identical clicks ────────────────────────────────────
+        # Hash the (resized) pixel bytes so spam-clicking Translate on the same
+        # selection doesn't spawn N parallel vision API calls. Each request
+        # costs real money + risks rate limits, so an in-flight guard pays for
+        # itself the first time the user double-clicks the menu.
+        if not hasattr(self, '_screenshot_in_flight'):
+            self._screenshot_in_flight: set = set()
+            self._screenshot_lock = threading.Lock()
+        try:
+            import hashlib as _hl
+            thumb = img.resize((64, 64)) if hasattr(img, 'resize') else img
+            key = _hl.sha1(thumb.tobytes()).hexdigest() + f':{int(translate)}'
+        except Exception:
+            key = None
+        if key is not None:
+            with self._screenshot_lock:
+                if key in self._screenshot_in_flight:
+                    self.root.after(0, self.refine_overlay.show_error,
+                                    'Already processing this selection')
+                    return
+                self._screenshot_in_flight.add(key)
+
+        # ── Downscale oversized selections ───────────────────────────────────
+        # Full-screen 4K captures push the base64 payload past Groq's vision
+        # context budget. 4 MP (≈ 2000×2000) keeps text crisp enough for OCR
+        # while shaving the encoded request from ~10 MB down to ~1 MB.
+        try:
+            from PIL import Image as _Im  # noqa: F401
+            w, h = img.size
+            mp = (w * h) / 1_000_000
+            if mp > 4.0:
+                scale = (4.0 / mp) ** 0.5
+                new_w, new_h = max(1, int(w * scale)), max(1, int(h * scale))
+                img = img.resize((new_w, new_h), resample=getattr(__import__('PIL').Image, 'LANCZOS', 1))
+                logger.info(f'Screenshot downscaled {w}x{h} → {new_w}x{new_h} '
+                            f'(was {mp:.1f} MP, now ≤4 MP) for vision API')
+        except Exception:
+            pass
+
+        try:
+            # In-flight pill so the user knows something is happening.
+            self.root.after(0, lambda: self.refine_overlay.show_screenshot_working(kind))
+        except Exception:
+            pass
+        try:
+            extract = self._vision_extractor
+            text = (extract(img) or '').strip()
+        except Exception as exc:
+            msg = str(exc).lower()
+            # Friendlier copy for the two failure modes users actually hit:
+            # rate limits and offline. Generic exceptions fall through to the
+            # raw message so weird upstream errors are still surfaced.
+            if '429' in msg or 'rate limit' in msg or 'quota' in msg:
+                friendly = 'OCR rate-limited, try again in ~1 min'
+            elif any(k in msg for k in ('connection', 'timeout', 'unreachable',
+                                         'name resolution', 'getaddrinfo')):
+                friendly = 'OCR offline — check your internet'
+            else:
+                friendly = f'OCR failed: {str(exc)[:60]}'
+            logger.warning(f'Screenshot OCR failed: {exc}')
+            self.root.after(0, self.refine_overlay.show_error, friendly)
+            if key is not None:
+                with self._screenshot_lock:
+                    self._screenshot_in_flight.discard(key)
+            return
+        # Vision models love to fill empty-image cases with a description
+        # like "There is no text in the image." Treat the canonical sentinel
+        # plus a handful of common phrasings as "no text found" so we hit
+        # the proper pill instead of trying to translate a description.
+        _NO_TEXT_PHRASES = (
+            'no_text_found',
+            'no text found',
+            'there is no text',
+            'there are no text',
+            'no readable text',
+            'no visible text',
+            'image contains no text',
+            'image does not contain',
+            'this image contains no',
+            'the image is blank',
+        )
+        text_l = text.lower().strip(' .!?"\'')
+        if not text or text_l in _NO_TEXT_PHRASES or any(p in text_l for p in _NO_TEXT_PHRASES):
+            self.root.after(0, self.refine_overlay.show_error,
+                            'No text found in selection')
+            if key is not None:
+                with self._screenshot_lock:
+                    self._screenshot_in_flight.discard(key)
+            return
+
+        # ── Skip translate when OCR returns code-like text ───────────────────
+        # Translating JavaScript / Python / shell into "English" is meaningless
+        # and tends to mangle identifiers. Detect heavy brace + symbol density
+        # and force the extract-only path in that case. The user still gets
+        # the OCR'd code on the clipboard and in the result, just not a
+        # nonsensical "translation".
+        looks_like_code = False
+        if translate:
+            import re as _re
+            # Code indicators: braces, semicolons, arrow/equals, common
+            # keywords. We require BOTH high symbol density AND a code
+            # keyword to avoid false positives on natural text that happens
+            # to contain a stray symbol.
+            symbol_chars = sum(1 for c in text if c in '{};()<>=[]')
+            symbol_ratio = symbol_chars / max(1, len(text))
+            kw_re = _re.compile(
+                r'\b(function|def|class|return|import|const|let|var|if|else|'
+                r'elif|while|for|public|private|static|void|int|string|bool|'
+                r'console\.log|print|System\.out|null|None|undefined|true|false)\b'
+            )
+            has_kw = bool(kw_re.search(text))
+            if symbol_ratio > 0.08 and has_kw:
+                looks_like_code = True
+                logger.info('Screenshot translate: source looks like code '
+                            f'(symbol_ratio={symbol_ratio:.2f}), skipping translate')
+
+        if translate and not looks_like_code:
+            try:
+                # Use the active LLM provider to translate. The prompt is
+                # written to handle the already-English case cleanly: most
+                # OCR'd captures will be non-English, but a user may
+                # absent-mindedly translate an English signpost, and we
+                # don't want the model to paraphrase or "improve" it.
+                prompt = (
+                    'You are a translator. The user will give you some text. '
+                    'If the text is in English, output it exactly as-is, '
+                    'unchanged, character-for-character. If the text is in any '
+                    'other language, translate it to English literally. '
+                    'Output ONLY the result. No commentary, no quotes, no '
+                    '"Translation:" prefix, no explanation.'
+                )
+                translated = self.provider.refine(text, prompt)
+                translated = (translated or '').strip()
+                # If the model returned nothing useful, fall back to the OCR
+                # text so the user at least sees the recognised characters.
+                text = translated or text
+            except Exception as exc:
+                msg = str(exc).lower()
+                if '429' in msg or 'rate limit' in msg or 'quota' in msg:
+                    friendly = 'Translate rate-limited, try again in ~1 min'
+                elif any(k in msg for k in ('connection', 'timeout', 'unreachable',
+                                             'name resolution', 'getaddrinfo')):
+                    friendly = 'Translate offline — check your internet'
+                else:
+                    friendly = f'Translate failed: {str(exc)[:60]}'
+                logger.warning(f'Screenshot translate failed: {exc}')
+                self.root.after(0, self.refine_overlay.show_error, friendly)
+                if key is not None:
+                    with self._screenshot_lock:
+                        self._screenshot_in_flight.discard(key)
+                return
+        if translate and looks_like_code:
+            # Rewrite the title so the popup header makes sense — the user
+            # asked to translate but we deliberately skipped it.
+            title = 'Extract text (code detected, not translated)'
+
+        # Copy to clipboard regardless of how we surface the result.
+        try:
+            import pyperclip as _pc
+            _pc.copy(text)
+        except Exception:
+            pass
+        # Dismiss the "in flight" pill before opening the result UI so the
+        # two pills never overlap on screen.
+        try:
+            self.root.after(0, self.refine_overlay.close)
+        except Exception:
+            pass
+        # Tweet-length threshold (280, single line) → reuse the Ask Claude
+        # (Shift+F4) AskPill so styling and dwell match exactly. Anything
+        # longer routes to the scrollable popup window which handles
+        # paragraph-sized content better than a floating pill.
+        _PILL_MAX_CHARS = 280
+        is_short = (len(text) <= _PILL_MAX_CHARS) and ('\n' not in text.strip())
+        if is_short:
+            self.root.after(0, lambda: self._show_screenshot_pill(title, text))
+        else:
+            self.root.after(0, lambda: self._show_screenshot_result(title, text))
+        if key is not None:
+            with self._screenshot_lock:
+                self._screenshot_in_flight.discard(key)
+
+    def _show_screenshot_pill(self, title: str, text: str) -> None:
+        """Render the short-form screenshot translation/extract result as an
+        AskPill, identical look-and-feel to a Shift+F4 Ask Claude answer.
+
+        Reuses the existing pill stack lifecycle (self._ask_pills) so the
+        user can dismiss multiple stacked pills the same way."""
+        def _on_close(pill_ref):
+            try:
+                self._ask_pills.remove(pill_ref)
+            except ValueError:
+                pass
+        try:
+            pill = AskPill(
+                self.root,
+                question=title,
+                provider=self.provider,
+                prepared_answer=text,
+            )
+            pill._on_close = lambda p=pill: _on_close(p)
+            self._ask_pills.append(pill)
+        except Exception as exc:
+            logger.exception(f'Screenshot pill failed: {exc}')
+
+    def _show_screenshot_result(self, title: str, text: str) -> None:
+        """Floating result window with the extracted/translated text. Scrollable,
+        selectable, copy + close buttons. Already copied to clipboard."""
+        try:
+            from theme import SURFACE, BORDER, TEXT_P, TEXT_S, ACCENT, ACCENTL, FONT_FAMILY, FONT_MONO
+            from win_geometry import center_on_work_area
+            win = ctk.CTkToplevel(self.root)
+            win.title(f'Hotkeys — {title}')
+            win.configure(fg_color=SURFACE)
+            # Match the Quick Notes / Whiteboard default size + centering
+            # so every popup feels like the same app instead of random
+            # corner toasts. center_on_work_area clamps the requested
+            # size to the current monitor's work area so it always fits.
+            _W, _H = 1216, 796
+            x, y, W, H = center_on_work_area(_W, _H)
+            win.geometry(f'{W}x{H}+{x}+{y}')
+            win.attributes('-topmost', True)
+            try: win.after(2000, lambda: win.attributes('-topmost', False))
+            except Exception: pass
+
+            header = ctk.CTkLabel(
+                win, text=title,
+                font=(FONT_FAMILY, 14, 'bold'), text_color=TEXT_P,
+                anchor='w',
+            )
+            header.pack(fill='x', padx=14, pady=(12, 4))
+            sub = ctk.CTkLabel(
+                win, text='Already copied to clipboard — paste anywhere.',
+                font=(FONT_FAMILY, 10), text_color=TEXT_S, anchor='w',
+            )
+            sub.pack(fill='x', padx=14, pady=(0, 8))
+
+            txt = ctk.CTkTextbox(
+                win, fg_color='#0e0e0e', text_color=TEXT_P,
+                font=(FONT_MONO, 11), border_color=BORDER, border_width=1,
+                wrap='word',
+            )
+            txt.pack(fill='both', expand=True, padx=14, pady=(0, 8))
+            txt.insert('1.0', text)
+
+            btns = ctk.CTkFrame(win, fg_color='transparent')
+            btns.pack(fill='x', padx=14, pady=(0, 14))
+            def _copy_again():
+                try:
+                    import pyperclip as _pc
+                    _pc.copy(txt.get('1.0', 'end').rstrip('\n'))
+                except Exception: pass
+            def _save_note():
+                try:
+                    from storage import load_notes, save_notes
+                    import uuid as _uuid
+                    from datetime import datetime as _dt
+                    notes = load_notes()
+                    notes.append({
+                        'id': str(_uuid.uuid4()),
+                        'text': f'[{title}]\n\n{text}',
+                        'items': [{'text': '', 'checked': False}],
+                        'voice': '', 'color': None, 'pinned': False,
+                        'created_at': _dt.now().isoformat(timespec='seconds'),
+                    })
+                    save_notes(notes)
+                except Exception as exc:
+                    logger.warning(f'Screenshot result save-to-notes failed: {exc}')
+                    try:
+                        save_btn.configure(text='✗ Save failed')
+                    except Exception: pass
+                    return
+                # Confirm so the user sees the action took effect. Button
+                # flips to "✓ Saved" briefly, then resets so they can save
+                # again if they want.
+                try:
+                    save_btn.configure(text='✓ Saved to Notes', state='disabled')
+                    def _reset_btn():
+                        try:
+                            save_btn.configure(text='Save to Notes', state='normal')
+                        except Exception: pass
+                    win.after(1800, _reset_btn)
+                except Exception: pass
+                # Also nudge an open Notes window to refresh its list so
+                # the new entry shows immediately without reopening.
+                try:
+                    nw = getattr(self, '_notes_win', None)
+                    if nw is not None and nw.winfo_exists():
+                        nw.after(0, nw._refresh_list)
+                        try: nw._invalidate_notes_cache()
+                        except Exception: pass
+                except Exception: pass
+            copy_btn = ctk.CTkButton(btns, text='Copy', width=80, fg_color=ACCENT,
+                                     hover_color=ACCENTL, command=_copy_again)
+            copy_btn.pack(side='left')
+            save_btn = ctk.CTkButton(btns, text='Save to Notes', width=140,
+                                     fg_color='#2a2a2a', hover_color='#3a3a3a',
+                                     command=_save_note)
+            save_btn.pack(side='left', padx=(8, 0))
+            ctk.CTkButton(btns, text='Close', width=80, fg_color='#2a2a2a',
+                          hover_color='#3a3a3a', command=win.destroy).pack(side='right')
+
+            # Same brief "✓ Copied" affordance for the Copy button so both
+            # actions feel symmetric — without it Copy also looked like a
+            # no-op even though it was working.
+            def _copy_with_feedback():
+                _copy_again()
+                try:
+                    copy_btn.configure(text='✓ Copied', state='disabled')
+                    def _reset():
+                        try: copy_btn.configure(text='Copy', state='normal')
+                        except Exception: pass
+                    win.after(1500, _reset)
+                except Exception: pass
+            copy_btn.configure(command=_copy_with_feedback)
+        except Exception as exc:
+            logger.exception(f'Screenshot result popup failed: {exc}')
 
     def _do_cancel_screenshot(self) -> None:
         """Cancel the active screenshot overlay. Called on main thread via _poll."""
@@ -3061,6 +3441,28 @@ class App:
         except Exception as e:
             logger.warning(f'Restore: history clear failed: {e}')
 
+        # ── Transient cross-call state added by later features ───────────────
+        # These dicts/sets accumulate during normal use (dedupe guards, pill
+        # rate-limiters, last-known-error caches). They aren't persisted to
+        # disk so Reset doesn't strictly need to touch them, but clearing
+        # them gives the user a TRUE clean slate — e.g. the next cloud-fail
+        # after Reset will surface the explanatory pill instead of being
+        # suppressed by a stale 10-minute cooldown carried over from before
+        # the reset.
+        try:
+            if hasattr(self, '_cloud_notice_seen'):
+                self._cloud_notice_seen.clear()
+            if hasattr(self, '_screenshot_in_flight'):
+                self._screenshot_in_flight.clear()
+            if hasattr(self, '_downloads_in_flight'):
+                self._downloads_in_flight.clear()
+            tr = getattr(self, '_transcriber', None)
+            if tr is not None:
+                tr._cloud_last_error = None
+                tr._CLOUD_RECENT_OK = True
+        except Exception as e:
+            logger.warning(f'Restore: transient state clear failed: {e}')
+
         # ── Prompt sticky note, close if open. Position state will respawn
         # centered on next prompt-hotkey fire.
         try:
@@ -3284,6 +3686,25 @@ class App:
     def _on_whisper_result(self, payload) -> None:
         text, language, duration_s = payload
         elapsed = time.time() - self._whisper_t0
+
+        # If the cloud Whisper path failed and we fell back to local model,
+        # surface that to the user — once per 10 minutes per unique message,
+        # not every dictation. The fallback "just works" so the user gets
+        # the pasted transcript either way; they only need to be told once
+        # what's going on, not nagged on every Ctrl+Enter.
+        try:
+            tr = getattr(self, '_transcriber', None)
+            err = getattr(tr, '_cloud_last_error', None)
+            if err:
+                tr._cloud_last_error = None   # always clear regardless
+                if not hasattr(self, '_cloud_notice_seen'):
+                    self._cloud_notice_seen: dict[str, float] = {}
+                last_t = self._cloud_notice_seen.get(err, 0.0)
+                if (time.time() - last_t) > 600:   # 10-minute cooldown
+                    self._cloud_notice_seen[err] = time.time()
+                    self.refine_overlay.show_cloud_fallback_notice(err)
+        except Exception:
+            pass
 
         # Sentinel from the transcriber meaning the recorded audio was
         # silent, no point pasting and no point letting Whisper hallucinate

@@ -68,6 +68,39 @@ class OverlayWindow:
         if self._win:
             self._win.after(4000, self._close)
 
+    def show_cloud_fallback_notice(self, msg: str) -> None:
+        """Non-alarming info pill: cloud path failed, but the local
+        fallback is now working. Yellow accent bar (WARN) rather than
+        red ✗ (ERR) so users don't think the whole operation failed.
+        Stays visible for 6s — short enough not to clutter, long enough
+        to actually read. The follow-up transcribing pill paints over
+        this one when local Whisper kicks in."""
+        self._tick = False
+        # Trim to fit nicely in the single-line pill.
+        short = (msg[:80] + '…') if len(msg) > 80 else msg
+        body = f'🌐  {short}'
+        if self._win:
+            self._set_text(body)
+            self._set_bar(WARN)
+        else:
+            self._build(body, _TEXT_CLR, WARN)
+        if self._win:
+            self._win.after(6000, self._close)
+
+    def show_screenshot_working(self, kind: str = 'translate') -> None:
+        """Brief 'in progress' pill while the screenshot OCR + translate
+        round-trip is in flight. Kept up indefinitely until the caller
+        closes it (via close() or by showing a different pill)."""
+        self._close()
+        label = 'Translating…' if kind == 'translate' else 'Reading text…'
+        self._build(f'⏳  {label}', _TEXT_CLR, INFO)
+
+    def close(self) -> None:
+        """Public close so worker threads can dismiss a long-running pill
+        once their work completes (e.g. before showing a follow-up window)."""
+        try: self._close()
+        except Exception: pass
+
     def show_no_selection(self) -> None:
         self._close()
         self._build('✦  Select text first', _TEXT_CLR, WARN)
@@ -123,6 +156,34 @@ class OverlayWindow:
             self._set_bar(OK)
         if self._win:
             self._win.after(3500, self._close)
+
+    def show_translation_pill(self, text: str, kind: str = 'translate') -> None:
+        """Short-form pill for screenshot Extract-text / Translate results.
+        Displays up to ~100 chars near the cursor; auto-dismisses after a
+        readable interval. The full text is already on the clipboard so
+        truncation doesn't lose information.
+
+        For longer results, the caller should fall back to the popup window
+        instead — a pill that wraps to multiple lines stops looking like
+        a pill.
+        """
+        self._tick = False
+        icon = '🌐' if kind == 'translate' else '🔤'
+        short = (text[:280] + '…') if len(text) > 280 else text
+        # Replace internal newlines with " · " so the single-line pill stays
+        # readable even if the source had line breaks.
+        short = short.replace('\r', '').replace('\n', '  ·  ')
+        body = f'{icon}  {short}'
+        if self._win:
+            self._set_text(body)
+            self._set_bar(OK)
+        else:
+            self._build(body, _TEXT_CLR, OK)
+        # Longer dwell than other pills — the user is reading text, not
+        # just glancing at a status. ~280 chars at ~25 chars/sec ≈ 11 s
+        # read time, with a small buffer.
+        if self._win:
+            self._win.after(13000, self._close)
 
     def show_error(self, msg: str) -> None:
         self._tick = False

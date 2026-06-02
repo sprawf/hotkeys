@@ -5,6 +5,21 @@
 
 ---
 
+## HOLISTIC CHANGE CHECKLIST (run before shipping any new feature)
+
+Every feature touches more of the system than it looks. Before considering a change "done," walk this checklist mentally:
+
+1. **Reset Everything button** (`_do_restore_all_defaults`) — Does your new feature add any **persisted config**? Add it to the reset path. Does it add any **transient in-memory state** (dedupe sets, rate-limiter dicts, last-error caches)? Clear those in the reset path too (see the `Transient cross-call state` block) so the user gets a true clean slate.
+2. **Stop everything & reload hotkeys** (`_reload_hotkeys_manual`) — Toplevel windows you create get destroyed by this. Make sure your code self-heals on next access (check `winfo_exists()` before using, rebuild if dead). The Tray History fix is the canonical pattern.
+3. **Tab cache invariant in Library** — If your feature changes any tab's data, route through `_invalidate_tab(tab)`, never call `_render_xxx_tab()` directly.
+4. **Child-widget event absorption** — If your feature adds a draggable / double-clickable Frame, bind on every non-interactive child too (Labels absorb clicks). Don't bind on Buttons (they have their own action).
+5. **Offline / AV-blocked paths** — Any new cloud call: use the existing reachability probe pattern (TCP probe in `_robust_post` for refine, `_cloud_reachable` in transcriber). Don't let an unreachable host hang the UI.
+6. **Dist build** — Source-only changes get into the dist on the next `build_dist.py` run automatically. Things to verify after rebuild: hidden imports for any new package, asset bundling in `hotkeys.spec`, no new MKL/torch transitive deps that would bring back the heap-corruption crash.
+7. **Audit the log after testing** — Don't trust "looks fine." Tail `app.log` and grep for `WARNING|ERROR|Traceback|unhandled`. Silent failures hide here.
+8. **Document it here** — If you debugged something that took >30 min, add it to this file. Future-you (and future agents) will thank present-you.
+
+---
+
 ## RECURRING UI BUGS (the ones that keep coming back across sessions)
 
 These are non-crash bugs that have been "fixed" multiple times but keep reappearing because the fix can be silently regressed by anyone adding new code without knowing the invariant. **Read this section before touching `library.py` or any tab-related code.**

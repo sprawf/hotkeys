@@ -574,9 +574,17 @@ class QuickNotesWindow(ctk.CTkToplevel):
         hdr.bind('<Double-Button-1>', lambda e: self._toggle_maximize())
 
         # Header label, app-style bold section title
-        tk.Label(hdr, text='Notes', bg=_LIST, fg=_T1,
-                 font=(FONT_FAMILY, 13, 'bold'),
-                 ).pack(side='left', padx=(14, 0), pady=12)
+        lbl = tk.Label(hdr, text='Notes', bg=_LIST, fg=_T1,
+                       font=(FONT_FAMILY, 13, 'bold'))
+        lbl.pack(side='left', padx=(14, 0), pady=12)
+        # Tk does NOT propagate <Double-Button-1> from a child Label to the
+        # parent Frame, so double-clicking right on the 'Notes' text would
+        # silently no-op. Re-bind drag + double-click on the label itself
+        # so the entire title bar feels like one consistent draggable /
+        # maximizable region (matches the native Win11 caption-bar UX).
+        lbl.bind('<ButtonPress-1>', self._drag_start)
+        lbl.bind('<B1-Motion>',     self._drag_move)
+        lbl.bind('<Double-Button-1>', lambda e: self._toggle_maximize())
 
         # New-note button, large, accent-filled, impossible to miss
         nb = ctk.CTkButton(
@@ -1314,10 +1322,77 @@ class QuickNotesWindow(ctk.CTkToplevel):
             has_clip = bool(self.clipboard_get().strip())
         except tk.TclError:
             has_clip = False
-        (self._popup()
+        all_notes = load_notes()
+        active_count  = sum(1 for n in all_notes if not n.get('trashed'))
+        trashed_count = sum(1 for n in all_notes if n.get('trashed'))
+        m = (self._popup()
             .add('New note',        self._new_note)
-            .add('Paste as note',   self._paste_to_list, enabled=has_clip)
-            .show(event.x_root, event.y_root))
+            .add('Paste as note',   self._paste_to_list, enabled=has_clip))
+        if active_count > 0 or trashed_count > 0:
+            m.separator()
+        if active_count > 0:
+            m.add(f'Move all to Trash  ({active_count})',
+                  self._trash_all_notes)
+        if trashed_count > 0:
+            m.add(f'Empty Trash  ({trashed_count})',
+                  self._empty_trash)
+        m.show(event.x_root, event.y_root)
+
+    def _trash_all_notes(self) -> None:
+        """Move every non-trashed note to Trash. Confirmation required so
+        the user can't nuke their notes with a misclick. Pinned notes are
+        moved too — pinning was a presentation choice, not a permanence
+        guarantee, and excluding them would confuse users who pinned
+        everything."""
+        notes = load_notes()
+        active = [n for n in notes if not n.get('trashed')]
+        if not active:
+            return
+        if not confirm(
+            self,
+            'Move all notes to Trash?',
+            f'This will move {len(active)} note(s) to Trash. '
+            'You can restore them from the Trash section at the bottom.',
+            action_label='Move all to Trash',
+        ):
+            return
+        from datetime import datetime as _dt
+        now = _dt.now().isoformat(timespec='seconds')
+        for n in notes:
+            if not n.get('trashed'):
+                n['trashed'] = True
+                n['trashed_at'] = now
+        save_notes(notes)
+        self._invalidate_notes_cache()
+        # If the editor is open on a now-trashed note, close it cleanly.
+        try:
+            if self._editing_nid:
+                self._editing_nid = None
+                self._show_panel()
+        except Exception: pass
+        self._refresh_list()
+        logger.info(f'Quick notes: moved {len(active)} notes to Trash.')
+
+    def _empty_trash(self) -> None:
+        """Permanently delete every trashed note. Strong confirmation —
+        this is not recoverable."""
+        notes = load_notes()
+        trashed = [n for n in notes if n.get('trashed')]
+        if not trashed:
+            return
+        if not confirm(
+            self,
+            'Empty Trash?',
+            f'Permanently delete {len(trashed)} note(s)? '
+            'This cannot be undone.',
+            action_label='Empty Trash',
+        ):
+            return
+        kept = [n for n in notes if not n.get('trashed')]
+        save_notes(kept)
+        self._invalidate_notes_cache()
+        self._refresh_list()
+        logger.info(f'Quick notes: emptied Trash ({len(trashed)} notes purged).')
 
     def _row_context_menu(self, event, nid: str) -> None:
         note = next((n for n in load_notes() if n.get('id') == nid), None)
@@ -1825,6 +1900,14 @@ class QuickNotesWindow(ctk.CTkToplevel):
         # Right controls: pin + minimize + close
         ctrl = tk.Frame(tb, bg=_EDIT)
         ctrl.pack(side='right', padx=(0, 12), pady=8)
+        # Empty pixels between buttons (padding) still belong to the
+        # title-bar drag/maximize region — child Buttons absorb their
+        # own clicks, but bare ctrl pixels should match the bare tb
+        # pixels next to them. Without this, the area between the pin
+        # icon and the close icon feels "dead."
+        ctrl.bind('<ButtonPress-1>', self._drag_start)
+        ctrl.bind('<B1-Motion>',     self._drag_move)
+        ctrl.bind('<Double-Button-1>', lambda e: self._toggle_maximize())
 
         # Pin / star, gold when pinned, dim when not
         self._pin_btn = tk.Label(ctrl, text='★', bg=_EDIT, fg=_T3,
