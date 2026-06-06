@@ -146,7 +146,8 @@ from core.vad         import SileroVAD
 from core.transcriber import Transcriber
 from core.typer       import copy_to_clipboard, paste_from_clipboard, copy_selection, undo_last
 from core.sounds      import play_start, play_stop
-from screenshot       import take_screenshot, start_prtsc_listener
+from screenshot       import (take_screenshot, start_prtsc_listener,
+                              start_prtsc_keylogger)
 from macros.recorder      import MacroRecorder
 from macros.library       import MacroLibrary
 from macros.save_prompt   import MacroSavePrompt
@@ -781,6 +782,12 @@ class App:
         logger.info('DEBUG: hotkey_watchdog scheduled')
         start_prtsc_listener(self._hk_screenshot)
         logger.info('DEBUG: start_prtsc_listener returned')
+        # Independent diagnostic — polls VK_SNAPSHOT directly so we still
+        # see the keypress in the log even when our WH_KEYBOARD_LL hook
+        # gets suppressed (UIPI, anti-cheat, shell hijack, hook-timeout
+        # uninstall). When the keylogger fires but [HOOK] doesn't, the
+        # diagnosis is unambiguous: the OS saw the key, our hook didn't.
+        start_prtsc_keylogger()
         self._start_tray()
         logger.info('DEBUG: _start_tray returned')
         self._start_ipc()
@@ -1063,24 +1070,58 @@ class App:
         # ── Screenshot overlay singleton ──────────────────────────────
         try:
             from screenshot import (_overlay_lock, _overlay_active,
-                                    _pending_overlay)
+                                    _pending_overlay, _overlay_claim_ts,
+                                    _OVERLAY_GRACE_SECS)
+            import time as _time
             with _overlay_lock:
-                if _overlay_active[0]:
+                # Grace window: don't reset a flag that was JUST set.
+                # The grab+dim runs on a worker thread for ~50-200 ms
+                # before the overlay Toplevel is constructed on the
+                # main thread. During that window _pending_overlay
+                # is legitimately None — without this check the
+                # watchdog would race ahead and reset the singleton,
+                # letting a second PrtSc start a duplicate grab.
+                held_for = (_time.monotonic() - _overlay_claim_ts[0]
+                            if _overlay_active[0] else 0.0)
+                if _overlay_active[0] and held_for >= _OVERLAY_GRACE_SECS:
                     ov = _pending_overlay[0]
                     alive = False
                     try:
                         if ov is not None:
-                            tk_root = getattr(ov, '_overlay', None) or \
-                                      getattr(ov, '_root', None)
+                            # ScreenshotOverlay puts its visible Toplevel
+                            # in `_win`. Earlier the watchdog read
+                            # `_overlay` / `_root` first — but `_root` is
+                            # the (legitimately withdrawn) main app root,
+                            # so winfo_ismapped() returned False on every
+                            # successful screenshot and the watchdog
+                            # reset the singleton flag every time. Prefer
+                            # `_win` (the overlay's actual Toplevel).
+                            tk_root = (getattr(ov, '_win',     None)
+                                       or getattr(ov, '_overlay', None)
+                                       or getattr(ov, '_root',    None))
                             alive = (tk_root is not None
                                      and tk_root.winfo_exists()
                                      and tk_root.winfo_ismapped())
                     except Exception:
                         alive = False
                     if not alive:
+                        # Distinguish the three ways we get here so we can
+                        # actually diagnose "PrtSc randomly didn't work":
+                        #   1. ov is None        → overlay construction
+                        #      never returned (look for "Screenshot
+                        #      overlay construction failed" upstream).
+                        #   2. ov exists but no tk_root → overlay built
+                        #      then destroyed mid-construction.
+                        #   3. tk_root exists but not mapped → built but
+                        #      Tk never put it on screen (DWM hung,
+                        #      foreground app stole focus before map).
+                        reason = ('no overlay obj' if ov is None
+                                  else ('no tk root' if tk_root is None
+                                        else 'tk root not mapped'))
                         _overlay_active[0] = False
                         _pending_overlay[0] = None
-                        logger.info('Watchdog: reset stuck screenshot flag.')
+                        logger.info(f'Watchdog: reset stuck screenshot flag '
+                                    f'(reason: {reason}).')
         except Exception:
             pass
 
@@ -1749,12 +1790,23 @@ class App:
         def _on_close():
             self._notes_win = None
             threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
-            # Refresh Notes tab in library if it's currently visible
+            # Refresh Notes tab in library if it's currently visible.
+            # IMPORTANT: must go through _invalidate_tab('notes') instead
+            # of calling _render_notes_tab() directly. The direct render
+            # writes into self._scroll, which AT REST is the OUTER
+            # CTkScrollableFrame whose children are EVERY tab's container
+            # frame. Destroying its children wipes out all tab containers,
+            # leaving subsequent tab clicks visually stuck (grid_remove
+            # of the stale container refs fails with "bad window path
+            # name", and the new container.grid() lands nowhere).
+            # _invalidate_tab routes the render through the per-tab
+            # container instead, mirroring update_recorder_state.
             try:
                 if (self.library and
                         getattr(self.library, '_active_tab', None) == 'notes' and
                         self.library.win.winfo_viewable()):
-                    self.root.after(0, self.library._render_notes_tab)
+                    self.root.after(
+                        0, lambda: self.library._invalidate_tab('notes'))
             except Exception:
                 pass
 
@@ -3250,8 +3302,14 @@ class App:
         bm_defaults = copy.deepcopy(_DEFAULT_BOOKMARKS)
         threading.Thread(target=lambda: save_bookmarks(bm_defaults), daemon=True).start()
         try:
-            if self.library._active_tab == 'web':
-                self.library._render_web_tab()
+            # Route through _invalidate_tab — NEVER call _render_web_tab
+            # directly. The render method assumes self._scroll has been
+            # swapped to the Web tab's container; calling it directly
+            # tripped the new tab-render guard (rerouted safely + warning
+            # logged). Also: unconditional invalidation refreshes Web's
+            # cached content even when it's not the active tab — without
+            # this the user sees stale bookmarks on next Web tab visit.
+            self.library._invalidate_tab('web')
         except Exception:
             pass
         logger.info('Restore: bookmarks reset.')
@@ -3267,8 +3325,10 @@ class App:
             self._register_chain_hotkeys()
             try:
                 self.library.chains = list(self.chains)
-                if self.library._active_tab == 'chains':
-                    self.library._render_chains_tab()
+                # Route through _invalidate_tab — same reasoning as the
+                # bookmarks reset above. Unconditional invalidation so
+                # Chains tab refreshes even when not currently active.
+                self.library._invalidate_tab('chains')
             except Exception:
                 pass
             logger.info(f'Restore: {len(self.chains)} chains written + hotkeys re-registered.')

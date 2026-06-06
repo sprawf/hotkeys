@@ -517,12 +517,17 @@ class QuickNotesWindow(ctk.CTkToplevel):
             self.geometry(f'{W}x{H}+{x}+{y}')
         self.minsize(600, 400)
 
-        # Windows 11 rounded corners
+        # Windows 11 rounded corners. Must target the OS top-level HWND;
+        # self.winfo_id() returns the inner child HWND for an
+        # overrideredirect window, and DwmSetWindowAttribute on the
+        # child silently no-ops (this is why the rounded corners never
+        # appeared). See win_helpers.top_level_hwnd().
         try:
             import ctypes as _ct
+            from win_helpers import top_level_hwnd
             val = _ct.c_int(2)
             _ct.windll.dwmapi.DwmSetWindowAttribute(
-                self.winfo_id(), 33, _ct.byref(val), _ct.sizeof(val))
+                top_level_hwnd(self), 33, _ct.byref(val), _ct.sizeof(val))
         except Exception:
             pass
 
@@ -2535,29 +2540,135 @@ class QuickNotesWindow(ctk.CTkToplevel):
     # ── Maximize / restore ────────────────────────────────────────────────────
 
     def _toggle_maximize(self) -> None:
-        if self._maximized:
+        logger.info(f'[NOTES] _toggle_maximize called (maximized was {self._maximized})')
+
+        # Why we don't use self.geometry() — Tk's geometry() ends up
+        # calling MoveWindow on the CHILD HWND returned by winfo_id().
+        # For an overrideredirect borderless window, the visible window
+        # is the ROOT ancestor; resizing the child has no visible
+        # effect. The native-resize handles (_enable_native_resize)
+        # already work around this by walking GA_ROOT and calling
+        # SetWindowPos directly. Mirror that approach here so the
+        # maximize / restore actions actually move the visible window.
+        try:
+            import ctypes, ctypes.wintypes as _wt
+            u32 = ctypes.windll.user32
+            u32.GetAncestor.restype  = ctypes.c_void_p
+            u32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+            u32.GetWindowRect.restype  = ctypes.c_bool
+            u32.GetWindowRect.argtypes = [ctypes.c_void_p,
+                                          ctypes.POINTER(_wt.RECT)]
+            u32.SetWindowPos.restype  = ctypes.c_bool
+            u32.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                         ctypes.c_int, ctypes.c_int,
+                                         ctypes.c_int, ctypes.c_int,
+                                         ctypes.c_uint]
+            child_hwnd = self.winfo_id()
+            hwnd = u32.GetAncestor(child_hwnd, 2) or child_hwnd  # GA_ROOT
+            SWP_NOZORDER   = 0x0004
+            SWP_NOACTIVATE = 0x0010
+        except Exception as e:
+            logger.warning(f'[NOTES] could not resolve root HWND: {e}; '
+                           'falling back to Tk geometry()')
+            hwnd = None
+
+        # Always read both CURRENT rect and TARGET work-area rect up
+        # front. The toggle decision depends on comparing them — if
+        # the window is already at (or very close to) the work-area
+        # size, "maximize" would be a no-op, so we flip to "restore"
+        # behaviour instead. This is what makes the button feel like
+        # a real maximize toggle even when the window opens at a
+        # previously-saved fullscreen geometry.
+        try:
+            if hwnd:
+                cur = _wt.RECT()
+                u32.GetWindowRect(hwnd, ctypes.byref(cur))
+                cur_w, cur_h = cur.right - cur.left, cur.bottom - cur.top
+                cur_x, cur_y = cur.left, cur.top
+            else:
+                cur_w, cur_h = self.winfo_width(), self.winfo_height()
+                cur_x, cur_y = self.winfo_x(), self.winfo_y()
+        except Exception:
+            cur_w, cur_h = self.winfo_width(), self.winfo_height()
+            cur_x, cur_y = self.winfo_x(), self.winfo_y()
+
+        try:
+            r = _wt.RECT()
+            ctypes.windll.user32.SystemParametersInfoW(
+                48, 0, ctypes.byref(r), 0)
+            wa_w, wa_h, wa_x, wa_y = (r.right - r.left, r.bottom - r.top,
+                                       r.left, r.top)
+        except Exception:
+            wa_w = self.winfo_screenwidth()
+            wa_h = self.winfo_screenheight()
+            wa_x, wa_y = 0, 0
+
+        # Detect "the window is already at work-area size" within a
+        # ±16 px tolerance (drop shadow / invisible border quirks).
+        # If so, treat the user's click as a restore request even when
+        # self._maximized was False (e.g., first session click on a
+        # window whose saved geometry IS the work area).
+        near_max = (abs(cur_w - wa_w) <= 16 and abs(cur_h - wa_h) <= 16
+                    and abs(cur_x - wa_x) <= 16 and abs(cur_y - wa_y) <= 16)
+        treat_as_maximized = self._maximized or near_max
+
+        if treat_as_maximized:
+            # ── Restore path ──────────────────────────────────────────
+            # Pick a target geometry. Priority:
+            #   1. _restore_geo if it exists AND is meaningfully smaller
+            #      than the work area (else we'd restore to fullscreen
+            #      and the user would see no change again).
+            #   2. A sensible default — 70% of work area, centred — so
+            #      the click visibly does something the very first time
+            #      the user toggles, even if no prior smaller geometry
+            #      was ever recorded.
+            target = None
             if self._restore_geo:
-                self.geometry(self._restore_geo)
+                try:
+                    wh, _, rest = self._restore_geo.partition('+')
+                    rx, _, ry = rest.partition('+')
+                    rw_s, _, rh_s = wh.partition('x')
+                    rw, rh = int(rw_s), int(rh_s)
+                    if rw < wa_w - 32 and rh < wa_h - 32:
+                        target = (rw, rh, int(rx), int(ry))
+                except Exception:
+                    pass
+            if target is None:
+                # Default-smaller target: 70% of work area, centred.
+                dw = max(640, int(wa_w * 0.7))
+                dh = max(480, int(wa_h * 0.7))
+                dx = wa_x + (wa_w - dw) // 2
+                dy = wa_y + (wa_h - dh) // 2
+                target = (dw, dh, dx, dy)
+                logger.info(f'[NOTES] no usable _restore_geo '
+                            f'({self._restore_geo!r}); using 70%-default '
+                            f'{dw}x{dh}+{dx}+{dy}')
+            w, h, x, y = target
+            if hwnd:
+                u32.SetWindowPos(hwnd, 0, x, y, w, h,
+                                 SWP_NOZORDER | SWP_NOACTIVATE)
+            else:
+                self.geometry(f'{w}x{h}+{x}+{y}')
             self._maximized = False
             try: self._max_btn.configure(text='□')
             except Exception: pass
+            logger.info(f'[NOTES] restored to {w}x{h}+{x}+{y} '
+                        f'(was {cur_w}x{cur_h}+{cur_x}+{cur_y}, '
+                        f'near_max={near_max})')
         else:
-            self._restore_geo = (
-                f'{self.winfo_width()}x{self.winfo_height()}'
-                f'+{self.winfo_x()}+{self.winfo_y()}'
-            )
-            try:
-                import ctypes, ctypes.wintypes as _wt
-                r = _wt.RECT()
-                ctypes.windll.user32.SystemParametersInfoW(48, 0, ctypes.byref(r), 0)
-                self.geometry(f'{r.right - r.left}x{r.bottom - r.top}+{r.left}+{r.top}')
-            except Exception:
-                sw = self.winfo_screenwidth()
-                sh = self.winfo_screenheight()
-                self.geometry(f'{sw}x{sh}+0+0')
+            # ── Maximize path ─────────────────────────────────────────
+            # Save the current rect as the restore target before resizing.
+            self._restore_geo = f'{cur_w}x{cur_h}+{cur_x}+{cur_y}'
+            if hwnd:
+                u32.SetWindowPos(hwnd, 0, wa_x, wa_y, wa_w, wa_h,
+                                 SWP_NOZORDER | SWP_NOACTIVATE)
+            else:
+                self.geometry(f'{wa_w}x{wa_h}+{wa_x}+{wa_y}')
             self._maximized = True
             try: self._max_btn.configure(text='⊡')
             except Exception: pass
+            logger.info(f'[NOTES] maximized to {wa_w}x{wa_h}+{wa_x}+{wa_y} '
+                        f'(restore={self._restore_geo})')
 
     # ── Alt+Tab / taskbar visibility for an overrideredirect window ───────────
 

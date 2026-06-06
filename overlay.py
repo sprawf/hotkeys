@@ -24,6 +24,31 @@ _FONT_TIMER = (FONT_MONO, 11)
 _SLOT_OFFSET = 50   # px between stacked pills
 
 
+def pill_anchor_xy(root: tk.Tk) -> tuple[int, int]:
+    """Return (x, y) screen coords for a status pill — at the mouse
+    cursor + small offset. Simple, predictable, always visible.
+
+    Earlier this routine tried to anchor to the foreground window's
+    corner so a hotkey-from-Notepad pill wouldn't land inside the
+    Library if the mouse happened to be parked there. But the
+    corner-anchored pill kept landing under other windows when the
+    Library overlapped the foreground app, and trying to fix that
+    with z-order / topmost games created more edge cases. The user's
+    actual preference: "show exactly where the cursor is, and on
+    top." So we do that, and the topmost handling lives on the pill
+    Toplevels themselves (see explain_pill.py and overlay._build).
+    """
+    try:
+        import logging as _logging
+        mx = root.winfo_pointerx() + 20
+        my = root.winfo_pointery() + 20
+        _logging.getLogger('overlay').info(
+            f'[PILL] cursor-anchor ({mx},{my})')
+        return (mx, my)
+    except Exception:
+        return (200, 200)
+
+
 def _draw_pill(canvas: tk.Canvas, x1: int, y1: int, x2: int, y2: int,
                r: int, fill: str, outline: str) -> None:
     pts = [
@@ -331,11 +356,29 @@ class OverlayWindow:
             font=_FONT, anchor='center',
         )
 
-        cx = self.root.winfo_pointerx() + 24
-        cy = self.root.winfo_pointery() + 24 + self._slot * _SLOT_OFFSET
+        # Anchor to the foreground app's window rect, not the mouse —
+        # so a pill triggered by a hotkey-in-Notepad appears over
+        # Notepad even when the mouse happens to be over our Library
+        # window. Falls back to mouse-relative when our own UI is in
+        # the foreground (see pill_anchor_xy() for the full rule).
+        cx, cy = pill_anchor_xy(self.root)
+        cy += self._slot * _SLOT_OFFSET
         sw = win.winfo_screenwidth()
         sh = win.winfo_screenheight()
         win.geometry(f'{w}x{h}+{min(cx, sw - w - 12)}+{min(cy, sh - h - 12)}')
+        # Prime + lift in one shot. Same fix as AskPill: when Hotkeys
+        # boots with root.withdraw() and the user fires a hotkey
+        # before opening Library / Notes / any other window, Tk's
+        # window manager on Windows isn't primed and the Toplevel
+        # never appears even though geometry is correct. Explicit
+        # deiconify + update_idletasks + lift forces it visible in
+        # the same paint frame.
+        try:
+            win.deiconify()
+            win.update_idletasks()
+            win.lift()
+        except Exception:
+            pass
 
         # Hide this window from screen-capture APIs (BitBlt, DWM, OBS, etc.)
         # so it never appears in recordings, while remaining visible to the user.

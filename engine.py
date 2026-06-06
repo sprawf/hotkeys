@@ -35,7 +35,10 @@ PROVIDER_LABELS  = {
 }
 GROQ_MODELS      = ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant',
                     'meta-llama/llama-4-scout-17b-16e-instruct', 'openai/gpt-oss-120b']
-CEREBRAS_MODELS  = ['llama3.1-8b', 'gpt-oss-120b']
+CEREBRAS_MODELS  = ['llama-3.3-70b', 'llama-4-scout-17b-16e-instruct', 'gpt-oss-120b']
+# Cerebras retired `llama3.1-8b` (404s on every call). llama-3.3-70b is
+# their current high-quality default and matches Groq's flagship in
+# capability, so the fallback chain is even.
 OPENAI_MODELS    = ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-3.5-turbo', 'o1', 'o1-mini']
 ANTHROPIC_MODELS = ['claude-3-5-sonnet-20241022', 'claude-3-5-haiku-20241022',
                     'claude-3-opus-20240229', 'claude-3-haiku-20240307']

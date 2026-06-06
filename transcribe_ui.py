@@ -448,8 +448,16 @@ class TranscribePanel:
     # ── Top-level layout ─────────────────────────────────────────────────────
 
     def _render(self) -> None:
-        for w in self.parent.winfo_children():
-            w.destroy()
+        # Wipe ONLY this panel's previous container — NOT every child of
+        # self.parent. Earlier this destroyed self.parent.winfo_children(),
+        # which is the exact "destroy too many siblings" trap that bit
+        # us in library.py's tab renders. If parent ever holds anything
+        # besides this panel, those siblings would be silently wiped.
+        # Always render into a panel-owned container instead.
+        prev = getattr(self, 'container', None)
+        if prev is not None:
+            try: prev.destroy()
+            except Exception: pass
         self.container = ctk.CTkFrame(self.parent, fg_color='transparent')
         self.container.grid(row=0, column=0, sticky='nsew', padx=PAD, pady=PAD)
         self.container.columnconfigure(0, weight=1)

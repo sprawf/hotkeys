@@ -1059,10 +1059,14 @@ class AudioEditorLauncher:
                 # above the editor right now, but ANY app the user
                 # clicks afterwards goes above it (which is what we
                 # want — overlay is editor-companion, not system-wide).
+                # Target the OS top-level HWND. tl is overrideredirect,
+                # so tl.winfo_id() returns the inner child HWND which
+                # silently no-ops on SetWindowPos. See
+                # win_helpers.top_level_hwnd().
                 try:
-                    overlay_hwnd = tl.winfo_id()
+                    from win_helpers import top_level_hwnd
                     _user32.SetWindowPos(
-                        overlay_hwnd, 0, 0, 0, 0, 0,
+                        top_level_hwnd(tl), 0, 0, 0, 0, 0,
                         0x0001 | 0x0002 | 0x0010)
                 except Exception:
                     pass

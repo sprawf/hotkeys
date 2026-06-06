@@ -193,6 +193,81 @@ the runtime override stays accurate.
 
 ---
 
+## ⚠ Tray menu coverage rule (applies to BOTH actions below)
+
+**Every change that touches state, opens a window, starts a thread, or
+holds a resource must be evaluated against BOTH tray menu actions** —
+🛑 *Stop everything & reload hotkeys* and ↺ *Reset everything…* —
+before being marked done.
+
+These two buttons are the user's only escape hatches when something
+feels stuck. If your new feature doesn't think about them, the user
+will find a state your code can't recover from.
+
+### Self-check before declaring ANY feature done
+
+1. ⬜ If feature opens a window or starts a state machine →
+   "Stop everything" closes/aborts it cleanly? (see rule below)
+2. ⬜ If feature persists any user-facing state → "Reset everything"
+   restores it to factory? (see rule below)
+3. ⬜ If feature stores transient state (timers, callbacks, in-flight
+   network calls) → both actions cancel them, no orphan threads?
+4. ⬜ If feature is opt-in (Welcome flow, login, calibration) →
+   "Reset everything" re-arms it for next launch?
+
+Skip this checklist and you ship a button that lies to the user. Both
+buttons MUST do what their label promises for every feature in the app.
+
+---
+
+## ⚠ Stop-everything completeness rule
+
+**"🛑 Stop everything & reload hotkeys" must cancel every in-flight
+operation, close every transient window, and rebind every hotkey
+without ever destroying `library` or `settings`.**
+
+Implementation: `_reload_hotkeys_manual()` in `main.py`. Reviewers
+must walk it top to bottom whenever a new feature lands.
+
+### What it must do, in order
+
+| Step | Action | Why |
+|---|---|---|
+| 1 | Reload config from disk | Pick up edits made by other tools |
+| 2 | Close GIF setup dialog (`_gif_setup_dlg`) | Modal-grab corruption recovery |
+| 3 | Destroy every non-permanent Toplevel (Library + Settings excluded via `_permanent`) | Sweep stuck pills, dialogs, popups |
+| 4 | Stop active state machines: Whisper, macro, screen recorder, GIF, in-flight refine, transcribe job | No orphan threads or stuck "Recording…" pills |
+| 4e/4f | Save-and-close Quick Notes + Whiteboard windows | Don't lose unsaved content |
+| 4f-2 | WM_CLOSE the Whiteboard subprocess if running | The pywebview subprocess is OUTSIDE our process tree |
+| 4g | `_close_all_ask_pills()` | Belt-and-suspenders for floating AskPills |
+| 5+ | Re-register every hotkey (`_register_hotkeys_bg`) | The whole point of "reload hotkeys" |
+
+### When you add ANY of these, you must update Stop everything:
+
+| You added… | What Stop-everything must do |
+|---|---|
+| New state machine (recording/playing/encoding/streaming) | Force-stop + clear state + null any worker handle. Pattern: see `_recorder_state` block. |
+| New floating window (pill, overlay, modal dialog) | Either it's caught by the destroy-non-permanent-Toplevel sweep (step 3) OR add an explicit close call (e.g. `_gif_setup_dlg`, Quick Notes, Whiteboard). |
+| New permanent UI window | Add to `_permanent` set so it ISN'T destroyed by step 3 |
+| New subprocess (pywebview, ffmpeg child, etc.) | Add explicit termination (WM_CLOSE, terminate(), kill()) so it doesn't survive the reset |
+| New background thread (daemon or not) | Either it dies on its own when state flips OR add explicit `force_stop()` call |
+| New in-flight network call / AI generation | Bump a generation counter (see `_refine_gen` pattern) so pending callbacks become no-ops |
+| New keyboard binding | Default in `DEFAULT_CONFIG['hotkeys']` so `_register_hotkeys` picks it up (already handled by existing path) |
+| New auto-restart timer (`after()`) | Cancel any pending `after_cancel()` so we don't get a ghost callback after reset |
+
+### Self-check before declaring "stop coverage" done
+
+1. ⬜ New state flag → reset in `_reload_hotkeys_manual`?
+2. ⬜ New thread/subprocess → forced to stop?
+3. ⬜ New transient window → either swept by step 3 or closed explicitly?
+4. ⬜ New `after()` callback → cancelled?
+5. ⬜ Manually tested: feature in mid-action, click Stop everything, verify clean recovery?
+
+If any box is unchecked, "Stop everything" will leak something. The
+button name promises totality — code must keep that promise.
+
+---
+
 ## ⚠ Reset-everything completeness rule
 
 **Every change that touches user state must also be reflected in the Reset
@@ -418,6 +493,126 @@ Output: `E:\Hotkeys\dist\Hotkeys\` — zip the whole folder to ship.
 
 ---
 
+## ⚠ Tab render guard rule
+
+**Every per-tab render method in `library.py` MUST start with:**
+
+```python
+def _render_<tabkey>_tab(self) -> None:
+    if self._render_tab_guard('<tabkey>'):
+        return
+    # ...rest of render
+```
+
+(Or for `_render_macro_cards`: `_render_tab_guard('macros')`. For
+`_render_slot_tab(key)`: `_render_tab_guard(key)`.)
+
+### Why
+
+Every tab render starts with
+`for w in self._scroll.winfo_children(): w.destroy()`. That is CORRECT
+when `self._scroll` has been swapped to the per-tab container (the
+normal path: `_show_active_tab` / `_invalidate_tab` / `_prewarm_tab`
+all do this swap inside try/finally). It is CATASTROPHIC when called
+with `self._scroll` still pointing at the outer `CTkScrollableFrame`,
+because the outer scroll's direct children are EVERY tab container.
+One unguarded call wipes them all — user sees "stuck on one tab no
+matter what I click" until app restart. Caught in production June
+2026 when `main.py._on_close` for Quick Notes called
+`library._render_notes_tab()` directly.
+
+### What to do when adding a new tab
+
+1. Drop `if self._render_tab_guard('your_key'): return` as the FIRST
+   line of your `_render_your_key_tab` method
+2. **Never** call `_render_*_tab()` directly from outside `library.py`.
+   Always go through `library._invalidate_tab(key)` or
+   `library._switch_tab(key)` — both swap `self._scroll` correctly
+3. The pattern `update_recorder_state` / `update_gif_state` in
+   `library.py` is the reference shape for "main.py needs to refresh
+   a tab in response to a state change"
+
+### Four overlapping safeguards already in place
+
+| Layer | What | Where |
+|---|---|---|
+| Doc | Multi-paragraph design comment | Above `_render_cards_impl` in `library.py` |
+| CI test | AST auto-discovery + guard-presence check | `test_tab_guard.py` |
+| Boot check | `_verify_tab_guards_at_boot()` logs CRITICAL if any method lacks guard | `LibraryWindow.__init__` |
+| Runtime safety net | `_render_tab_guard()` reroutes through `_invalidate_tab` on misroute | At the top of every render method |
+
+**Add new tabs without thinking about this.** All four layers fire if
+you forget the guard.
+
+---
+
+## ⚠ HWND / Win32 rule
+
+**For any Win32 API that takes an HWND as its first argument
+(SetWindowPos, DwmSetWindowAttribute, SetWindowDisplayAffinity,
+MoveWindow, GetWindowLong*, SetWindowLong*, GetWindowRect, ShowWindow,
+etc), use `win_helpers.top_level_hwnd(widget)` — never
+`widget.winfo_id()` directly.**
+
+```python
+from win_helpers import top_level_hwnd
+ctypes.windll.user32.SetWindowPos(
+    top_level_hwnd(self._win),  # ← NOT self._win.winfo_id()
+    0, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010,
+)
+```
+
+### Why
+
+Tk's `winfo_id()` returns the inner widget HWND, NOT the OS top-level
+window. For an `overrideredirect(True)` borderless Toplevel, the inner
+HWND is a CHILD of the real top-level window — Win32 calls applied to
+the child silently no-op OR hit the wrong window. This bug has bitten
+us at least four times (Quick Notes maximize, Quick Notes rounded
+corners, AskPill lift, audio-editor hint overlay lift).
+
+`top_level_hwnd(widget)` walks `GetAncestor(GA_ROOT)` so it works for:
+- normal `Toplevel` windows (CTk may wrap with an inner frame in some
+  versions; the helper is still correct because GA_ROOT on a real
+  top-level returns itself)
+- `overrideredirect` borderless windows (the inner HWND is a child;
+  the helper resolves it)
+- inner frames / canvases inside any window
+
+The helper never raises; on non-Win32 platforms or on
+already-destroyed widgets it returns whatever `winfo_id()` gave back.
+
+### What to do when writing new Win32 code
+
+1. `from win_helpers import top_level_hwnd`
+2. Pass `top_level_hwnd(widget)` as the first arg of any HWND API
+3. Run `test_hwnd_audit.py` — it AST-scans every source file for raw
+   `widget.winfo_id()` calls inside HWND APIs and fails loudly if it
+   finds any
+
+---
+
+## ⚠ Destroying widget children rule
+
+**`for w in WIDGET.winfo_children(): w.destroy()` is correct ONLY
+when you own every direct child of WIDGET.**
+
+If WIDGET is a shared parent (a panel mounted into someone else's
+frame, the outer scrollable area of a multi-tab UI, the app root),
+that pattern destroys siblings you didn't mean to touch. The exact
+trap that broke `library.py` tab rendering (the rule above) and
+`transcribe_ui.py` panel rendering.
+
+### What to do
+
+1. Own a private container: `self._content = ctk.CTkFrame(parent)`.
+   Wipe it via `self._content.destroy()` + re-create, OR wipe its
+   children via `for w in self._content.winfo_children(): w.destroy()`
+2. Never wipe children of a parent passed in from outside without
+   first confirming you're the only consumer of that parent
+
+---
+
 ## Key architecture rules (see FIXES.md for full history)
 
 1. **One `tk.Tk()` per process** — all windows are `Toplevel` children of `self.root`
@@ -426,3 +621,8 @@ Output: `E:\Hotkeys\dist\Hotkeys\` — zip the whole folder to ship.
 4. **Win32 `SendInput` for Ctrl+C/V/Z** — never `keyboard.send()` for injected keystrokes
 5. **All HTTPS calls via `_robust_post()`** — handles AVG/antivirus SSL inspection transparently
 6. **Set error state before raising** — "running" flags must be reset in the exception path
+7. **Tab render methods START with `_render_tab_guard(key)`** — see "Tab render guard rule" above
+8. **Win32 HWND APIs use `top_level_hwnd(widget)`, never `winfo_id()`** — see "HWND / Win32 rule" above
+9. **Never destroy `parent.winfo_children()` from a panel you don't fully own** — see "Destroying widget children rule" above
+10. **Tests `test_tab_guard.py` + `test_hwnd_audit.py` must pass before any tab/Win32 change ships**
+11. **Every feature is evaluated against BOTH tray menu actions** (🛑 Stop everything + ↺ Reset everything) — see "Tray menu coverage rule" above. No feature is "done" until both buttons do the right thing for it.

@@ -1195,6 +1195,11 @@ class LibraryWindow:
                  on_macro_hotkeys_changed: Callable | None = None,
                  on_feature_hotkey_changed: Callable | None = None,
                  on_chains_changed: Callable | None = None) -> None:
+        # Boot-time safety check: if any per-tab render method is
+        # missing the _render_tab_guard line, log a CRITICAL warning.
+        # Belt-and-suspenders pair with test_tab_guard.py. See the
+        # docstring on _verify_tab_guards_at_boot for the full story.
+        self.__class__._verify_tab_guards_at_boot()
         self.root               = root
         self.prompts            = list(prompts)
         self.on_select          = on_select
@@ -1508,12 +1513,27 @@ class LibraryWindow:
         self._search_bar_frame = search_bar
 
     def _build_grid(self) -> None:
+        # ── Outer scroll + guard reference ──────────────────────────────
+        # `self._scroll` gets temporarily swapped to the per-tab container
+        # by _show_active_tab / _invalidate_tab / _prewarm_tab whenever a
+        # render runs. Save the ORIGINAL outer scroll separately so
+        # _render_X_tab methods can detect a "called without swap" situation
+        # and route through _invalidate_tab() instead — otherwise
+        # `for w in self._scroll.winfo_children(): w.destroy()` (at the top
+        # of every render) destroys every tab container in one shot,
+        # leaving subsequent tab clicks visually stuck. See the
+        # _render_tab_guard() helper below; every tab render calls it.
         self._scroll = ctk.CTkScrollableFrame(
             self.win, fg_color=BG,
             scrollbar_button_color=SURF2,
             scrollbar_button_hover_color=SURF3,
         )
         self._scroll.pack(fill='both', expand=True, padx=PAD, pady=PAD)
+        # Permanent reference to the OUTER scroll — never reassigned.
+        # `self._scroll` itself gets swapped to per-tab containers during
+        # rendering; comparisons against `self._outer_scroll` let
+        # _render_tab_guard() detect "called without swap" scenarios.
+        self._outer_scroll = self._scroll
         # CTkScrollableFrame has several internal layers; bind them all so
         # right-clicking anywhere in the empty grid area shows the menu.
         for widget in (self._scroll,):
@@ -1591,9 +1611,13 @@ class LibraryWindow:
         """
         try:
             import ctypes
+            from win_helpers import top_level_hwnd
             DWMWA_TRANSITIONS_FORCEDISABLED = 3
+            # Use the OS top-level HWND. For CTkToplevel, winfo_id()
+            # may return an inner widget HWND in some Tk/CTk versions;
+            # always walking GA_ROOT makes this resilient.
             ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                self.win.winfo_id(),
+                top_level_hwnd(self.win),
                 DWMWA_TRANSITIONS_FORCEDISABLED,
                 ctypes.byref(ctypes.c_int(1)),
                 ctypes.sizeof(ctypes.c_int))
@@ -1669,6 +1693,8 @@ class LibraryWindow:
         visible while the failure gets investigated via the log.
         """
         target = self._active_tab
+        _log.info(f'[TAB] _show_active_tab target={target!r}  '
+                  f'containers={list(self._tab_containers.keys())}')
 
         # Hide every cached container that isn't the target tab. Track
         # which ones we hid so we can re-grid them on render failure.
@@ -1676,10 +1702,14 @@ class LibraryWindow:
         for k, c in self._tab_containers.items():
             if k != target:
                 try:
+                    # Was the container actually mapped before grid_remove?
+                    was_mapped = bool(c.winfo_ismapped())
                     c.grid_remove()
+                    if was_mapped:
+                        _log.info(f'[TAB]   hid {k!r} (was mapped)')
                     hidden.append((k, c))
-                except Exception:
-                    pass
+                except Exception as e:
+                    _log.warning(f'[TAB]   grid_remove({k!r}) failed: {e}')
 
         # Get or create the container for the target tab.
         if target not in self._tab_containers:
@@ -1688,7 +1718,7 @@ class LibraryWindow:
                 container.columnconfigure(0, weight=1)
                 self._tab_containers[target] = container
             except Exception as exc:
-                logger.error(f'Tab switch: failed to create container for {target!r}: {exc}')
+                _log.error(f'Tab switch: failed to create container for {target!r}: {exc}')
                 # Re-grid the most recent previously-active tab so the user
                 # sees something.
                 for k, c in hidden:
@@ -1700,12 +1730,22 @@ class LibraryWindow:
         container = self._tab_containers[target]
         try:
             container.grid(row=0, column=0, sticky='nsew')
+            # After grid: log mapped state + children count. If the user
+            # reports "stuck on previous tab" the question is whether
+            # THIS line actually made the new tab's container visible.
+            container.update_idletasks()
+            _log.info(f'[TAB]   gridded {target!r}: '
+                      f'mapped={container.winfo_ismapped()} '
+                      f'kids={len(container.winfo_children())} '
+                      f'size={container.winfo_width()}x{container.winfo_height()}')
         except Exception as exc:
-            logger.error(f'Tab switch: failed to grid {target!r}: {exc}')
+            _log.error(f'Tab switch: failed to grid {target!r}: {exc}')
 
         # Already built? Just show, no work.
         if target in self._tab_built:
+            _log.info(f'[TAB]   {target!r} already built; switch complete')
             return
+        _log.info(f'[TAB]   {target!r} not yet built; building now')
 
         # First visit: build the widgets. Swap self._scroll → container so the
         # existing render methods (which use self._scroll as their parent)
@@ -1720,16 +1760,19 @@ class LibraryWindow:
             # Loud log so we can find the actual cause from user reports
             # of "tab went blank". The defensive recovery below at least
             # gets them back to a working pane.
-            logger.exception(f'Tab switch: _render_cards_impl raised on {target!r}: {exc}')
+            _log.exception(f'Tab switch: _render_cards_impl raised on {target!r}: {exc}')
         finally:
             self._scroll = real_scroll
 
         if build_ok:
             self._tab_built.add(target)
+            _log.info(f'[TAB]   {target!r} build OK; switch complete')
         else:
             # Render failed — invalidate so the next click retries from
             # scratch, and re-grid the most recent prior tab so the user
             # isn't staring at a blank pane.
+            _log.warning(f'[TAB]   {target!r} build FAILED; running '
+                         f'fallback (re-grid first hidden container)')
             self._tab_built.discard(target)
             try: container.grid_remove()
             except Exception: pass
@@ -1737,6 +1780,8 @@ class LibraryWindow:
                 try:
                     c.grid(row=0, column=0, sticky='nsew')
                     self._active_tab = k
+                    _log.warning(f'[TAB]   fallback re-gridded {k!r}; '
+                                 f'_active_tab now {k!r}')
                     break
                 except Exception:
                     pass
@@ -1774,6 +1819,16 @@ class LibraryWindow:
     def _invalidate_tab(self, tab: str) -> None:
         """Mark *tab* as needing a full rebuild on its next visit. If *tab* is
         currently active, rebuild immediately so the user sees fresh data."""
+        # Diagnostic: log the caller so we can see WHO invalidates Macros/
+        # Recorder/Gif silently while the user is on another tab.
+        try:
+            import sys as _sys
+            f = _sys._getframe(1)
+            caller = f'{f.f_code.co_name}:{f.f_lineno}'
+        except Exception:
+            caller = '?'
+        _log.info(f'[TAB] _invalidate_tab({tab!r}) by {caller} '
+                  f'(active={self._active_tab!r})')
         self._tab_built.discard(tab)
         if self._active_tab != tab:
             return  # next visit will rebuild
@@ -1799,6 +1854,117 @@ class LibraryWindow:
         Tab switches should call _show_active_tab instead, which preserves
         the cache."""
         self._invalidate_tab(self._active_tab)
+
+    # ── Tab render safety guard ──────────────────────────────────────────────
+    #
+    # Every _render_X_tab method (and _render_macro_cards) MUST start with:
+    #
+    #     if self._render_tab_guard('X'):
+    #         return
+    #
+    # The guard exists because every tab render begins with
+    #     for w in self._scroll.winfo_children(): w.destroy()
+    # which is correct WHEN self._scroll has been swapped to the per-tab
+    # container (the normal path via _show_active_tab / _invalidate_tab /
+    # _prewarm_tab does this swap), but CATASTROPHICALLY WRONG when
+    # called with self._scroll pointing at the OUTER CTkScrollableFrame —
+    # because the outer scroll's direct children are ALL tab containers.
+    # One unswapped call wipes every tab container in one shot, leaving
+    # subsequent tab clicks visually stuck (grid_remove on the stale refs
+    # fails with "bad window path name" and the new grid lands nowhere).
+    #
+    # The guard detects the unswapped state by comparing self._scroll to
+    # self._outer_scroll. If they match → reroute through _invalidate_tab
+    # (which sets up the swap correctly), and signal the caller to bail.
+    #
+    # WHEN ADDING A NEW TAB: drop `if self._render_tab_guard('your_tab_key'):
+    # return` as the first line of your render method. Without it, any
+    # external caller that calls your method directly (e.g. main.py after
+    # a state change) can break every other tab.
+
+    def _render_tab_guard(self, tab_key: str) -> bool:
+        """Return True if the caller should bail and let _invalidate_tab
+        rerun the render correctly. Returns False when self._scroll is
+        already swapped to the per-tab container (the normal path)."""
+        if self._scroll is getattr(self, '_outer_scroll', None):
+            _log.info(f'[TAB] _render_tab_guard tripped for {tab_key!r}: '
+                      'caller used outer scroll, routing through '
+                      '_invalidate_tab to protect other tab containers')
+            self._invalidate_tab(tab_key)
+            return True
+        return False
+
+    @classmethod
+    def _verify_tab_guards_at_boot(cls) -> None:
+        """Boot-time safety net: walk every method on this class whose
+        name matches the per-tab render convention and verify it begins
+        with `if self._render_tab_guard(...): return`. Logs a CRITICAL
+        warning for any method missing the guard.
+
+        This is the belt-and-suspenders pair to test_tab_guard.py — the
+        test catches missing guards in CI / pre-commit, this catches
+        them at app boot if the test was skipped. Together they make
+        it impossible for a new tab to ship with the guard missing
+        without somebody yelling at the dev.
+        """
+        import ast as _ast, inspect as _inspect, textwrap as _tw
+        # Pull every method whose name fits the per-tab render pattern.
+        candidates = []
+        for name in dir(cls):
+            if name == '_render_cards_impl':
+                continue  # dispatcher, not a per-tab render
+            if name == '_render_macro_cards' or (
+                    name.startswith('_render_') and name.endswith('_tab')):
+                obj = getattr(cls, name, None)
+                if callable(obj):
+                    candidates.append((name, obj))
+
+        missing = []
+        for name, fn in candidates:
+            try:
+                src = _tw.dedent(_inspect.getsource(fn))
+                tree = _ast.parse(src)
+                if not tree.body or not isinstance(tree.body[0], _ast.FunctionDef):
+                    continue
+                body = tree.body[0].body[:]
+                # Skip docstring if any
+                if (body and isinstance(body[0], _ast.Expr)
+                        and isinstance(body[0].value, _ast.Constant)
+                        and isinstance(body[0].value.value, str)):
+                    body = body[1:]
+                if not body:
+                    missing.append(name); continue
+                first = body[0]
+                guarded = (
+                    isinstance(first, _ast.If)
+                    and isinstance(first.test, _ast.Call)
+                    and isinstance(first.test.func, _ast.Attribute)
+                    and first.test.func.attr == '_render_tab_guard'
+                    and len(first.body) == 1
+                    and isinstance(first.body[0], _ast.Return)
+                )
+                if not guarded:
+                    missing.append(name)
+            except Exception:
+                # If we can't inspect the source for some reason, don't
+                # break boot — just skip this method. The static test
+                # is the authoritative check.
+                continue
+
+        if missing:
+            _log.critical(
+                '[TAB GUARD] %d tab render method(s) are missing the '
+                '_render_tab_guard() safety check: %s. Without it, any '
+                'external direct call (e.g. from main.py after a state '
+                'change) will destroy every tab container. See the '
+                'comment above _render_cards_impl in library.py and add '
+                '`if self._render_tab_guard(\'<key>\'): return` as the '
+                'first statement of each listed method.',
+                len(missing), missing)
+        else:
+            _log.info(f'[TAB GUARD] startup check: all '
+                      f'{len(candidates)} per-tab render methods are '
+                      'guarded')
 
     def _render_cards_impl(self) -> None:
         if self._active_tab == 'macros':
@@ -2792,8 +2958,14 @@ class LibraryWindow:
             self._hint_lbl.configure(text=self._hint_prompts_text)
 
     def _switch_tab(self, tab: str) -> None:
+        # Diagnostic: log every tab-switch click so we can correlate user-
+        # reported "tab got stuck" reports with exactly what the code did.
+        _log.info(f'[TAB] _switch_tab({tab!r}) called  '
+                  f'active={self._active_tab!r}  '
+                  f'built={sorted(self._tab_built)}')
         # Bail out fast on no-op clicks.
         if tab == self._active_tab and tab in self._tab_built:
+            _log.info(f'[TAB] _switch_tab: no-op (same tab, already built)')
             return
 
         prev = self._active_tab
@@ -2874,6 +3046,8 @@ class LibraryWindow:
 
     def _render_macro_cards(self) -> None:
         """Render macro cards into the scroll frame."""
+        if self._render_tab_guard('macros'):
+            return
         for w in self._scroll.winfo_children():
             w.destroy()
         self._macro_cards.clear()
@@ -2914,6 +3088,36 @@ class LibraryWindow:
             corner_radius=RADIUS_SM, font=(FONT_FAMILY, 11),
             command=_open_macros_folder,
         ).pack(side='right')
+
+        # Bulk delete — only render when there's at least one macro to delete.
+        # The button sits to the LEFT of Open Folder so the destructive action
+        # is visually separated from the navigation one.
+        if macros and self._macro_library is not None:
+            def _delete_all_macros():
+                n = len(self._macro_library.macros)
+                if n == 0:
+                    return
+                if not confirm(self.win, 'Delete all macros',
+                               f'Delete all {n} saved macros?\n\n'
+                               'This cannot be undone.',
+                               action_label='Delete all',
+                               action_color='#b03030',
+                               action_hover='#d04040'):
+                    return
+                # Snapshot ids so iteration isn't affected by deletes
+                ids = [m['id'] for m in list(self._macro_library.macros)]
+                for mid in ids:
+                    try:
+                        self._macro_library.delete(mid)
+                    except Exception as e:
+                        _log.warning(f'delete_all_macros: {mid}: {e}')
+                self._render_cards()
+            ctk.CTkButton(
+                _folder_row, text='🗑  Delete all', width=110, height=26,
+                fg_color=SURF2, hover_color=ERR, text_color=TEXT_S,
+                corner_radius=RADIUS_SM, font=(FONT_FAMILY, 11),
+                command=_delete_all_macros,
+            ).pack(side='right', padx=(0, 6))
 
         # ── Active-session banner (shown when a recording/playback is in progress) ──
         if self._macro_state != 'idle':
@@ -3255,6 +3459,8 @@ class LibraryWindow:
 
     def _render_recorder_tab(self) -> None:
         """Render the Recorder tab contents inside self._scroll."""
+        if self._render_tab_guard('recorder'):
+            return
         # Cancel any existing live ticker from a previous render
         if self._rec_tab_ticker is not None:
             try:
@@ -3364,6 +3570,40 @@ class LibraryWindow:
                 corner_radius=RADIUS_SM, font=(FONT_FAMILY, 11),
                 command=_open_folder,
             ).pack(side='right', pady=4)
+
+            # Bulk delete for recordings — iterates the on-disk list, removes
+            # each file, prunes the recordings index, then invalidates the
+            # tab cache so the rebuild reflects the cleanup.
+            def _delete_all_recordings():
+                from screen_recorder import (list_recordings as _list_rec,
+                                              remove_from_recordings_index
+                                              as _rm_rec_idx)
+                items = _list_rec(rec_dir)
+                if not items:
+                    return
+                if not confirm(self.win, 'Delete all recordings',
+                               f'Delete all {len(items)} recordings from '
+                               f'disk?\n\nThis cannot be undone.',
+                               action_label='Delete all',
+                               action_color='#b03030',
+                               action_hover='#d04040'):
+                    return
+                for r in items:
+                    try:
+                        os.unlink(r['path'])
+                    except Exception as e:
+                        _log.warning(f'delete_all_recordings: {r["path"]}: {e}')
+                    try:
+                        _rm_rec_idx(r['path'])
+                    except Exception:
+                        pass
+                self._invalidate_tab('recorder')
+            ctk.CTkButton(
+                hdr, text='🗑  Delete all', width=100, height=22,
+                fg_color=SURF2, hover_color=ERR, text_color=TEXT_S,
+                corner_radius=RADIUS_SM, font=(FONT_FAMILY, 11),
+                command=_delete_all_recordings,
+            ).pack(side='right', pady=4, padx=(0, 6))
 
             import datetime as _dt
             for row_i, rec in enumerate(recordings[:10]):
@@ -3520,6 +3760,8 @@ class LibraryWindow:
 
     def _render_gif_tab(self) -> None:
         """Render the GIF tab contents inside self._scroll."""
+        if self._render_tab_guard('gif'):
+            return
         # Cancel any existing ticker
         if self._gif_tab_ticker is not None:
             try:
@@ -3633,6 +3875,37 @@ class LibraryWindow:
                 command=_open_gif_folder,
             ).pack(side='right', pady=4)
 
+            # Bulk delete for saved GIFs — iterates the list, removes each
+            # file, prunes the gif index, then invalidates the tab cache.
+            def _delete_all_gifs():
+                items = _list_gifs(str(gif_dir))
+                if not items:
+                    return
+                if not confirm(self.win, 'Delete all GIFs',
+                               f'Delete all {len(items)} GIFs from disk?'
+                               f'\n\nThis cannot be undone.',
+                               action_label='Delete all',
+                               action_color='#b03030',
+                               action_hover='#d04040'):
+                    return
+                for g in items:
+                    p = Path(g['path'])
+                    try:
+                        p.unlink(missing_ok=True)
+                    except Exception as e:
+                        _log.warning(f'delete_all_gifs: {p}: {e}')
+                    try:
+                        _rm_gif_idx(str(p))
+                    except Exception:
+                        pass
+                self._invalidate_tab('gif')
+            ctk.CTkButton(
+                hdr, text='🗑  Delete all', width=100, height=22,
+                fg_color=SURF2, hover_color=ERR, text_color=TEXT_S,
+                corner_radius=RADIUS_SM, font=(FONT_FAMILY, 11),
+                command=_delete_all_gifs,
+            ).pack(side='right', pady=4, padx=(0, 6))
+
             import datetime as _dt
             for row_i, gif_info in enumerate(gifs):
                 gif_path = Path(gif_info['path'])
@@ -3692,6 +3965,8 @@ class LibraryWindow:
 
     def _render_ask_tab(self) -> None:
         """Render the Ask tab, type a question or use Shift+F4 on selected text."""
+        if self._render_tab_guard('ask'):
+            return
         for w in self._scroll.winfo_children():
             w.destroy()
         self._cards.clear()
@@ -3833,6 +4108,8 @@ class LibraryWindow:
 
     def _render_chains_tab(self) -> None:
         """Render the Chains tab, ordered list of chains with active toggle, edit, delete."""
+        if self._render_tab_guard('chains'):
+            return
         from storage import load_chains, save_chains
 
         for w in self._scroll.winfo_children():
@@ -4046,6 +4323,8 @@ class LibraryWindow:
         pattern so the Library tab strip stays consistent and the user is
         never shown two interfaces for the same content.
         """
+        if self._render_tab_guard('notes'):
+            return
         for w in self._scroll.winfo_children():
             w.destroy()
         self._cards.clear()
@@ -4172,6 +4451,8 @@ class LibraryWindow:
         """Mount the TurboScribe-style transcription UI inside the scroll area.
         The full UI lives in transcribe_ui.TranscribePanel, this method is
         just the wiring."""
+        if self._render_tab_guard('transcribe'):
+            return
         # Tear down any previous panel (e.g. switching back to this tab)
         if getattr(self, '_transcribe_panel', None) is not None:
             try: self._transcribe_panel.destroy()
@@ -4204,6 +4485,8 @@ class LibraryWindow:
         is auto-saved there), so this tab is just a launcher. We keep the
         layout consistent with the Notes empty-state card.
         """
+        if self._render_tab_guard('whiteboard'):
+            return
         for w in self._scroll.winfo_children():
             w.destroy()
         self._cards.clear()
@@ -4262,6 +4545,8 @@ class LibraryWindow:
         to "Audio Editor", launched as a sibling process. This tab
         is just a launcher card, same shape as the Whiteboard tab.
         """
+        if self._render_tab_guard('audio_editor'):
+            return
         for w in self._scroll.winfo_children():
             w.destroy()
         self._cards.clear()
@@ -4320,6 +4605,8 @@ class LibraryWindow:
         """Render a reserved-slot tab. Same shape as the Whiteboard tab so it
         slots into the existing layout without surprises, a header card
         explaining the slot is reserved, plus the hotkey for reference."""
+        if self._render_tab_guard(key):
+            return
         for w in self._scroll.winfo_children():
             w.destroy()
         self._cards.clear()
@@ -4359,6 +4646,8 @@ class LibraryWindow:
 
     def _render_web_tab(self) -> None:
         """Render the Web bookmarks tab, radio-select active site, Shift+F5 opens it."""
+        if self._render_tab_guard('web'):
+            return
         from storage import load_bookmarks, save_bookmarks
         import webbrowser, threading
 

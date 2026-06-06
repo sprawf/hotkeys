@@ -63,10 +63,24 @@ def start_prtsc_listener(callback) -> None:
         if nCode >= 0 and wParam in (_WM_KEYDOWN, _WM_SYSKEYDOWN):
             kb = ctypes.cast(lParam, ctypes.POINTER(_KBDLLHOOKSTRUCT)).contents
             if kb.vkCode == _VK_SNAPSHOT:
+                # Single INFO line so we can tell hook-didn't-fire from
+                # hook-fired-but-callback-broke. Captures the foreground
+                # window too so we can correlate "hook didn't fire" with
+                # what was in front (UIPI elevation is the #1 suspect).
+                # Diagnostic only; stays well inside the 300ms
+                # LowLevelHooksTimeout budget.
+                import logging
+                _log = logging.getLogger(__name__)
+                try:
+                    fg = _get_foreground_window_info()
+                except Exception:
+                    fg = 'foreground=?'
+                _log.info(f'[HOOK] PrtSc hook fired  •  {fg}')
                 try:
                     callback()
-                except Exception:
-                    pass
+                except Exception as e:
+                    _log.warning(f'PrtSc callback raised: {e}')
+                _log.info('[HOOK] PrtSc callback returned')
         return _user32.CallNextHookEx(_hook_ref[0], nCode, wParam, lParam)
 
     def _listen():
@@ -90,10 +104,114 @@ def start_prtsc_listener(callback) -> None:
     threading.Thread(target=_listen, daemon=True, name='prtsc-listener').start()
 
 
+# ── Independent PrtSc keylogger (diagnostic) ─────────────────────────────────
+#
+# This polls GetAsyncKeyState(VK_SNAPSHOT) directly on a background thread,
+# bypassing the WH_KEYBOARD_LL chain entirely. The point: when our hook
+# DOESN'T fire on a PrtSc press, we still want to know whether the OS saw
+# the keypress. If this poller fires and our hook doesn't, the diagnosis is
+# unambiguous — our hook was suppressed (UIPI, foreground app elevated,
+# anti-cheat driver, Windows shell hotkey hijack, etc).
+#
+# Every press also captures the foreground window (process name + title) so
+# we can correlate "PrtSc didn't work" with what was in front at the time.
+
+def _get_foreground_window_info() -> str:
+    """Return 'pid=X exe=name.exe title="…"' for whatever window has
+    focus right now. Used to annotate every PrtSc telemetry line."""
+    try:
+        hwnd = _user32.GetForegroundWindow()
+        if not hwnd:
+            return 'foreground=none'
+        # Window title
+        try:
+            length = _user32.GetWindowTextLengthW(hwnd)
+            buf = ctypes.create_unicode_buffer(length + 1)
+            _user32.GetWindowTextW(hwnd, buf, length + 1)
+            title = buf.value
+        except Exception:
+            title = '?'
+        # Owning PID
+        pid = ctypes.wintypes.DWORD(0)
+        _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        # Process name
+        exe = '?'
+        try:
+            kernel32 = ctypes.windll.kernel32
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
+                                     False, pid.value)
+            if h:
+                try:
+                    psapi = ctypes.windll.psapi
+                    buf2 = ctypes.create_unicode_buffer(1024)
+                    n = psapi.GetModuleBaseNameW(h, None, buf2, 1024)
+                    if n:
+                        exe = buf2.value
+                except Exception:
+                    pass
+                kernel32.CloseHandle(h)
+        except Exception:
+            pass
+        return f'pid={pid.value} exe={exe} title="{title[:60]}"'
+    except Exception as e:
+        return f'foreground=unavailable ({e})'
+
+
+def start_prtsc_keylogger() -> None:
+    """Independent diagnostic. Polls VK_SNAPSHOT directly at 25 ms; logs
+    every detected press alongside the foreground window. Runs forever
+    as a daemon thread. Cheap: GetAsyncKeyState is a single syscall that
+    returns instantly, so the poll thread eats negligible CPU.
+    """
+    import logging
+    log = logging.getLogger(__name__)
+
+    def _loop():
+        # GetAsyncKeyState returns a SHORT whose bits we care about:
+        #   • 0x8000 — key is CURRENTLY pressed
+        #   • 0x0001 — key was pressed AT LEAST ONCE since last call (auto
+        #     cleared by Windows when read). This is the safety net for
+        #     fast taps shorter than our poll interval — if the user
+        #     presses+releases PrtSc between two snapshots, the high bit
+        #     would never show "down" but 0x0001 will still be set.
+        # We poll at 8 ms so even a 1-frame tap can't slip through.
+        last_down = False
+        kernel32 = ctypes.windll.kernel32
+        while True:
+            try:
+                state = _user32.GetAsyncKeyState(_VK_SNAPSHOT)
+                down  = bool(state & 0x8000)
+                tapped = bool(state & 0x0001)
+                if (down and not last_down) or tapped:
+                    fg = _get_foreground_window_info()
+                    flags = ('DOWN' if down else '') + \
+                            ('+TAPPED' if tapped else '')
+                    log.info(f'[KEYLOGGER] PrtSc {flags or "?"} '
+                             f'(raw=0x{state & 0xFFFF:04x})  •  {fg}')
+                last_down = down
+            except Exception as e:
+                log.warning(f'PrtSc keylogger poll failed: {e}')
+            kernel32.Sleep(8)
+
+    threading.Thread(target=_loop, daemon=True,
+                     name='prtsc-keylogger').start()
+    logging.getLogger(__name__).info(
+        'PrtSc keylogger started (25 ms poll via GetAsyncKeyState).')
+
+
 # ── Singleton guard ───────────────────────────────────────────────────────────
 _overlay_lock    = threading.Lock()
 _overlay_active  = [False]
 _pending_overlay: list = [None]   # active ScreenshotOverlay instance (for cancellation)
+# Time the singleton was claimed. The watchdog uses this to avoid
+# resetting a flag that was JUST set: a legitimate grab + overlay
+# construct takes roughly 100-200 ms on a 1080p single monitor and up
+# to ~1 s on a busy 4K multi-mon. Anything shorter than the grace
+# window is presumed to be a grab still in flight and must not be
+# reset, otherwise the next PrtSc starts a duplicate overlay.
+_overlay_claim_ts: list = [0.0]
+_OVERLAY_GRACE_SECS = 3.0
 
 
 # ── Clipboard helper ──────────────────────────────────────────────────────────
@@ -162,7 +280,9 @@ class ScreenshotOverlay:
             with _overlay_lock:
                 if _overlay_active[0]:
                     return
+                import time as _time
                 _overlay_active[0] = True
+                _overlay_claim_ts[0] = _time.monotonic()
 
         self._on_done        = on_done
         self._on_extract_text = on_extract_text
@@ -284,6 +404,19 @@ class ScreenshotOverlay:
         win.bind('<Control-s>',          lambda e: self._save())
         win.bind('<Control-z>',          lambda e: self._undo())
 
+        # Force the overlay onto the screen and to the top of z-order
+        # BEFORE asking for focus. Tray menus / app context menus auto-
+        # dismiss the moment focus leaves them — without the explicit
+        # deiconify + update_idletasks pair, our overlay can get caught
+        # in a "constructed but never mapped" race with the dismissing
+        # menu, and Tk reports it as fine while the user sees nothing.
+        # Same priming pattern as overlay.py / explain_pill.py.
+        try:
+            win.deiconify()
+            win.update_idletasks()
+            win.lift()
+        except Exception:
+            pass
         win.focus_force()   # grab focus immediately so Escape works from the first frame
         self._root.after(50, lambda: win.focus_force())
 
@@ -1277,13 +1410,29 @@ def _create_overlay(root, on_done, shot, dim_img,
     """Called on the main thread once the background grab completes."""
     if not _overlay_active[0]:
         return   # was cancelled while the grab was in flight
+    import logging as _logging
+    _scr_log = _logging.getLogger(__name__)
+    _scr_log.info('[PIPELINE] _create_overlay on main thread; '
+                  'constructing ScreenshotOverlay…')
     try:
         ov = ScreenshotOverlay(root, on_done=on_done,
                                on_extract_text=on_extract_text,
                                on_translate=on_translate,
                                _preloaded_shot=shot, _preloaded_dim=dim_img)
         _pending_overlay[0] = ov
-    except Exception:
+        _scr_log.info('[PIPELINE] ScreenshotOverlay constructed OK; '
+                      'overlay should now be visible')
+    except Exception as e:
+        # Log WHY the overlay failed — the watchdog otherwise silently
+        # resets the singleton flag 2-3s later, hiding the root cause.
+        # Real symptoms tied to this: PrtSc "stops working" after some
+        # window goes wonky, then comes back when the watchdog clears
+        # the flag. Without this log we can't tell which.
+        import logging, traceback
+        logging.getLogger(__name__).warning(
+            f'Screenshot overlay construction failed: {e}\n'
+            f'{traceback.format_exc()}'
+        )
         with _overlay_lock:
             _overlay_active[0] = False
 
@@ -1305,40 +1454,79 @@ def take_screenshot(root=None, on_done=None,
     # (previous overlay crashed, was force-closed, raced through cleanup,
     # etc.), clear the flag and proceed. Without this, a single stale
     # True silently dead-locks Print Screen forever.
+    import logging as _logging
+    _scr_log = _logging.getLogger(__name__)
+    _scr_log.info('[PIPELINE] take_screenshot() entered')
     with _overlay_lock:
         if _overlay_active[0]:
+            # Grace window: an in-flight grab that hasn't yet built
+            # the overlay still has _pending_overlay==None. Without
+            # this we'd misread that as "stale flag" and proceed to
+            # start a SECOND concurrent grab on top of the first.
+            import time as _time
+            held_for = _time.monotonic() - _overlay_claim_ts[0]
+            if held_for < _OVERLAY_GRACE_SECS:
+                _scr_log.info(f'[PIPELINE] rejected — singleton held '
+                              f'{held_for*1000:.0f}ms, grab still in flight')
+                return
             ov = _pending_overlay[0]
             still_alive = False
             try:
                 if ov is not None:
                     # An overlay is "real" iff its toplevel still exists
-                    # and is mapped. Anything else is a ghost.
-                    tk_root = getattr(ov, '_overlay', None) or \
-                              getattr(ov, '_root',    None)
+                    # and is mapped. Check `_win` first — that's where
+                    # ScreenshotOverlay puts its visible Toplevel. The
+                    # other names (`_overlay`, `_root`) were vestigial
+                    # and pointed at the always-withdrawn main app root,
+                    # which made this check always say "not alive" and
+                    # let duplicate overlays slip through.
+                    tk_root = (getattr(ov, '_win',     None)
+                               or getattr(ov, '_overlay', None)
+                               or getattr(ov, '_root',    None))
                     still_alive = (tk_root is not None
                                    and tk_root.winfo_exists()
                                    and tk_root.winfo_ismapped())
             except Exception:
                 still_alive = False
             if still_alive:
+                _scr_log.info('[PIPELINE] rejected — overlay already '
+                              'live (this PrtSc ignored)')
                 return   # genuine in-flight overlay, do not start a 2nd
             # Stale flag, clear and continue.
             _overlay_active[0] = False
             _pending_overlay[0] = None
-            import logging
-            logging.getLogger(__name__).info(
-                'Cleared stale screenshot flag from previous run.')
+            _scr_log.info('[PIPELINE] cleared stale singleton flag from '
+                          'previous run; proceeding')
+        import time as _time
         _overlay_active[0] = True
+        _overlay_claim_ts[0] = _time.monotonic()
+        _scr_log.info('[PIPELINE] singleton claimed; starting grab thread')
 
     if root is not None:
         def _grab():
+            import time as _time
+            _t0 = _time.perf_counter()
             try:
+                _scr_log.info('[PIPELINE] grab thread: ImageGrab.grab(all_screens=True) starting')
                 shot = ImageGrab.grab(all_screens=True)
+                _scr_log.info(f'[PIPELINE] grab done in '
+                              f'{(_time.perf_counter() - _t0) * 1000:.0f}ms '
+                              f'({shot.size[0]}×{shot.size[1]})')
                 # ImageEnhance.Brightness is ~10× faster than image.point()
                 # for large captures (uses PIL's C-level implementation).
                 from PIL import ImageEnhance
                 dim_img = ImageEnhance.Brightness(shot).enhance(_DIM_FACTOR)
-            except Exception:
+                _scr_log.info('[PIPELINE] dim pass done; scheduling overlay on main thread')
+            except Exception as e:
+                # Log WHY the grab failed — same reasoning as the
+                # overlay-construction except above. Common culprits:
+                # DWM busy during HDR mode switch, locked desktop,
+                # remote-desktop reconnect mid-grab, PIL OOM on huge
+                # multi-mon captures.
+                import logging, traceback
+                logging.getLogger(__name__).warning(
+                    f'Screenshot grab failed: {e}\n{traceback.format_exc()}'
+                )
                 with _overlay_lock:
                     _overlay_active[0] = False
                 return

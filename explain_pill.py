@@ -76,13 +76,16 @@ class AskPill:
 
         self._win = tk.Toplevel(root)
         self._win.overrideredirect(True)
-        # Do NOT use -topmost. The pill auto-dismisses after 30s; with
-        # -topmost set, it would float over YouTube / Chrome / any
-        # other app the user switches to during that window. Instead
-        # we lift it to the top of the non-topmost z-order once after
-        # creation via Win32 SetWindowPos with SWP_NOACTIVATE so it
-        # paints above whatever app the user just asked from, without
-        # blocking subsequent app switches.
+        # The user explicitly asked for the pill to be on TOP, not
+        # behind other windows. Earlier comment here argued against
+        # -topmost (afraid it would float over YouTube / Chrome on
+        # later app switches), but the alternative — relying on
+        # one-shot SetWindowPos lift after creation — kept losing
+        # the z-order race to whatever foreground app repainted just
+        # after. Setting -topmost wins decisively, and the pill auto-
+        # dismisses on Esc / close / 30s timeout, so the "float over
+        # YouTube" concern is bounded.
+        self._win.attributes('-topmost', True)
 
         # Windows transparentcolor trick, same as OverlayWindow
         try:
@@ -264,14 +267,19 @@ class AskPill:
     # ── Positioning ───────────────────────────────────────────────────────────
 
     def _place(self, w: int, h: int) -> None:
-        """Position near cursor, clamped to screen edges."""
+        """Position the pill anchored to the foreground app's window
+        (falling back to the mouse if our own UI is in front). This
+        keeps the pill over Notepad / browser / whatever app the user
+        triggered the hotkey from, even if their mouse happened to be
+        parked over the Library window. See overlay.pill_anchor_xy()
+        for the full rule and rationale."""
+        from overlay import pill_anchor_xy
         sw = self._win.winfo_screenwidth()
         sh = self._win.winfo_screenheight()
-        mx = self._root.winfo_pointerx()
-        my = self._root.winfo_pointery()
+        mx, my = pill_anchor_xy(self._root)
 
-        x = mx + 20
-        y = my + 20
+        x = mx
+        y = my
         if x + w + _MARGIN > sw:
             x = mx - w - 10
         if y + h + _MARGIN > sh:
@@ -279,15 +287,42 @@ class AskPill:
         x = max(_MARGIN, min(x, sw - w - _MARGIN))
         y = max(_MARGIN, y)
         self._win.geometry(f'{w}x{h}+{x}+{y}')
+        # Force the pill onto the screen and to the top of z-order.
+        #
+        # Why all three:
+        #   • deiconify(): when the main root has never been mapped
+        #     (Hotkeys boots with root.withdraw()), Tk's WM subsystem
+        #     on Windows isn't primed until a Toplevel is explicitly
+        #     deiconified. Without this, the FIRST pill after launch
+        #     gets created in the WM but never actually shown — the
+        #     user sees nothing despite the geometry being correct.
+        #     Once Library opens once, the WM is primed and subsequent
+        #     pills work. deiconify() forces priming on the pill itself
+        #     so it doesn't need the Library to have been opened first.
+        #   • update_idletasks(): flushes the deiconify + geometry to
+        #     the OS in the same paint frame.
+        #   • lift(): wins the z-order race against whatever app the
+        #     user just asked from (e.g. Notepad may repaint on top
+        #     of a freshly-created Toplevel without this).
+        try:
+            self._win.deiconify()
+            self._win.update_idletasks()
+            self._win.lift()
+        except Exception:
+            pass
         # Lift above whatever app the user just asked from, without
-        # stealing focus and without floating above subsequent app
-        # switches. HWND_TOP=0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE.
+        # stealing focus. HWND_TOP=0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE.
+        # MUST target the OS top-level HWND — self._win is
+        # overrideredirect, so winfo_id() returns the inner child HWND
+        # which is the wrong window for SetWindowPos. See
+        # win_helpers.top_level_hwnd().
         try:
             import sys as _sys
             if _sys.platform == 'win32':
                 import ctypes as _ct
+                from win_helpers import top_level_hwnd
                 _ct.windll.user32.SetWindowPos(
-                    self._win.winfo_id(), 0, 0, 0, 0, 0,
+                    top_level_hwnd(self._win), 0, 0, 0, 0, 0,
                     0x0001 | 0x0002 | 0x0010)
         except Exception:
             pass
