@@ -105,3 +105,6 @@ models/large-v3/
 
 # Demo / docs generation tooling (heavy media + transient outputs)
 demo/
+
+# Test scripts (local-only, not shipped)
+test_*.py
