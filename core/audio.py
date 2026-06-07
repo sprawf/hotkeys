@@ -325,8 +325,25 @@ class AudioCapture:
             self._recording = False
             audio = np.concatenate(self._buffer) if self._buffer else np.zeros(0, dtype=np.float32)
             self._buffer = []
-        if len(audio) > 0:
+        # ALWAYS hand the audio off, even when the buffer is empty.
+        # Without this, an empty buffer (audio device hiccup, sample-rate
+        # fallback, no-input race) silently dropped the pipeline and left
+        # the "Transcribing…" pill stuck forever. Empty audio is handled
+        # cleanly downstream — the transcriber's silence guard returns
+        # __NO_AUDIO__ which surfaces a clear "No audio" pill.
+        if len(audio) == 0:
+            import logging
+            logging.getLogger(__name__).warning(
+                'stop_recording: audio buffer was empty; downstream will '
+                'show "No audio" pill instead of getting stuck'
+            )
+        try:
             self._on_utterance_ready(audio)
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception(
+                'stop_recording: on_utterance_ready raised'
+            )
 
     def cancel_recording(self):
         with self._lock:

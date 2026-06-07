@@ -123,6 +123,7 @@ import datetime
 
 import customtkinter as ctk
 import keyboard
+import kbhook  # Bulletproof replacement for keyboard.add_hotkey — see kbhook.py
 import mouse
 import pyperclip
 import pystray
@@ -544,6 +545,10 @@ class App:
         # ── Whisper state ─────────────────────────────────────────────────────
         self._whisper_recording = False
         self._whisper_t0: float = 0.0
+        # Watchdog: pill stuck on "Transcribing…" recovery. Set when
+        # transcription begins, cancelled on result/error, fires after
+        # 30 s if nothing arrived. See _transcribe_watchdog_fire().
+        self._transcribe_watchdog_id = None
         self._whisper_ready     = False
         self._history: list     = load_history()
 
@@ -827,7 +832,11 @@ class App:
         """Unhook all keyboard and mouse bindings, called while HotkeyCapture dialog
         is open so nothing fires during capture."""
         try:
-            keyboard.unhook_all()
+            kbhook.unhook_all()
+        except Exception:
+            pass
+        try:
+            keyboard.unhook_all()   # clears PTT on_press/on_release if any
         except Exception:
             pass
         try:
@@ -843,7 +852,11 @@ class App:
         """Register all global hotkeys, forcefully resetting the keyboard listener first."""
         # ── Step 1: full teardown ─────────────────────────────────────────────
         try:
-            keyboard.unhook_all()
+            kbhook.unhook_all()
+        except Exception:
+            pass
+        try:
+            keyboard.unhook_all()   # PTT on_press_key handlers (if any)
         except Exception:
             pass
         try:
@@ -873,34 +886,35 @@ class App:
             # Shift would appear "stuck" to the library even after the user released
             # them, silently blocking all subsequent hotkeys with no recovery path
             # (even unhook_all + re-registration couldn't fix a broken listener).
-            keyboard.add_hotkey(hk.get('refine',       'alt+shift+w'), self._hk_refine,      suppress=False)
-            keyboard.add_hotkey(hk.get('library',      'alt+shift+e'), self._hk_library,     suppress=False)
-            keyboard.add_hotkey(hk.get('undo_refine',  'alt+shift+z'), self._hk_undo_refine, suppress=False)
-            keyboard.add_hotkey(hk.get('macro_record', 'shift+f1'),
-                                lambda: self._q.put(('macro:hotkey', None)),     suppress=False)
-            keyboard.add_hotkey(hk.get('recorder',     'shift+f2'),
-                                lambda: self._q.put(('recorder:toggle', None)), suppress=False)
-            keyboard.add_hotkey(hk.get('gif_record',   'shift+f3'),
-                                lambda: self._q.put(('gif:toggle',      None)), suppress=False)
-            keyboard.add_hotkey(hk.get('ask',          'shift+f4'),
-                                self._hk_ask,                                   suppress=False)
-            keyboard.add_hotkey(hk.get('web',          'shift+f5'),
-                                lambda: self._q.put(('web', None)),             suppress=False)
-            keyboard.add_hotkey(hk.get('chain',        'shift+f6'),
-                                self._hk_chain,                                 suppress=False)
-            keyboard.add_hotkey(hk.get('notes',        'shift+f7'),
-                                lambda: self._q.put(('notes',      None)),      suppress=False)
-            keyboard.add_hotkey(hk.get('whiteboard',   'shift+f8'),
-                                lambda: self._q.put(('whiteboard', None)),      suppress=False)
-            keyboard.add_hotkey(hk.get('transcribe',   'shift+f9'),
-                                lambda: self._q.put(('transcribe', None)),      suppress=False)
-            # Shift+F10, bundled audio editor (Tenacity), launched as a
-            # sibling process and relabeled to "Audio Editor" at the
-            # window-title layer. See audio_editor.py.
-            keyboard.add_hotkey(hk.get('audio_editor', 'shift+f10'),
-                                lambda: self._q.put(('audio_editor', None)),    suppress=False)
-            keyboard.add_hotkey(hk.get('download_url', 'ctrl+alt+d'),
-                                self._hk_download_url,                          suppress=False)
+            # Use kbhook (our bulletproof LL hook) for all permanent
+            # hotkey registration. keyboard.add_hotkey()'s shared
+            # callback can silently die under load. See kbhook.py.
+            kbhook.add_hotkey(hk.get('refine',       'alt+shift+w'), self._hk_refine)
+            kbhook.add_hotkey(hk.get('library',      'alt+shift+e'), self._hk_library)
+            kbhook.add_hotkey(hk.get('undo_refine',  'alt+shift+z'), self._hk_undo_refine)
+            kbhook.add_hotkey(hk.get('macro_record', 'shift+f1'),
+                              lambda: self._q.put(('macro:hotkey', None)))
+            kbhook.add_hotkey(hk.get('recorder',     'shift+f2'),
+                              lambda: self._q.put(('recorder:toggle', None)))
+            kbhook.add_hotkey(hk.get('gif_record',   'shift+f3'),
+                              lambda: self._q.put(('gif:toggle',      None)))
+            kbhook.add_hotkey(hk.get('ask',          'shift+f4'),
+                              self._hk_ask)
+            kbhook.add_hotkey(hk.get('web',          'shift+f5'),
+                              lambda: self._q.put(('web', None)))
+            kbhook.add_hotkey(hk.get('chain',        'shift+f6'),
+                              self._hk_chain)
+            kbhook.add_hotkey(hk.get('notes',        'shift+f7'),
+                              lambda: self._q.put(('notes',      None)))
+            kbhook.add_hotkey(hk.get('whiteboard',   'shift+f8'),
+                              lambda: self._q.put(('whiteboard', None)))
+            kbhook.add_hotkey(hk.get('transcribe',   'shift+f9'),
+                              lambda: self._q.put(('transcribe', None)))
+            # Shift+F10, bundled audio editor (Tenacity).
+            kbhook.add_hotkey(hk.get('audio_editor', 'shift+f10'),
+                              lambda: self._q.put(('audio_editor', None)))
+            kbhook.add_hotkey(hk.get('download_url', 'ctrl+alt+d'),
+                              self._hk_download_url)
 
             if ptt:
                 # Push-to-talk reads the full whisper hotkey (e.g. ctrl+enter)
@@ -948,9 +962,9 @@ class App:
                 # a newline, but it interfered with games and other apps that
                 # legitimately use Ctrl+Enter. The newline cost in chat apps is
                 # acceptable; the game compatibility is not.
-                keyboard.add_hotkey(hk.get('whisper', 'ctrl+enter'), self._hk_whisper, suppress=False)
+                kbhook.add_hotkey(hk.get('whisper', 'ctrl+enter'), self._hk_whisper)
 
-            keyboard.add_hotkey('escape', self._hk_escape, suppress=False)
+            kbhook.add_hotkey('escape', self._hk_escape)
 
             # Per-prompt hotkeys (assigned via right-click → Assign hotkey…)
             for _idx, _p in enumerate(self.prompts):
@@ -962,7 +976,7 @@ class App:
                         self._q.put(('prompt_hotkey', idx))
                     return _handler
                 try:
-                    keyboard.add_hotkey(_hk, _make_ph_handler(), suppress=False)
+                    kbhook.add_hotkey(_hk, _make_ph_handler())
                     logger.info(f'Per-prompt hotkey: {_hk!r} → [{_idx}] {_p["title"]!r}')
                 except Exception as _e:
                     logger.warning(f'Per-prompt hotkey {_hk!r} failed: {_e}')
@@ -974,6 +988,7 @@ class App:
             logger.warning(f'Hotkey registration failed ({e}), retrying in 0.5 s')
             time.sleep(0.5)
             try:
+                kbhook.unhook_all()
                 keyboard.unhook_all()
                 mouse.unhook_all()
                 _do_register()
@@ -2401,7 +2416,7 @@ class App:
         """Re-register per-chain playback hotkeys (chains with a hotkey field set)."""
         for hk in self._chain_saved_hks:
             try:
-                keyboard.remove_hotkey(hk)
+                kbhook.remove_hotkey(hk)
             except Exception:
                 pass
         self._chain_saved_hks = []
@@ -2412,10 +2427,9 @@ class App:
                 continue
             cname = chain.get('name', 'Chain')
             try:
-                handle = keyboard.add_hotkey(
+                handle = kbhook.add_hotkey(
                     hk,
                     lambda c=chain: self._q.put(('chain_named', c)),
-                    suppress=False,
                 )
                 self._chain_saved_hks.append(handle)
                 logger.info(f'Chain hotkey registered: {hk!r} -> "{cname}"')
@@ -3693,6 +3707,52 @@ class App:
         self.whisper_overlay.show_transcribing()
         self._update_tray()
         logger.info('Whisper recording stopped, transcribing.')
+        # Watchdog: if neither result nor error arrives within the
+        # budget, force-clear the pill + state and surface a clear
+        # error to the user. Without this, ANY silent failure in the
+        # audio→transcriber chain leaves the "Transcribing…" pill
+        # frozen until the user reloads. Real transcriptions complete
+        # well under 30 s; we cancel any prior watchdog if a new
+        # recording starts inside the window.
+        try:
+            if self._transcribe_watchdog_id is not None:
+                self.root.after_cancel(self._transcribe_watchdog_id)
+        except Exception:
+            pass
+        self._transcribe_watchdog_id = self.root.after(
+            30_000, self._transcribe_watchdog_fire)
+
+    def _transcribe_watchdog_fire(self) -> None:
+        """30 s expired waiting for whisper:result / whisper:error.
+        Clear the stuck UI + state and let the next press succeed.
+        (The overlay's own 30 s auto-dismiss handles the visible pill;
+        this watchdog handles the BEHIND-THE-SCENES STATE — resetting
+        the recording flag, cancelling in-flight transcriber work, so
+        the next Ctrl+Enter doesn't run into the stale state.)"""
+        self._transcribe_watchdog_id = None
+        logger.warning(
+            'Transcribe watchdog: 30 s elapsed since recording stopped '
+            'with no result/error. Forcing whisper state reset.'
+        )
+        try:
+            self.whisper_overlay.show_whisper_error('Transcription stuck — try again')
+        except Exception:
+            pass
+        # Belt + braces: cancel any in-flight audio + transcriber state
+        # so the next Ctrl+Enter starts cleanly.
+        try:
+            self._audio.cancel_recording()
+        except Exception:
+            pass
+        try:
+            self._transcriber.cancel()
+        except Exception:
+            pass
+        self._whisper_recording = False
+        try:
+            self._update_tray()
+        except Exception:
+            pass
 
     def _whisper_cancel_recording(self) -> None:
         if not self._whisper_recording:
@@ -3744,6 +3804,13 @@ class App:
         self._q.put(('whisper:result', (text, language, duration_s)))
 
     def _on_whisper_result(self, payload) -> None:
+        # Result arrived → cancel the transcribe watchdog.
+        try:
+            if self._transcribe_watchdog_id is not None:
+                self.root.after_cancel(self._transcribe_watchdog_id)
+                self._transcribe_watchdog_id = None
+        except Exception:
+            pass
         text, language, duration_s = payload
         elapsed = time.time() - self._whisper_t0
 
@@ -4049,6 +4116,13 @@ class App:
             logger.warning(f'voice-to-notes persist failed: {exc}')
 
     def _on_whisper_error(self, msg: str) -> None:
+        # Error arrived → cancel the transcribe watchdog.
+        try:
+            if self._transcribe_watchdog_id is not None:
+                self.root.after_cancel(self._transcribe_watchdog_id)
+                self._transcribe_watchdog_id = None
+        except Exception:
+            pass
         self.whisper_overlay.show_whisper_error(msg)
         logger.error(f'Whisper error: {msg}')
 
@@ -4195,7 +4269,7 @@ class App:
         """Re-register all saved-macro playback hotkeys."""
         for hk in self._macro_saved_hks:
             try:
-                keyboard.remove_hotkey(hk)
+                kbhook.remove_hotkey(hk)
             except Exception:
                 pass
         self._macro_saved_hks = []
@@ -4206,10 +4280,9 @@ class App:
             mid  = meta['id']
             name = meta['name']
             try:
-                handle = keyboard.add_hotkey(
+                handle = kbhook.add_hotkey(
                     hk,
                     lambda m=meta: self._q.put(('macro:play_saved', m)),
-                    suppress=False,
                 )
                 self._macro_saved_hks.append(handle)
                 logger.info(f'Macro hotkey registered: {hk!r} -> "{name}"')
@@ -4250,13 +4323,13 @@ class App:
         # Esc is handled by the permanent _hk_escape (which checks macro state),
         # so we only add Delete here to avoid a double-Esc handler.
         self._macro_stop_hks = [
-            keyboard.add_hotkey('delete', lambda: self._q.put(('macro:stop', None)), suppress=False),
+            kbhook.add_hotkey('delete', lambda: self._q.put(('macro:stop', None))),
         ]
 
     def _macro_unregister_stop_keys(self) -> None:
         for hk in self._macro_stop_hks:
             try:
-                keyboard.remove_hotkey(hk)
+                kbhook.remove_hotkey(hk)
             except Exception:
                 pass
         self._macro_stop_hks = []
@@ -4938,6 +5011,10 @@ class App:
                 except Exception:
                     pass
                 _singleton_sock.close()
+        except Exception:
+            pass
+        try:
+            kbhook.stop()
         except Exception:
             pass
         keyboard.unhook_all()
