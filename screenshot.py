@@ -1206,12 +1206,14 @@ class ScreenshotOverlay:
         img  = self._shot.crop((x1, y1, x2, y2)).copy()
         draw = ImageDraw.Draw(img, 'RGBA')
 
-        # Marker strokes get composited via multiply blend at the end so
-        # they behave like a real highlighter (yellow over white text =
-        # yellow; yellow over black text = black, not muddy olive). Paint
-        # them onto a pure-white RGB layer first; ImageChops.multiply at
-        # the end blends it with the base in one shot.
-        marker_layer = None  # lazy-allocate (most screenshots have no marker)
+        # Marker strokes are accumulated on a separate near-white layer
+        # and multiplied with the base at the end. Multiply keeps black
+        # text fully black (black * anything = black) which is what
+        # Lightshot does — a real highlighter never colours the ink it
+        # crosses over. _MARKER_STRENGTH controls how strongly the
+        # background is tinted; the rest stays white so non-marker
+        # pixels pass through unchanged.
+        marker_layer = None
 
         for ann in self._ann_data:
             tool  = ann['tool']
@@ -1248,15 +1250,11 @@ class ScreenshotOverlay:
                 if len(pts) >= 2:
                     rpts = [(px - x1, py - y1) for px, py in pts]
                     if marker_layer is None:
-                        # Pure white so non-marker pixels are an identity
-                        # under multiply (white * pixel = pixel).
                         marker_layer = Image.new('RGB', img.size,
                                                  (255, 255, 255))
                     mdraw = ImageDraw.Draw(marker_layer)
-                    # Solid full color on the layer; multiply takes care
-                    # of the "translucent over text" appearance. Flat
-                    # ('projecting' equiv) caps to look chisel-tip.
-                    mdraw.line(rpts, fill=color, width=16, joint='curve')
+                    mdraw.line(rpts, fill=self._marker_tint_rgb(color),
+                               width=16, joint='curve')
 
             elif tool == 'text':
                 ax1, ay1 = ann['coords'][:2]
@@ -1271,9 +1269,6 @@ class ScreenshotOverlay:
 
         out = img.convert('RGB')
         if marker_layer is not None:
-            # Highlighter blend: base * marker_layer / 255 per channel.
-            # White areas of the layer leave the base untouched; colored
-            # strokes tint underlying pixels without lifting black text.
             from PIL import ImageChops
             out = ImageChops.multiply(out, marker_layer)
         return out
@@ -1283,17 +1278,32 @@ class ScreenshotOverlay:
         h = hex_color.lstrip('#')
         return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
 
+    # Marker translucency for the multiply-blend layer. 0.0 leaves the
+    # background untouched, 1.0 paints full colour (electric yellow).
+    # Lightshot's actual marker measures ~0.18-0.22 — a faint paper
+    # highlighter wash. Multiply preserves black text fully (black ×
+    # anything = black) so highlighted text remains crisp.
+    _MARKER_STRENGTH = 0.20
+
+    @classmethod
+    def _marker_tint_rgb(cls, hex_color: str) -> tuple[int, int, int]:
+        """RGB tuple to paint onto the multiply layer. Shifts `hex_color`
+        toward white by (1 - _MARKER_STRENGTH); white areas of the layer
+        leave the base untouched, and the tinted stroke gently colours
+        whatever's underneath without dimming text."""
+        r, g, b = cls._hex_to_rgb(hex_color)
+        s = cls._MARKER_STRENGTH
+        return (int(255 - (255 - r) * s),
+                int(255 - (255 - g) * s),
+                int(255 - (255 - b) * s))
+
     @classmethod
     def _lighten_for_preview(cls, hex_color: str) -> str:
-        """Mix `hex_color` 50/50 with white. Used for Tk canvas live
-        preview of the marker tool, since canvases don't support
-        per-item alpha. The simulated 'over white' tint matches what the
-        user will see when the marker lands on a light background and
-        roughly matches the multiply blend on darker backgrounds."""
-        r, g, b = cls._hex_to_rgb(hex_color)
-        r = (r + 255) // 2
-        g = (g + 255) // 2
-        b = (b + 255) // 2
+        """Hex string of the same tint used in the final render, for
+        the Tk canvas live preview. Tk has no per-item alpha so we
+        pre-mix toward white using the same strength as the multiply
+        layer — WYSIWYG over light backgrounds."""
+        r, g, b = cls._marker_tint_rgb(hex_color)
         return f'#{r:02x}{g:02x}{b:02x}'
 
     # ─────────────────────────────────────────────────────────────────────────
