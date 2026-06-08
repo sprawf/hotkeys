@@ -254,6 +254,7 @@ must walk it top to bottom whenever a new feature lands.
 | New in-flight network call / AI generation | Bump a generation counter (see `_refine_gen` pattern) so pending callbacks become no-ops |
 | New keyboard binding | Default in `DEFAULT_CONFIG['hotkeys']` so `_register_hotkeys` picks it up (already handled by existing path) |
 | New auto-restart timer (`after()`) | Cancel any pending `after_cancel()` so we don't get a ghost callback after reset |
+| New runtime flag that *gates* hotkey behavior (e.g. `kbhook._paused`) | Force back to the documented default state. Panic button must land the user in "hotkeys live", not "hotkeys silently disabled". |
 
 ### Self-check before declaring "stop coverage" done
 

@@ -181,6 +181,13 @@ _hook_ref = [None]   # mutable container shared with the listener thread
 _listener_thread = None
 _worker_thread   = None
 
+# When True, the hook becomes a pure pass-through: it does NOT update the
+# modifier mask, does NOT look up the hotkey table, does NOT suppress.
+# Toggled from the tray menu so a user can temporarily reclaim conflicting
+# F-keys / Ctrl+combos for the foreground app (Chrome devtools, IDEs, etc.)
+# without having to quit and relaunch us.
+_paused = False
+
 
 # ── Hook procedure (runs on listener thread, must return FAST) ───────────────
 
@@ -188,6 +195,13 @@ def _hook_proc(nCode, wParam, lParam):
     global _modifier_mask
     if nCode < 0:
         return _user32.CallNextHookEx(_hook_ref[0], nCode, wParam, lParam)
+    # When paused, every key flows straight through — no mask updates,
+    # no table lookup, no suppression. The hook stays installed so
+    # resume is instant. Modifier mask is reset on pause/resume edges
+    # in set_paused() to avoid a stuck-modifier on toggle.
+    if _paused:
+        return _user32.CallNextHookEx(_hook_ref[0], nCode, wParam, lParam)
+    matched = False  # if True, suppress the key (don't pass to foreground app)
     try:
         kb = ctypes.cast(lParam, ctypes.POINTER(_KBDLLHOOKSTRUCT)).contents
         vk = kb.vkCode
@@ -209,19 +223,32 @@ def _hook_proc(nCode, wParam, lParam):
                             cb = entry[1]
                             try:
                                 _dispatch_q.put_nowait(cb)
+                                matched = True
                             except queue.Full:
                                 # Dispatch queue full means the worker
                                 # is stuck. Don't block the hook;
                                 # the watchdog (if any) will recover.
-                                pass
+                                # Still mark as matched so we suppress —
+                                # better to swallow one keystroke than
+                                # let the foreground app fire its action.
+                                matched = True
         elif wParam in (_WM_KEYUP, _WM_SYSKEYUP):
             mod_bit = _VK_TO_MOD.get(vk)
             if mod_bit is not None:
                 _modifier_mask &= ~mod_bit
+            # Key releases ALWAYS pass through (never suppress), so the
+            # foreground app's key-state tracking stays consistent even
+            # if we swallowed the matching key-down.
     except Exception:
         # The hook MUST return — never let a Python exception propagate
         # into the Win32 callback path.
         pass
+    if matched:
+        # Returning non-zero tells Windows "we handled this; don't pass
+        # it to the next hook or the foreground window." This is what
+        # makes our F1/F12/Ctrl+Enter/etc. NOT also trigger Chrome's,
+        # Blender's, AutoCAD's same-combo shortcut.
+        return 1
     return _user32.CallNextHookEx(_hook_ref[0], nCode, wParam, lParam)
 
 
@@ -309,6 +336,26 @@ def unhook_all() -> None:
     with _state_lock:
         _hotkeys.clear()
         _handles.clear()
+
+
+def set_paused(paused: bool) -> None:
+    """When `paused` is True, the hook stops matching/suppressing entirely
+    — every key flows to the foreground app unchanged. Use this so the
+    user can temporarily reclaim F-keys / Ctrl+combos for Chrome devtools
+    or other apps without having to restart Hotkeys.
+
+    Resets the modifier-mask cache on every toggle, otherwise a key
+    pressed *during* the pause window would be invisible to us and leave
+    the cached mask out-of-sync with the real keyboard state after resume.
+    """
+    global _paused, _modifier_mask
+    _paused = bool(paused)
+    _modifier_mask = 0
+    logger.info(f'kbhook: paused={_paused}')
+
+
+def is_paused() -> bool:
+    return _paused
 
 
 def stop() -> None:

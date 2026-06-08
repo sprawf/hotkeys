@@ -744,6 +744,7 @@ class App:
             'whisper:cancel':   lambda _: self._whisper_cancel_recording(),
             'restore_all_defaults': lambda _: self._do_restore_all_defaults(),
             'reload_hotkeys':   lambda _: self._reload_hotkeys_manual(),
+            'toggle_pause_hotkeys': lambda _: self._toggle_pause_hotkeys(),
             'prompt_hotkey':    self._on_prompt_hotkey,
             'whisper:status':   self._on_transcriber_status_event,
             'whisper:result':   self._on_whisper_result,
@@ -1300,9 +1301,47 @@ class App:
         except Exception:
             pass
 
+    def _toggle_pause_hotkeys(self) -> None:
+        """Flip kbhook between matching/suppressing and pure pass-through.
+        Lets the user reclaim conflicting F-keys / Ctrl+combos for the
+        foreground app (Chrome devtools, Blender, AutoCAD) without
+        quitting Hotkeys. Auto-rebuilds tray menu + tooltip + toast pill."""
+        try:
+            now_paused = not kbhook.is_paused()
+            kbhook.set_paused(now_paused)
+            logger.info(f'Hotkeys {"paused" if now_paused else "resumed"} via tray.')
+        except Exception as e:
+            logger.warning(f'Pause toggle failed: {e}')
+            return
+        try:
+            self._update_tray()
+        except Exception:
+            pass
+        try:
+            if now_paused:
+                self._notify('Hotkeys paused',
+                             'F-keys + combos now flow to the foreground app. '
+                             'Click tray ▶ to resume.')
+            else:
+                self._notify('Hotkeys resumed',
+                             'Your hotkeys are live again.')
+        except Exception:
+            pass
+
     def _reload_hotkeys_manual(self) -> None:
         """Full reset from tray menu, cancels anything stuck, re-registers hotkeys."""
         logger.info('Manual reload requested from tray.')
+
+        # ── 0. Force-resume hotkey listener ───────────────────────────────────────
+        # Tray coverage rule: panic button must land the user in a
+        # known-working state. If they hit "Stop everything" while
+        # paused, they almost certainly want hotkeys live again.
+        try:
+            if kbhook.is_paused():
+                kbhook.set_paused(False)
+                logger.info('Reload: kbhook was paused, force-resumed.')
+        except Exception:
+            pass
 
         # ── 1. Reload config from disk so hotkeys reflect the latest saved values ──
         try:
@@ -3633,6 +3672,16 @@ class App:
         except Exception:
             pass
 
+        # Tray-coverage rule: any state hotkeys depend on must be reset
+        # by Reset-everything. Force-resume kbhook so the user lands in
+        # the documented default (hotkeys live).
+        try:
+            if kbhook.is_paused():
+                kbhook.set_paused(False)
+                logger.info('Reset: kbhook was paused, force-resumed.')
+        except Exception:
+            pass
+
         self._update_tray()
         self._notify('Everything reset ✓',
                      'Templates, workflows, shortcuts, bookmarks, windows, '
@@ -4660,7 +4709,10 @@ class App:
                   'transcribe', 'audio_editor',
                   # Destructive actions still go through the confirm dialog
                   # before they touch state, safe to expose for scripting.
-                  'restore_all_defaults', 'reload_hotkeys'}
+                  'restore_all_defaults', 'reload_hotkeys',
+                  # Pause/resume hotkeys — non-destructive toggle, useful
+                  # for scripts and testing.
+                  'toggle_pause_hotkeys'}
         # 'whisper' is a toggle that already handles start/stop based on
         # state, route it through _hk_whisper instead of a queued event.
         _DIRECT_CALL = {'whisper': lambda: self._hk_whisper()}
@@ -4896,6 +4948,18 @@ class App:
         # Layperson-friendly labels, "Stop everything" is the panic button,
         # findable when something feels stuck. "Reset everything" is the
         # factory-reset, intentionally further down the menu.
+        # Pause/Resume hotkeys — lets the user reclaim conflicting F-keys
+        # for Chrome devtools, Blender, AutoCAD, etc. without quitting us.
+        # When paused, kbhook becomes a pure pass-through (no match, no
+        # suppress); resume re-enables matching instantly.
+        _paused = kbhook.is_paused()
+        pause_label = ('▶  Resume hotkeys' if _paused
+                       else '⏸  Pause hotkeys')
+        pause_items = [
+            pystray.MenuItem(pause_label,
+                             lambda: self._q.put(('toggle_pause_hotkeys', None))),
+        ]
+
         reset_items = [
             pystray.MenuItem('🛑  Stop everything & reload hotkeys',
                              lambda: self._q.put(('reload_hotkeys', None))),
@@ -4916,6 +4980,7 @@ class App:
             pystray.Menu.SEPARATOR,
             *app_items,
             pystray.Menu.SEPARATOR,
+            *pause_items,
             *reset_items,
             pystray.Menu.SEPARATOR,
             pystray.MenuItem('Quit Hotkeys', self._quit),
@@ -4944,7 +5009,14 @@ class App:
         active  = self.config.get('active_provider', 'cerebras')
         r_state = 'Ready' if self.provider.ready else 'Loading…'
         w_state = '🔴 Recording' if self._whisper_recording else 'Idle'
-        return f'Hotkeys  ·  {active.title()}  ·  {r_state}  ·  Whisper: {w_state}'
+        paused = ''
+        try:
+            if kbhook.is_paused():
+                paused = '  ·  ⏸ Paused'
+        except Exception:
+            pass
+        return (f'Hotkeys  ·  {active.title()}  ·  {r_state}  '
+                f'·  Whisper: {w_state}{paused}')
 
     def _update_tray(self) -> None:
         try:
