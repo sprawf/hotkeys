@@ -1085,19 +1085,29 @@ class ScreenshotOverlay:
 
         if self._tool == 'marker':
             # Freehand highlighter, accumulates points exactly like pen.
-            # Tk canvas has no per-item alpha, so simulate the translucent
-            # look by drawing in a pre-lightened version of `clr` (color
-            # mixed 50/50 with white). Avoids the dithered halftone you
-            # get from stipple, matches Lightshot's smooth live preview.
+            #
+            # Live preview translucency is genuinely hard on Tk: canvas
+            # items have NO per-item alpha. The only mechanism that lets
+            # the underlying screenshot (and its text) show through the
+            # stroke is `stipple` — Tk draws a dot pattern instead of a
+            # solid fill, and the canvas background pokes through the
+            # gaps. Without stipple, the marker is opaque and the
+            # text being highlighted disappears under the stroke until
+            # the user releases and we render the multiply blend.
+            #
+            # gray25 + full colour gives ~25% dot coverage: a clearly
+            # yellow stroke whose underlying text is still readable
+            # while drawing. Final saved PNG uses the multiply blend
+            # (see _render) which is smooth, not stippled — the dot
+            # pattern is a draw-time-only artifact.
             self._pen_pts.append((ex, ey))
             if self._draw_live:
                 c.delete(self._draw_live)
             if len(self._pen_pts) >= 2:
                 self._draw_live = c.create_line(
-                    self._pen_pts, fill=self._lighten_for_preview(clr),
-                    width=16, smooth=True,
+                    self._pen_pts, fill=clr, width=16, smooth=True,
                     capstyle='projecting', joinstyle='round',
-                    tags=('annotation',))
+                    stipple='gray25', tags=('annotation',))
             return
 
         if self._draw_live:
@@ -1280,10 +1290,11 @@ class ScreenshotOverlay:
 
     # Marker translucency for the multiply-blend layer. 0.0 leaves the
     # background untouched, 1.0 paints full colour (electric yellow).
-    # Lightshot's actual marker measures ~0.18-0.22 — a faint paper
-    # highlighter wash. Multiply preserves black text fully (black ×
-    # anything = black) so highlighted text remains crisp.
-    _MARKER_STRENGTH = 0.20
+    # Pixel-matched against Lightshot screenshots: their marker reads
+    # as ~0.10-0.13 — almost an off-white wash. Multiply preserves
+    # black text fully (black × anything = black) so the underlying
+    # text stays crisp on light backgrounds.
+    _MARKER_STRENGTH = 0.12
 
     @classmethod
     def _marker_tint_rgb(cls, hex_color: str) -> tuple[int, int, int]:
