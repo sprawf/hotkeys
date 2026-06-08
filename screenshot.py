@@ -317,6 +317,8 @@ class ScreenshotOverlay:
 
         # Canvas item ids
         self._sel_photo   = None
+        self._sel_image_canvas_id = None  # id of the sel canvas image
+        self._sel_crop    = None  # PIL of the selection region (cache)
         self._dim_photo   = None
 
         # Bounding boxes for toolbar / action-bar (set during _redraw)
@@ -495,9 +497,16 @@ class ScreenshotOverlay:
         x1, y1, x2, y2 = s
 
         # ── Bright crop (undimmed area inside selection) ──────────────────
+        # We cache the canvas image id so the marker tool can swap in a
+        # multiply-blended preview on the fly. That keeps the live
+        # drawing visually identical to the saved render — same PIL
+        # multiply driving both, instead of Tk-canvas-line for live and
+        # PIL-multiply for save (which never matched).
         crop = self._shot.crop((x1, y1, x2, y2))
+        self._sel_crop = crop  # base for multiply previews
         self._sel_photo = ImageTk.PhotoImage(crop, master=c)
-        c.create_image(x1, y1, anchor='nw', image=self._sel_photo, tags=('sel',))
+        self._sel_image_canvas_id = c.create_image(
+            x1, y1, anchor='nw', image=self._sel_photo, tags=('sel',))
 
         # ── Dashed white border ───────────────────────────────────────────
         c.create_rectangle(x1, y1, x2, y2,
@@ -937,6 +946,10 @@ class ScreenshotOverlay:
         self._canvas.delete('annotation')
         self._annotations.clear()
         self._ann_data.clear()
+        # _sel_crop will be re-cached by the next _draw_sel; until then
+        # the marker preview has no underlying base to multiply against.
+        self._sel_crop = None
+        self._sel_image_canvas_id = None
         self._redraw()
 
     def _on_ldrag(self, event) -> None:
@@ -1084,30 +1097,15 @@ class ScreenshotOverlay:
             return
 
         if self._tool == 'marker':
-            # Freehand highlighter, accumulates points exactly like pen.
-            #
-            # Live preview translucency is genuinely hard on Tk: canvas
-            # items have NO per-item alpha. The only mechanism that lets
-            # the underlying screenshot (and its text) show through the
-            # stroke is `stipple` — Tk draws a dot pattern instead of a
-            # solid fill, and the canvas background pokes through the
-            # gaps. Without stipple, the marker is opaque and the
-            # text being highlighted disappears under the stroke until
-            # the user releases and we render the multiply blend.
-            #
-            # gray25 + full colour gives ~25% dot coverage: a clearly
-            # yellow stroke whose underlying text is still readable
-            # while drawing. Final saved PNG uses the multiply blend
-            # (see _render) which is smooth, not stippled — the dot
-            # pattern is a draw-time-only artifact.
+            # Live preview goes through the SAME PIL multiply pipeline
+            # as the final save — no Tk canvas line involved. We paint
+            # the marker layer (white + tinted strokes), multiply it
+            # with the sel crop, swap the result into the sel canvas
+            # image. Result: dragging the marker over text shows the
+            # text crisp under a soft yellow band, identical to the
+            # final saved PNG, with no halftone dottedness.
             self._pen_pts.append((ex, ey))
-            if self._draw_live:
-                c.delete(self._draw_live)
-            if len(self._pen_pts) >= 2:
-                self._draw_live = c.create_line(
-                    self._pen_pts, fill=clr, width=16, smooth=True,
-                    capstyle='projecting', joinstyle='round',
-                    stipple='gray25', tags=('annotation',))
+            self._refresh_marker_preview()
             return
 
         if self._draw_live:
@@ -1143,7 +1141,23 @@ class ScreenshotOverlay:
             self._show_text_popup(sx, sy)
             return
 
-        if self._tool in ('pen', 'marker'):
+        if self._tool == 'marker':
+            # No canvas line for markers — the multiply preview already
+            # painted into self._sel_photo. Just record the stroke.
+            # _annotations uses a sentinel so undo can route to "remove
+            # last marker ann_data + refresh preview" while still
+            # popping in stroke order.
+            if len(self._pen_pts) >= 2:
+                self._annotations.append('marker_sentinel')
+                self._ann_data.append({
+                    'tool': 'marker', 'color': clr,
+                    'points': list(self._pen_pts),
+                })
+            self._draw_live = None
+            self._pen_pts   = []
+            return
+
+        if self._tool == 'pen':
             if self._draw_live and len(self._pen_pts) >= 2:
                 self._annotations.append(self._draw_live)
                 self._ann_data.append({
@@ -1199,10 +1213,64 @@ class ScreenshotOverlay:
         entry.bind('<Escape>', lambda e: popup.destroy())
 
     def _undo(self) -> None:
-        if self._annotations:
-            self._canvas.delete(self._annotations.pop())
-            if self._ann_data:
-                self._ann_data.pop()
+        if not self._annotations:
+            return
+        last = self._annotations.pop()
+        if self._ann_data:
+            self._ann_data.pop()
+        if last == 'marker_sentinel':
+            # Marker isn't a canvas item — it lives in the multiply
+            # preview. Refresh that preview so the popped stroke
+            # vanishes from the sel image.
+            self._refresh_marker_preview()
+        else:
+            try:
+                self._canvas.delete(last)
+            except Exception:
+                pass
+
+    def _refresh_marker_preview(self) -> None:
+        """Rebuild the sel canvas image from scratch: base × all
+        committed marker strokes × current in-progress stroke. One
+        PIL multiply pipeline drives BOTH the live drawing experience
+        and the final saved render — same yellow, every time.
+
+        Cheap to call on every motion event: PIL multiply is implemented
+        in C and runs in ~5ms on a typical 1000x500 selection.
+        """
+        from PIL import ImageChops
+        if self._sel_image_canvas_id is None or self._sel_crop is None:
+            return
+        s = self._sel()
+        if not s:
+            return
+        x1, y1, x2, y2 = s
+        w, h = x2 - x1, y2 - y1
+
+        # Build the marker layer from canonical truth: every marker
+        # entry in _ann_data plus the in-flight stroke.
+        layer = Image.new('RGB', (w, h), (255, 255, 255))
+        ld = ImageDraw.Draw(layer)
+        for ann in self._ann_data:
+            if ann.get('tool') == 'marker':
+                pts = ann.get('points', [])
+                if len(pts) >= 2:
+                    rpts = [(px - x1, py - y1) for px, py in pts]
+                    ld.line(rpts, fill=self._marker_tint_rgb(ann['color']),
+                            width=16, joint='curve')
+        # In-progress stroke (during drag, before commit)
+        if self._tool == 'marker' and len(self._pen_pts) >= 2:
+            rpts = [(px - x1, py - y1) for px, py in self._pen_pts]
+            ld.line(rpts, fill=self._marker_tint_rgb(self._color),
+                    width=16, joint='curve')
+
+        composed = ImageChops.multiply(self._sel_crop, layer)
+        self._sel_photo = ImageTk.PhotoImage(composed, master=self._canvas)
+        try:
+            self._canvas.itemconfigure(self._sel_image_canvas_id,
+                                       image=self._sel_photo)
+        except Exception:
+            pass
 
     # ─────────────────────────────────────────────────────────────────────────
     # Render final image (screenshot + annotations flattened)
@@ -1294,7 +1362,7 @@ class ScreenshotOverlay:
     # as ~0.10-0.13 — almost an off-white wash. Multiply preserves
     # black text fully (black × anything = black) so the underlying
     # text stays crisp on light backgrounds.
-    _MARKER_STRENGTH = 0.12
+    _MARKER_STRENGTH = 0.20
 
     @classmethod
     def _marker_tint_rgb(cls, hex_color: str) -> tuple[int, int, int]:
