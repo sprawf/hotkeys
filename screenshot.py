@@ -304,7 +304,7 @@ class ScreenshotOverlay:
             'line':   '#ff0000',
             'arrow':  '#ff0000',
             'rect':   '#ff0000',
-            'marker': '#ffff00',
+            'marker': '#fff200',
             'text':   '#000000',
         }
         self._color = self._tool_colors[self._tool]
@@ -1084,15 +1084,20 @@ class ScreenshotOverlay:
             return
 
         if self._tool == 'marker':
-            # Freehand highlighter, accumulates points exactly like pen
+            # Freehand highlighter, accumulates points exactly like pen.
+            # Tk canvas has no per-item alpha, so simulate the translucent
+            # look by drawing in a pre-lightened version of `clr` (color
+            # mixed 50/50 with white). Avoids the dithered halftone you
+            # get from stipple, matches Lightshot's smooth live preview.
             self._pen_pts.append((ex, ey))
             if self._draw_live:
                 c.delete(self._draw_live)
             if len(self._pen_pts) >= 2:
                 self._draw_live = c.create_line(
-                    self._pen_pts, fill=clr, width=16,
-                    smooth=True, capstyle='round', joinstyle='round',
-                    stipple='gray50', tags=('annotation',))
+                    self._pen_pts, fill=self._lighten_for_preview(clr),
+                    width=16, smooth=True,
+                    capstyle='projecting', joinstyle='round',
+                    tags=('annotation',))
             return
 
         if self._draw_live:
@@ -1201,6 +1206,13 @@ class ScreenshotOverlay:
         img  = self._shot.crop((x1, y1, x2, y2)).copy()
         draw = ImageDraw.Draw(img, 'RGBA')
 
+        # Marker strokes get composited via multiply blend at the end so
+        # they behave like a real highlighter (yellow over white text =
+        # yellow; yellow over black text = black, not muddy olive). Paint
+        # them onto a pure-white RGB layer first; ImageChops.multiply at
+        # the end blends it with the base in one shot.
+        marker_layer = None  # lazy-allocate (most screenshots have no marker)
+
         for ann in self._ann_data:
             tool  = ann['tool']
             color = ann['color']
@@ -1235,9 +1247,16 @@ class ScreenshotOverlay:
                 pts = ann.get('points', [])
                 if len(pts) >= 2:
                     rpts = [(px - x1, py - y1) for px, py in pts]
-                    # Semi-transparent highlighter: 50% alpha, 16px wide
-                    rgba = (*self._hex_to_rgb(color), 128)
-                    draw.line(rpts, fill=rgba, width=16, joint='curve')
+                    if marker_layer is None:
+                        # Pure white so non-marker pixels are an identity
+                        # under multiply (white * pixel = pixel).
+                        marker_layer = Image.new('RGB', img.size,
+                                                 (255, 255, 255))
+                    mdraw = ImageDraw.Draw(marker_layer)
+                    # Solid full color on the layer; multiply takes care
+                    # of the "translucent over text" appearance. Flat
+                    # ('projecting' equiv) caps to look chisel-tip.
+                    mdraw.line(rpts, fill=color, width=16, joint='curve')
 
             elif tool == 'text':
                 ax1, ay1 = ann['coords'][:2]
@@ -1250,12 +1269,32 @@ class ScreenshotOverlay:
                 draw.text((ax1 - x1, ay1 - y1), ann.get('text', ''),
                           fill=color, font=font)
 
-        return img.convert('RGB')
+        out = img.convert('RGB')
+        if marker_layer is not None:
+            # Highlighter blend: base * marker_layer / 255 per channel.
+            # White areas of the layer leave the base untouched; colored
+            # strokes tint underlying pixels without lifting black text.
+            from PIL import ImageChops
+            out = ImageChops.multiply(out, marker_layer)
+        return out
 
     @staticmethod
     def _hex_to_rgb(hex_color: str):
         h = hex_color.lstrip('#')
         return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+
+    @classmethod
+    def _lighten_for_preview(cls, hex_color: str) -> str:
+        """Mix `hex_color` 50/50 with white. Used for Tk canvas live
+        preview of the marker tool, since canvases don't support
+        per-item alpha. The simulated 'over white' tint matches what the
+        user will see when the marker lands on a light background and
+        roughly matches the multiply blend on darker backgrounds."""
+        r, g, b = cls._hex_to_rgb(hex_color)
+        r = (r + 255) // 2
+        g = (g + 255) // 2
+        b = (b + 255) // 2
+        return f'#{r:02x}{g:02x}{b:02x}'
 
     # ─────────────────────────────────────────────────────────────────────────
     # Actions
