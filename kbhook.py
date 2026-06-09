@@ -102,6 +102,14 @@ _MOD_ALT   = 0x02
 _MOD_SHIFT = 0x04
 _MOD_WIN   = 0x08
 
+# vkCodes whose matching combos still fire our callback BUT are NEVER
+# suppressed — the keystroke is always allowed to reach the foreground
+# app too. Reserved for keys that have universal cross-app meaning we
+# must not steal. Escape closes dialogs / cancels in every app on the
+# planet; eating it would mean opening any window after a Hotkeys
+# Escape-bound action would leave the user unable to close it.
+_PASSTHROUGH_KEYS = {0x1B}  # VK_ESCAPE
+
 # vkCode → bit in the modifier mask. Both L and R variants count.
 _VK_TO_MOD = {
     0x11: _MOD_CTRL,  0xA2: _MOD_CTRL,  0xA3: _MOD_CTRL,  # CONTROL / L / R
@@ -181,12 +189,18 @@ _hook_ref = [None]   # mutable container shared with the listener thread
 _listener_thread = None
 _worker_thread   = None
 
-# When True, the hook becomes a pure pass-through: it does NOT update the
-# modifier mask, does NOT look up the hotkey table, does NOT suppress.
+# When True, the hook stops matching/suppressing/dispatching, but still
+# tracks the modifier mask so it can recognise "a registered hotkey was
+# pressed while paused" and tell the app to show a reminder toast.
 # Toggled from the tray menu so a user can temporarily reclaim conflicting
 # F-keys / Ctrl+combos for the foreground app (Chrome devtools, IDEs, etc.)
 # without having to quit and relaunch us.
 _paused = False
+
+# Optional callback invoked when a registered hotkey matches WHILE paused.
+# Set from main.py to show a throttled toast nudging the user to click
+# "Resume hotkeys" in the tray. Receives no args.
+_on_paused_match: Callable[[], None] | None = None
 
 
 # ── Hook procedure (runs on listener thread, must return FAST) ───────────────
@@ -194,12 +208,6 @@ _paused = False
 def _hook_proc(nCode, wParam, lParam):
     global _modifier_mask
     if nCode < 0:
-        return _user32.CallNextHookEx(_hook_ref[0], nCode, wParam, lParam)
-    # When paused, every key flows straight through — no mask updates,
-    # no table lookup, no suppression. The hook stays installed so
-    # resume is instant. Modifier mask is reset on pause/resume edges
-    # in set_paused() to avoid a stuck-modifier on toggle.
-    if _paused:
         return _user32.CallNextHookEx(_hook_ref[0], nCode, wParam, lParam)
     matched = False  # if True, suppress the key (don't pass to foreground app)
     try:
@@ -214,24 +222,48 @@ def _hook_proc(nCode, wParam, lParam):
                 key = (_modifier_mask, vk)
                 handles = _hotkeys.get(key)
                 if handles:
-                    # Snapshot the list (we hold no lock here; mutations
-                    # via add/remove are atomic dict operations and we
-                    # can tolerate a brief stale read).
-                    for h in tuple(handles):
-                        entry = _handles.get(h)
-                        if entry is not None:
-                            cb = entry[1]
+                    if _paused:
+                        # Pressed a registered combo while paused. Don't
+                        # dispatch and don't suppress — let the key flow
+                        # through. But ping the optional UX callback so
+                        # main.py can show a throttled "hotkeys are
+                        # paused" toast / pill. Without this, paused
+                        # hotkeys are silently dead and the user can't
+                        # tell whether they typed wrong or we're broken.
+                        if _on_paused_match is not None:
                             try:
-                                _dispatch_q.put_nowait(cb)
-                                matched = True
+                                _dispatch_q.put_nowait(_on_paused_match)
                             except queue.Full:
-                                # Dispatch queue full means the worker
-                                # is stuck. Don't block the hook;
-                                # the watchdog (if any) will recover.
-                                # Still mark as matched so we suppress —
-                                # better to swallow one keystroke than
-                                # let the foreground app fire its action.
-                                matched = True
+                                pass
+                    else:
+                        # Snapshot the list (we hold no lock here;
+                        # mutations via add/remove are atomic dict
+                        # operations and we can tolerate a brief stale
+                        # read).
+                        # Keys in _PASSTHROUGH_KEYS still fire the
+                        # callback but never get suppressed — Escape
+                        # is the canonical case: every other app on
+                        # the system uses it to close their own UI.
+                        suppress_this = vk not in _PASSTHROUGH_KEYS
+                        for h in tuple(handles):
+                            entry = _handles.get(h)
+                            if entry is not None:
+                                cb = entry[1]
+                                try:
+                                    _dispatch_q.put_nowait(cb)
+                                    if suppress_this:
+                                        matched = True
+                                except queue.Full:
+                                    # Dispatch queue full means the
+                                    # worker is stuck. Don't block the
+                                    # hook; the watchdog (if any) will
+                                    # recover. Still mark as matched
+                                    # so we suppress — better to
+                                    # swallow one keystroke than let
+                                    # the foreground app fire its
+                                    # action.
+                                    if suppress_this:
+                                        matched = True
         elif wParam in (_WM_KEYUP, _WM_SYSKEYUP):
             mod_bit = _VK_TO_MOD.get(vk)
             if mod_bit is not None:
@@ -339,14 +371,16 @@ def unhook_all() -> None:
 
 
 def set_paused(paused: bool) -> None:
-    """When `paused` is True, the hook stops matching/suppressing entirely
-    — every key flows to the foreground app unchanged. Use this so the
-    user can temporarily reclaim F-keys / Ctrl+combos for Chrome devtools
-    or other apps without having to restart Hotkeys.
+    """When `paused` is True, the hook stops dispatching callbacks and
+    suppressing keys, so every keystroke flows to the foreground app
+    unchanged. The hook still tracks the modifier mask + recognises
+    registered combos — that's how we know to ping `on_paused_match`
+    when a user presses a hotkey while paused, so the app can show
+    them a reminder instead of just silently swallowing it.
 
     Resets the modifier-mask cache on every toggle, otherwise a key
-    pressed *during* the pause window would be invisible to us and leave
-    the cached mask out-of-sync with the real keyboard state after resume.
+    pressed *during* the resume edge would leave the cached mask
+    out-of-sync with the real keyboard state.
     """
     global _paused, _modifier_mask
     _paused = bool(paused)
@@ -356,6 +390,16 @@ def set_paused(paused: bool) -> None:
 
 def is_paused() -> bool:
     return _paused
+
+
+def set_on_paused_match(cb: Callable[[], None] | None) -> None:
+    """Register a callback invoked (via the worker thread) every time a
+    registered hotkey combo is pressed while paused. Use this to surface
+    a throttled toast so the user understands why their hotkey did
+    nothing. Pass None to clear. The callback should be cheap and
+    thread-safe; ours just enqueues a Tk after() call."""
+    global _on_paused_match
+    _on_paused_match = cb
 
 
 def stop() -> None:

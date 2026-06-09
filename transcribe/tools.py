@@ -74,6 +74,10 @@ def _run_ffmpeg(args: list[str],
     log = lambda m: (on_log and on_log(m)) or logger.debug(m)
     cmd = [_ffmpeg_path(), '-hide_banner', '-y', '-nostdin', '-loglevel', 'info',
            *args]
+    # Log the full command at INFO level so post-mortem on a failed
+    # ffmpeg run can see exactly what was invoked, without needing
+    # DEBUG-level logging enabled.
+    logger.info('ffmpeg cmd: ' + ' '.join(cmd[1:]))
     log('ffmpeg: ' + ' '.join(cmd[1:]))
 
     # CREATE_NO_WINDOW so the dist exe doesn't flash a console window for
@@ -94,6 +98,13 @@ def _run_ffmpeg(args: list[str],
 
     time_re = re.compile(r'time=(\d+):(\d+):(\d+\.\d+)')
     pulse = 0.0
+    # Keep the last N stderr lines so the error path can actually report
+    # what ffmpeg said. Previously stderr was drained line-by-line for
+    # progress parsing, then read() at error-time returned '' because
+    # the pipe was already empty, leaving us with a totally opaque
+    # "ffmpeg exited 1234567:" with no message.
+    from collections import deque
+    stderr_tail = deque(maxlen=60)
     try:
         while True:
             line = proc.stderr.readline() if proc.stderr else ''
@@ -102,6 +113,7 @@ def _run_ffmpeg(args: list[str],
                     break
                 continue
             line = line.rstrip()
+            stderr_tail.append(line)
             if should_cancel and should_cancel():
                 proc.kill()
                 raise RuntimeError('cancelled')
@@ -117,13 +129,31 @@ def _run_ffmpeg(args: list[str],
     finally:
         proc.wait()
     if proc.returncode != 0:
-        # Re-read remaining stderr for the error message
-        tail = ''
-        try:
-            tail = proc.stderr.read() if proc.stderr else ''
-        except Exception:
-            pass
-        raise RuntimeError(f'ffmpeg exited {proc.returncode}: {tail.strip()[-400:]}')
+        tail_text = '\n'.join(stderr_tail)[-1200:].strip()
+        # Try to surface the most actionable line. ffmpeg's last error
+        # line is usually the most useful; common patterns include
+        # "Conversion failed!", "Error opening input", "No such file",
+        # "Invalid data found", etc.
+        err_hint = ''
+        for ln in reversed(stderr_tail):
+            low = ln.lower()
+            if any(k in low for k in (
+                'error', 'failed', 'invalid', 'no such', 'unable',
+                'protocol not found', 'codec not currently supported',
+            )):
+                err_hint = ln
+                break
+        # Log the full tail at WARNING so the app log keeps a record.
+        logger.warning(
+            f'ffmpeg failed (exit {proc.returncode} / 0x{proc.returncode & 0xffffffff:08x}). '
+            f'Stderr tail:\n{tail_text}'
+        )
+        msg = f'ffmpeg exited {proc.returncode}'
+        if err_hint:
+            msg += f': {err_hint}'
+        elif tail_text:
+            msg += f': {tail_text[-300:]}'
+        raise RuntimeError(msg)
     if on_progress:
         on_progress(1.0)
 
@@ -153,11 +183,106 @@ _AUDIO_OUT_DEFAULTS = {
     '.m4a':  ('aac',        '192k'),
     '.aac':  ('aac',        '192k'),
     '.mp4':  ('aac',        '192k'),
+    '.mkv':  ('aac',        '192k'),
+    '.webm': ('libopus',    '128k'),
     '.ogg':  ('libvorbis',  '128k'),
     '.opus': ('libopus',    '128k'),
     '.flac': ('flac',       ''),
     '.wav':  ('pcm_s16le',  ''),
+    '.wma':  ('aac',        '192k'),   # no native WMA encoder in most builds
 }
+
+
+# Encoders the bundled ffmpeg knows about. Lazily populated by querying
+# `ffmpeg -encoders` once. We use this to validate every -c:a name we
+# pass — otherwise an unsupported codec produces ffmpeg's cryptic
+# "Encoder not found" error and the user is stuck.
+_AVAILABLE_ENCODERS: set[str] | None = None
+
+
+def _available_encoders() -> set[str]:
+    """Set of audio encoder names the current ffmpeg binary supports.
+    Lazy + cached: only spawns ffmpeg once per session."""
+    global _AVAILABLE_ENCODERS
+    if _AVAILABLE_ENCODERS is not None:
+        return _AVAILABLE_ENCODERS
+    encoders: set[str] = set()
+    try:
+        out = subprocess.check_output(
+            [_ffmpeg_path(), '-hide_banner', '-encoders'],
+            stderr=subprocess.STDOUT, text=True, timeout=10,
+            creationflags=(subprocess.CREATE_NO_WINDOW
+                           if sys.platform == 'win32' else 0),
+        )
+        for ln in out.splitlines():
+            # Encoder lines start with ' V', ' A', ' S' (with flags like
+            # FS....). The encoder name is the 2nd column.
+            s = ln.lstrip()
+            if not s or not s[0].isalpha():
+                continue
+            parts = s.split(None, 2)
+            if len(parts) >= 2 and 'A' in parts[0]:
+                encoders.add(parts[1].lower())
+    except Exception as e:
+        logger.warning(f'Could not list ffmpeg encoders: {e}')
+    _AVAILABLE_ENCODERS = encoders
+    logger.info(f'ffmpeg audio encoders available: {len(encoders)}')
+    return encoders
+
+
+_AUDIO_ONLY_EXTS = {'.mp3', '.m4a', '.aac', '.wav', '.flac',
+                    '.ogg', '.opus', '.wma'}
+
+
+def _reencode_codec_args(in_path: str | Path,
+                         out_path: str | Path) -> list[str]:
+    """Build `-c:*` args for a reencode pass that respects the output
+    container. Audio-only outputs get JUST an audio encoder (no video
+    codec to confuse ffmpeg about); video outputs get libx264 + a safe
+    audio encoder. Used by trim_media and concat_media, which used to
+    hardcode `-c:v libx264 -c:a aac` regardless of output extension —
+    which broke when the user asked for an .mp3 output (AAC stream in
+    MP3 container is invalid)."""
+    out_ext = Path(out_path).suffix.lower()
+    if out_ext in _AUDIO_ONLY_EXTS:
+        # Pick the right audio encoder for this container.
+        return _matched_output_args(in_path, out_path)
+    # Video container — keep H.264 video + safe audio encoder.
+    args = ['-c:v', 'libx264']
+    aac, _ = _resolve_safe_encoder('aac', '.m4a')
+    if aac:
+        args += ['-c:a', aac, '-b:a', '192k']
+    return args
+
+
+def _resolve_safe_encoder(preferred: str, out_ext: str) -> tuple[str, str]:
+    """Given a desired encoder + output extension, return (encoder,
+    bitrate) that the current ffmpeg can actually USE. Falls through:
+      1. preferred encoder, if available
+      2. extension's canonical default, if available
+      3. universal safe fallback: aac (in mp4-family) or pcm_s16le (wav)
+    The bitrate string is empty for lossless codecs."""
+    available = _available_encoders()
+    # 1. Try the preferred name
+    if preferred and preferred.lower() in available:
+        return (preferred, '')
+    # 2. Try the extension default
+    fallback = _AUDIO_OUT_DEFAULTS.get(out_ext.lower())
+    if fallback:
+        enc, br = fallback
+        if enc.lower() in available:
+            return (enc, br)
+    # 3. Universal safe fallback. aac is built into ffmpeg without
+    # needing libfdk/libfaac; pcm_s16le is always present. Pick by ext.
+    if out_ext.lower() == '.wav':
+        return ('pcm_s16le', '')
+    if 'aac' in available:
+        return ('aac', '192k')
+    if 'libmp3lame' in available:
+        return ('libmp3lame', '192k')
+    # Total failure mode — let ffmpeg auto-pick something or fail
+    # with a clearer "no encoder for this container" message.
+    return ('', '')
 
 
 def _input_audio_codec(path: str | Path) -> tuple[str, str]:
@@ -207,23 +332,24 @@ def _matched_output_args(in_path: str | Path,
     in_ext  = Path(in_path).suffix.lower()
     out_ext = Path(out_path).suffix.lower()
     # Same container: copy input codec + bitrate so size / quality match.
+    preferred = ''
+    preferred_br = ''
     if in_ext == out_ext:
-        codec, bitrate = _input_audio_codec(in_path)
-        if codec:
-            args = ['-c:a', codec]
-            if bitrate:
-                args += ['-b:a', bitrate]
-            return args
-    # Different container: use the canonical encoder for the output ext.
-    enc_default = _AUDIO_OUT_DEFAULTS.get(out_ext)
-    if enc_default:
-        codec, bitrate = enc_default
-        args = ['-c:a', codec]
-        if bitrate:
-            args += ['-b:a', bitrate]
-        return args
-    # Unknown extension: let ffmpeg auto-pick (last-resort fallback).
-    return []
+        preferred, preferred_br = _input_audio_codec(in_path)
+    # Always resolve through the safe encoder picker so we never ask
+    # ffmpeg for an encoder it doesn't have ("Encoder not found").
+    codec, default_br = _resolve_safe_encoder(preferred, out_ext)
+    if not codec:
+        return []
+    # Prefer the input's detected bitrate (preserves "feel" of the
+    # original) if the picked codec is lossy; lossless ignores bitrate.
+    bitrate = preferred_br or default_br
+    if codec in ('flac', 'pcm_s16le', 'pcm_s24le', 'pcm_s32le'):
+        bitrate = ''
+    args = ['-c:a', codec]
+    if bitrate:
+        args += ['-b:a', bitrate]
+    return args
 
 
 # ── Audio extraction / conversion ────────────────────────────────────────────
@@ -239,6 +365,17 @@ def extract_audio(in_path: str | Path,
     """
     in_p, out_p = Path(in_path), Path(out_path)
     out_p.parent.mkdir(parents=True, exist_ok=True)
+    # Validate the requested codec against the bundled ffmpeg's actual
+    # encoder list; fall back to a safe alternative if missing.
+    if codec.lower() not in _available_encoders():
+        safe_codec, safe_br = _resolve_safe_encoder(codec, out_p.suffix)
+        if safe_codec:
+            logger.warning(
+                f'extract_audio: requested codec {codec!r} not available '
+                f'in bundled ffmpeg; falling back to {safe_codec!r}.'
+            )
+            codec = safe_codec
+            bitrate = safe_br or bitrate
     args = ['-i', str(in_p), '-vn',
             '-c:a', codec]
     if codec not in ('flac', 'pcm_s16le', 'pcm_s24le'):
@@ -252,11 +389,14 @@ def extract_audio(in_path: str | Path,
 
 # User-friendly aliases for the audio operation dropdown
 AUDIO_FORMATS = {
-    'MP3 (most compatible)':   ('mp3',       '192k'),
-    'M4A / AAC (smaller)':     ('aac',       '192k'),
-    'Opus (best quality/size)': ('libopus',  '128k'),
-    'FLAC (lossless)':         ('flac',      ''),
-    'WAV (uncompressed)':      ('pcm_s16le', ''),
+    # Use ENCODER names (not decoder names) so extract_audio doesn't
+    # have to fall back via _resolve_safe_encoder. MP3 decodes as
+    # 'mp3' but encodes as 'libmp3lame'; same name-mismatch for opus.
+    'MP3 (most compatible)':    ('libmp3lame', '192k'),
+    'M4A / AAC (smaller)':      ('aac',        '192k'),
+    'Opus (best quality/size)': ('libopus',    '128k'),
+    'FLAC (lossless)':          ('flac',       ''),
+    'WAV (uncompressed)':       ('pcm_s16le',  ''),
 }
 
 
@@ -422,7 +562,10 @@ def trim_media(in_path, out_path,
     if end is not None:
         args += ['-to', _hhmmss(end)]
     args += ['-i', str(in_p)]
-    args += ['-c', 'copy'] if not reencode else ['-c:v', 'libx264', '-c:a', 'aac']
+    if not reencode:
+        args += ['-c', 'copy']
+    else:
+        args += _reencode_codec_args(in_p, out_p)
     args.append(str(out_p))
     dur = (end or _probe_duration(in_p)) - start
     _run_ffmpeg(args, max(dur, 0.0),
@@ -563,7 +706,12 @@ def concat_media(in_paths: list, out_path,
         manifest = mf.name
     try:
         args = ['-f', 'concat', '-safe', '0', '-i', manifest]
-        args += ['-c', 'copy'] if not reencode else ['-c:v', 'libx264', '-c:a', 'aac']
+        if not reencode:
+            args += ['-c', 'copy']
+        else:
+            # Use the first input as the representative audio source
+            # for codec detection (concat assumes inputs share codecs).
+            args += _reencode_codec_args(in_paths[0], out_p)
         args.append(str(out_p))
         dur = sum(_probe_duration(p) for p in in_paths)
         _run_ffmpeg(args, dur,

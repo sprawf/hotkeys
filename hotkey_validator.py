@@ -111,6 +111,29 @@ _WINDOWS_RESERVED = {
     ]
 }
 
+# Bare keys whose meaning is so universal across every app that letting
+# the user bind them to a Hotkeys action would break typing and basic
+# UI navigation app-wide. Modifier combos (Ctrl+Enter, Alt+Tab, etc.)
+# are NOT in this set — only the standalone key with no modifiers.
+# Mirror in spirit of `_PASSTHROUGH_KEYS` in kbhook.py (which lets
+# Escape co-exist with our action); these go further and refuse the
+# binding outright because suppressing them would be hostile.
+_APP_FORBIDDEN = {
+    normalize_hotkey(k): why for k, why in [
+        ('enter',     'Enter is needed to submit forms and confirm dialogs'),
+        ('return',    'Return is needed to submit forms and confirm dialogs'),
+        ('tab',       'Tab is needed to move focus between fields'),
+        ('space',     'Space is needed for typing and play/pause in media apps'),
+        ('backspace', 'Backspace is needed to delete characters and go back'),
+        ('delete',    'Delete is needed to remove selected items'),
+        ('up',        'Up arrow is needed to navigate'),
+        ('down',      'Down arrow is needed to navigate'),
+        ('left',      'Left arrow is needed to navigate'),
+        ('right',     'Right arrow is needed to navigate'),
+    ]
+}
+
+
 # Keys that work but are risky, chosen by the user themselves at their
 # own risk, but worth warning about.
 _RISKY = {
@@ -214,6 +237,15 @@ def validate_hotkey(
         return Diagnostic(ERROR,
             f'"{raw}" is reserved by Windows and can never be captured by an '
             f'app. Pick something else.', action)
+
+    # 2b. App-forbidden bare keys (Enter, Tab, Space, arrows, etc.).
+    # Binding any of these standalone would break typing or basic UI
+    # navigation everywhere. Modifier combos using the same key (e.g.
+    # Ctrl+Enter) remain perfectly legal — only the bare form is blocked.
+    if norm in _APP_FORBIDDEN:
+        return Diagnostic(ERROR,
+            f'"{raw}" can\'t be a hotkey on its own: {_APP_FORBIDDEN[norm]}. '
+            f'Try a combo like Ctrl+{raw}, Alt+{raw}, or Shift+{raw}.', action)
 
     # 3. Self-conflict with another app assignment
     if other_assignments:

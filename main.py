@@ -851,6 +851,12 @@ class App:
 
     def _register_hotkeys(self) -> None:
         """Register all global hotkeys, forcefully resetting the keyboard listener first."""
+        # Always re-arm the paused-match nudge in case anything cleared
+        # it. Idempotent and cheap.
+        try:
+            kbhook.set_on_paused_match(self._on_paused_hotkey_attempt)
+        except Exception:
+            pass
         # ── Step 1: full teardown ─────────────────────────────────────────────
         try:
             kbhook.unhook_all()
@@ -1300,6 +1306,44 @@ class App:
             )
         except Exception:
             pass
+
+    def _on_paused_hotkey_attempt(self) -> None:
+        """Called from kbhook's worker thread when a user pressed a
+        registered hotkey while we're paused. Marshals to the Tk thread
+        and shows a throttled dialog so the user understands why their
+        hotkey did nothing. Debounced to 15 s + an "open dialog" guard
+        so mashing the same hotkey doesn't stack dialogs."""
+        try:
+            self.root.after(0, self._show_paused_reminder)
+        except Exception as e:
+            logger.warning(f'paused-match: root.after failed: {e}')
+
+    def _show_paused_reminder(self) -> None:
+        last = getattr(self, '_paused_toast_at', 0.0)
+        now = time.monotonic()
+        if now - last < 15.0:
+            return
+        if getattr(self, '_paused_dialog_open', False):
+            return
+        self._paused_toast_at = now
+        self._paused_dialog_open = True
+        try:
+            from dialogs import confirm
+            resumed = confirm(
+                self.root,
+                '⏸  Hotkeys paused',
+                'Resume to use hotkeys again.',
+                action_label='Resume',
+            )
+            if resumed:
+                # User picked "Resume hotkeys" in the dialog. Flip kbhook
+                # back to active + refresh tray UI. Reuses the same path
+                # the tray menu uses so behavior is identical.
+                self._toggle_pause_hotkeys()
+        except Exception as e:
+            logger.warning(f'paused-reminder: dialog failed: {e}')
+        finally:
+            self._paused_dialog_open = False
 
     def _toggle_pause_hotkeys(self) -> None:
         """Flip kbhook between matching/suppressing and pure pass-through.
