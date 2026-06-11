@@ -56,31 +56,57 @@ class _KBDLLHOOKSTRUCT(ctypes.Structure):
 
 
 def start_prtsc_listener(callback) -> None:
-    """Install WH_KEYBOARD_LL and fire callback() on every VK_SNAPSHOT press."""
+    """Install WH_KEYBOARD_LL and fire callback() on every VK_SNAPSHOT press.
+
+    The hook itself enqueues onto a private worker queue and returns
+    immediately — same pattern as kbhook.py. The hook body is restricted
+    to a vkCode comparison + put_nowait, which keeps it microseconds
+    even under disk pressure / AVG inspection. The worker thread handles
+    the foreground-window introspection (OpenProcess + GetModuleBaseName,
+    can be slow), the logging (file I/O, can stall), and the user
+    callback() (can do anything). None of that is allowed in the hook
+    context — Windows uninstalls a WH_KEYBOARD_LL hook whose callback
+    exceeds the LowLevelHooksTimeout (300 ms by default).
+    """
+    import queue as _q
+    import threading as _th
     _hook_ref = [None]
+    _worker_q: _q.Queue = _q.Queue(maxsize=64)
+
+    def _worker():
+        import logging
+        _log = logging.getLogger(__name__)
+        while True:
+            sentinel = _worker_q.get()
+            if sentinel is None:
+                return
+            try:
+                fg = _get_foreground_window_info()
+            except Exception:
+                fg = 'foreground=?'
+            _log.info(f'[HOOK] PrtSc hook fired  •  {fg}')
+            try:
+                callback()
+            except Exception as e:
+                _log.warning(f'PrtSc callback raised: {e}')
+            _log.info('[HOOK] PrtSc callback returned')
+    _th.Thread(target=_worker, daemon=True,
+               name='prtsc-hook-worker').start()
 
     def _hook_proc(nCode, wParam, lParam):
         if nCode >= 0 and wParam in (_WM_KEYDOWN, _WM_SYSKEYDOWN):
-            kb = ctypes.cast(lParam, ctypes.POINTER(_KBDLLHOOKSTRUCT)).contents
-            if kb.vkCode == _VK_SNAPSHOT:
-                # Single INFO line so we can tell hook-didn't-fire from
-                # hook-fired-but-callback-broke. Captures the foreground
-                # window too so we can correlate "hook didn't fire" with
-                # what was in front (UIPI elevation is the #1 suspect).
-                # Diagnostic only; stays well inside the 300ms
-                # LowLevelHooksTimeout budget.
-                import logging
-                _log = logging.getLogger(__name__)
-                try:
-                    fg = _get_foreground_window_info()
-                except Exception:
-                    fg = 'foreground=?'
-                _log.info(f'[HOOK] PrtSc hook fired  •  {fg}')
-                try:
-                    callback()
-                except Exception as e:
-                    _log.warning(f'PrtSc callback raised: {e}')
-                _log.info('[HOOK] PrtSc callback returned')
+            try:
+                kb = ctypes.cast(lParam, ctypes.POINTER(_KBDLLHOOKSTRUCT)).contents
+                if kb.vkCode == _VK_SNAPSHOT:
+                    try:
+                        _worker_q.put_nowait(1)
+                    except _q.Full:
+                        # Worker is backed up — drop this event rather
+                        # than block the hook. Single missed PrtSc is
+                        # vastly preferable to a dead hook.
+                        pass
+            except Exception:
+                pass
         return _user32.CallNextHookEx(_hook_ref[0], nCode, wParam, lParam)
 
     def _listen():
@@ -264,10 +290,13 @@ _AB_GAP       = 3
 class ScreenshotOverlay:
     """Full-screen Lightshot-style screenshot overlay with annotation tools."""
 
-    _TOOLS = ('marker', 'line', 'arrow', 'rect', 'pen', 'text')
+    _TOOLS = ('select', 'marker', 'line', 'arrow', 'rect', 'pen', 'text')
 
     def __init__(self, root=None, on_done=None,
                  on_extract_text=None, on_translate=None,
+                 on_translate_google=None,
+                 on_translate_offline_ar=None,
+                 on_scan=None,
                  _preloaded_shot=None, _preloaded_dim=None):
         # on_extract_text(img: PIL.Image) — fires on context-menu "Extract text".
         # on_translate(img: PIL.Image)    — fires on context-menu "Translate to English".
@@ -287,6 +316,9 @@ class ScreenshotOverlay:
         self._on_done        = on_done
         self._on_extract_text = on_extract_text
         self._on_translate    = on_translate
+        self._on_translate_google = on_translate_google
+        self._on_translate_offline_ar = on_translate_offline_ar
+        self._on_scan         = on_scan
         self._own_root       = (root is None)  # True if we created our own tk.Tk()
         self._root_ref       = root            # None means we'll create our own
         self._preloaded_shot = _preloaded_shot
@@ -298,8 +330,21 @@ class ScreenshotOverlay:
         self._has_sel   = False
 
         # Annotation state
-        self._tool        = 'pen'
+        # 'select' is the default — it lets the user resize the selection
+        # via the 8 handles or move it by dragging the body, without
+        # accidentally drawing pen strokes. Switch to pen/marker/etc.
+        # from the toolbar when ready to annotate.
+        self._tool        = 'select'
+        # Resize / move state populated by _on_ldown when the user grabs
+        # a handle or the inside of a selection while the select tool is
+        # active.
+        self._resize_handle = None   # 'tl' | 't' | 'tr' | 'r' | 'br' | 'b' | 'bl' | 'l' | None
+        self._move_origin   = None   # (origin_x, origin_y, sx, sy, cx, cy) snapshot at press
         self._tool_colors = {   # per-tool default colours
+            # 'select' doesn't draw anything but keeps a placeholder
+            # so the colour picker has something to show / switch from
+            # when the user switches to a drawing tool.
+            'select': '#ff0000',
             'pen':    '#ff0000',
             'line':   '#ff0000',
             'arrow':  '#ff0000',
@@ -307,7 +352,7 @@ class ScreenshotOverlay:
             'marker': '#fff200',
             'text':   '#000000',
         }
-        self._color = self._tool_colors[self._tool]
+        self._color = self._tool_colors.get(self._tool, '#ff0000')
         self._annotations = []   # canvas item ids (for undo)
         self._ann_data    = []   # dicts for PIL rendering
         self._drawing     = False
@@ -645,7 +690,23 @@ class ScreenshotOverlay:
         t = ('toolbar',)
         ids = []
 
-        if tid == 'pen':
+        if tid == 'select':
+            # Standard arrow cursor icon — diagonal pointer with a notch.
+            ids += [c.create_polygon(
+                cx-6, cy-6,
+                cx-6, cy+6,
+                cx-2, cy+2,
+                cx+1, cy+6,
+                cx+3, cy+5,
+                cx, cy+1,
+                cx+5, cy+1,
+                fill=fg, outline='', tags=t)]
+            # Outline so the icon stays visible on the purple active bg.
+            ids += [c.create_line(
+                cx-6, cy-6, cx+5, cy+1,
+                fill=bg if bg != fg else '#ffffff', width=1, tags=t)]
+
+        elif tid == 'pen':
             # Pencil: diagonal body SW→NE, sharp tip at NE, flat eraser at SW
             # Main diagonal stroke
             ids += [c.create_line(cx-5, cy+5, cx+3, cy-3,
@@ -729,6 +790,7 @@ class ScreenshotOverlay:
     def _draw_toolbar(self, x1, y1, x2, y2) -> None:
         c = self._canvas
         tools = [
+            ('select', 'Select / Move / Resize selection'),
             ('marker', 'Marker (highlight)'),
             ('line',   'Line'),
             ('arrow',  'Arrow'),
@@ -927,12 +989,62 @@ class ScreenshotOverlay:
                 return True
         return False
 
+    # Handle-position helper. Returns ('tl', 't', 'tr', 'r', 'br', 'b',
+    # 'bl', 'l') or None. Each handle is a fixed dot at a corner or
+    # midpoint — we test point-distance to each, NOT a band along the
+    # entire edge (which would falsely catch any click near the border).
+    def _hit_handle(self, x: int, y: int):
+        if not self._has_sel:
+            return None
+        x1, y1 = min(self._sx, self._cx), min(self._sy, self._cy)
+        x2, y2 = max(self._sx, self._cx), max(self._sy, self._cy)
+        mx, my = (x1 + x2) // 2, (y1 + y2) // 2
+        r = _HANDLE_R + 5   # generous slop for easier grabbing
+        # Corners
+        if abs(x - x1) <= r and abs(y - y1) <= r: return 'tl'
+        if abs(x - x2) <= r and abs(y - y1) <= r: return 'tr'
+        if abs(x - x1) <= r and abs(y - y2) <= r: return 'bl'
+        if abs(x - x2) <= r and abs(y - y2) <= r: return 'br'
+        # Edge midpoints — each is a single point, NOT the whole edge.
+        if abs(x - mx) <= r and abs(y - y1) <= r: return 't'
+        if abs(x - mx) <= r and abs(y - y2) <= r: return 'b'
+        if abs(y - my) <= r and abs(x - x1) <= r: return 'l'
+        if abs(y - my) <= r and abs(x - x2) <= r: return 'r'
+        return None
+
+    # Resize cursors per handle.
+    _RESIZE_CURSORS = {
+        'tl': 'size_nw_se', 'br': 'size_nw_se',
+        'tr': 'size_ne_sw', 'bl': 'size_ne_sw',
+        't':  'size_ns',    'b':  'size_ns',
+        'l':  'size_we',    'r':  'size_we',
+    }
+
     def _on_ldown(self, event) -> None:
         # Ignore clicks that land on toolbar / action-bar panels
         if self._in_ui(event.x, event.y):
             return
-        # If we have a selection and click is inside it → draw annotation
+        # First: handle resize via the 8 handles (any tool — so the user
+        # can resize without going back to the select tool).
+        if self._has_sel:
+            h = self._hit_handle(event.x, event.y)
+            if h is not None:
+                self._resize_handle = h
+                # Normalise sx/sy/cx/cy to TL/BR for predictable edge
+                # adjustment during drag.
+                x1, y1 = min(self._sx, self._cx), min(self._sy, self._cy)
+                x2, y2 = max(self._sx, self._cx), max(self._sy, self._cy)
+                self._sx, self._sy, self._cx, self._cy = x1, y1, x2, y2
+                return
+        # Inside the selection: behaviour depends on active tool.
         if self._has_sel and self._inside_sel(event.x, event.y):
+            if self._tool == 'select':
+                # Move the whole selection (don't draw annotations).
+                self._move_origin = (
+                    event.x, event.y,
+                    self._sx, self._sy, self._cx, self._cy)
+                return
+            # Drawing tools: produce an annotation.
             self._drawing  = True
             self._draw_p0  = (event.x, event.y)
             self._pen_pts  = [(event.x, event.y)]
@@ -946,13 +1058,45 @@ class ScreenshotOverlay:
         self._canvas.delete('annotation')
         self._annotations.clear()
         self._ann_data.clear()
-        # _sel_crop will be re-cached by the next _draw_sel; until then
-        # the marker preview has no underlying base to multiply against.
         self._sel_crop = None
         self._sel_image_canvas_id = None
         self._redraw()
 
     def _on_ldrag(self, event) -> None:
+        if self._resize_handle is not None:
+            # Resize the appropriate edge / corner of the selection.
+            h = self._resize_handle
+            if 'l' in h: self._sx = event.x
+            if 'r' in h: self._cx = event.x
+            if 't' in h: self._sy = event.y
+            if 'b' in h: self._cy = event.y
+            # _sel_crop must invalidate so the next redraw reads the
+            # right pixel region from the underlying screenshot.
+            self._sel_crop = None
+            self._sel_image_canvas_id = None
+            self._redraw()
+            return
+        if self._move_origin is not None:
+            ox, oy, sx0, sy0, cx0, cy0 = self._move_origin
+            dx = event.x - ox
+            dy = event.y - oy
+            # Clamp so the selection stays within the visible canvas.
+            new_x1 = min(sx0, cx0) + dx
+            new_x2 = max(sx0, cx0) + dx
+            new_y1 = min(sy0, cy0) + dy
+            new_y2 = max(sy0, cy0) + dy
+            if new_x1 < 0: dx -= new_x1
+            if new_y1 < 0: dy -= new_y1
+            if new_x2 > self._vw: dx -= new_x2 - self._vw
+            if new_y2 > self._vh: dy -= new_y2 - self._vh
+            self._sx = sx0 + dx
+            self._sy = sy0 + dy
+            self._cx = cx0 + dx
+            self._cy = cy0 + dy
+            self._sel_crop = None
+            self._sel_image_canvas_id = None
+            self._redraw()
+            return
         if self._drawing:
             self._live_draw(event.x, event.y)
             return
@@ -962,6 +1106,12 @@ class ScreenshotOverlay:
             self._redraw()
 
     def _on_lup(self, event) -> None:
+        if self._resize_handle is not None:
+            self._resize_handle = None
+            return
+        if self._move_origin is not None:
+            self._move_origin = None
+            return
         if self._drawing:
             self._commit_draw(event.x, event.y)
             self._drawing = False
@@ -975,8 +1125,19 @@ class ScreenshotOverlay:
     def _on_motion(self, event) -> None:
         if self._in_ui(event.x, event.y):
             self._canvas.config(cursor='arrow')
-        elif self._has_sel and self._inside_sel(event.x, event.y):
-            cursors = {'pen': 'pencil', 'text': 'xterm'}
+            return
+        # Hover over a resize handle → show the appropriate resize cursor
+        if self._has_sel:
+            h = self._hit_handle(event.x, event.y)
+            if h is not None:
+                self._canvas.config(cursor=self._RESIZE_CURSORS.get(h, 'crosshair'))
+                return
+        if self._has_sel and self._inside_sel(event.x, event.y):
+            cursors = {
+                'select': 'fleur',   # move cursor (4-arrow)
+                'pen': 'pencil',
+                'text': 'xterm',
+            }
             self._canvas.config(cursor=cursors.get(self._tool, 'crosshair'))
         else:
             self._canvas.config(cursor='crosshair')
@@ -1005,12 +1166,18 @@ class ScreenshotOverlay:
         if has_sel:
             menu.add_command(label='  Copy',   command=self._copy)
             menu.add_command(label='  Save',   command=self._save)
-            if self._on_extract_text is not None:
-                menu.add_command(label='  🔤  Extract text',
-                                 command=self._extract_text_action)
+            if self._on_scan is not None:
+                menu.add_command(label='  📄  Scan document',
+                                 command=self._scan_action)
             if self._on_translate is not None:
-                menu.add_command(label='  🌐  Translate to English',
+                menu.add_command(label='  🌐  Translate to English (AI)',
                                  command=self._translate_action)
+            if self._on_translate_google is not None:
+                menu.add_command(label='  🔵  Translate to English (Google)',
+                                 command=self._translate_google_action)
+            if self._on_translate_offline_ar is not None:
+                menu.add_command(label='  🟢  Translate to English (Offline Arabic OCR)',
+                                 command=self._translate_offline_ar_action)
             menu.add_separator()
         # Exit is always present, this is the last-resort escape if Esc/Del
         # are somehow not responding (e.g. focus was stolen by another app).
@@ -1451,7 +1618,11 @@ class ScreenshotOverlay:
 
     def _extract_text_action(self) -> None:
         """Context-menu "Extract text" — render the selection, hand it to the
-        OCR callback, then close the overlay so the result popup gets focus."""
+        OCR callback, then close the overlay so the result popup gets focus.
+
+        Kept around because the in-popup Extract text button (inside the
+        Scan preview) routes through the same callback path; only the
+        context-menu surfacing was removed."""
         img = self._render()
         cb = self._on_extract_text
         self._close()
@@ -1460,9 +1631,22 @@ class ScreenshotOverlay:
             except Exception as e:
                 print(f'Screenshot extract-text callback error: {e}')
 
+    def _scan_action(self) -> None:
+        """Context-menu "Scan document" — render the selection and hand it
+        to the scan callback, which applies CamScanner-style cleanup
+        (corner detection + perspective transform + enhance) and opens
+        a preview popup with mode toggle + Save/Copy/Extract buttons."""
+        img = self._render()
+        cb = self._on_scan
+        self._close()
+        if img and cb:
+            try: cb(img)
+            except Exception as e:
+                print(f'Screenshot scan callback error: {e}')
+
     def _translate_action(self) -> None:
-        """Context-menu "Translate to English" — same flow as extract, but
-        routes through the translate callback (which OCRs THEN translates)."""
+        """Context-menu "Translate to English (AI)" — same flow as extract, but
+        routes through the translate callback (which OCRs THEN translates via LLM)."""
         img = self._render()
         cb = self._on_translate
         self._close()
@@ -1470,6 +1654,33 @@ class ScreenshotOverlay:
             try: cb(img)
             except Exception as e:
                 print(f'Screenshot translate callback error: {e}')
+
+    def _translate_google_action(self) -> None:
+        """Context-menu "Translate to English (Google)" — OCR then translate via
+        the Google Translate web endpoint (deep-translator scrape). Lets the
+        user compare Google's neural output against the LLM translation."""
+        img = self._render()
+        cb = self._on_translate_google
+        self._close()
+        if img and cb:
+            try: cb(img)
+            except Exception as e:
+                print(f'Screenshot translate-google callback error: {e}')
+
+    def _translate_offline_ar_action(self) -> None:
+        """Context-menu "Translate to English (Offline Arabic OCR)" — uses
+        Tesseract with ara+eng language packs for the OCR step, then
+        Google line-by-line for translation. Significantly better for
+        dense Arabic text than the hosted vision-LLM path because
+        Tesseract Arabic was trained on millions of Arabic documents
+        with proper ligature + RTL handling."""
+        img = self._render()
+        cb = self._on_translate_offline_ar
+        self._close()
+        if img and cb:
+            try: cb(img)
+            except Exception as e:
+                print(f'Screenshot translate-offline-ar callback error: {e}')
 
     def _select_all(self) -> None:
         self._sx, self._sy = 0, 0
@@ -1534,7 +1745,10 @@ def cancel_screenshot() -> bool:
 
 
 def _create_overlay(root, on_done, shot, dim_img,
-                    on_extract_text=None, on_translate=None) -> None:
+                    on_extract_text=None, on_translate=None,
+                    on_translate_google=None,
+                    on_translate_offline_ar=None,
+                    on_scan=None) -> None:
     """Called on the main thread once the background grab completes."""
     if not _overlay_active[0]:
         return   # was cancelled while the grab was in flight
@@ -1546,6 +1760,9 @@ def _create_overlay(root, on_done, shot, dim_img,
         ov = ScreenshotOverlay(root, on_done=on_done,
                                on_extract_text=on_extract_text,
                                on_translate=on_translate,
+                               on_translate_google=on_translate_google,
+                               on_translate_offline_ar=on_translate_offline_ar,
+                               on_scan=on_scan,
                                _preloaded_shot=shot, _preloaded_dim=dim_img)
         _pending_overlay[0] = ov
         _scr_log.info('[PIPELINE] ScreenshotOverlay constructed OK; '
@@ -1566,7 +1783,10 @@ def _create_overlay(root, on_done, shot, dim_img,
 
 
 def take_screenshot(root=None, on_done=None,
-                    on_extract_text=None, on_translate=None) -> None:
+                    on_extract_text=None, on_translate=None,
+                    on_translate_google=None,
+                    on_translate_offline_ar=None,
+                    on_scan=None) -> None:
     """Grab the screen in a background thread, then build the overlay on the main thread.
 
     ImageGrab.grab(all_screens=True) on a large or multi-monitor desktop can
@@ -1660,7 +1880,10 @@ def take_screenshot(root=None, on_done=None,
                 return
             root.after(0, lambda: _create_overlay(
                 root, on_done, shot, dim_img,
-                on_extract_text=on_extract_text, on_translate=on_translate))
+                on_extract_text=on_extract_text, on_translate=on_translate,
+                on_translate_google=on_translate_google,
+                on_translate_offline_ar=on_translate_offline_ar,
+                on_scan=on_scan))
 
         threading.Thread(target=_grab, daemon=True, name='screenshot-grab').start()
     else:
@@ -1669,5 +1892,6 @@ def take_screenshot(root=None, on_done=None,
         threading.Thread(
             target=lambda: ScreenshotOverlay(
                 None, on_done=on_done,
-                on_extract_text=on_extract_text, on_translate=on_translate),
+                on_extract_text=on_extract_text, on_translate=on_translate,
+                on_translate_google=on_translate_google),
             daemon=True, name='screenshot-overlay').start()

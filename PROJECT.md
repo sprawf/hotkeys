@@ -614,6 +614,228 @@ trap that broke `library.py` tab rendering (the rule above) and
 
 ---
 
+## ⚠ Subprocess spawn rule (no PowerShell intermediary)
+
+**Never use `powershell.exe Start-Process` (or any `powershell -Command "..."`)
+as a launcher for subprocesses we spawn ourselves.** Always use direct
+`subprocess.Popen` with detach flags.
+
+### Why
+
+AVG / Defender / most commercial AVs classify `powershell.exe` as a
+LOLBin (Living-Off-The-Land Binary) used by malware. Every spawn
+through PowerShell triggers a full behaviour scan of the chain:
+**measured 22+ seconds** of latency per launch (sometimes 12s on
+warm runs). Direct `subprocess.Popen` of the SAME final binary
+clocks in at **~100 ms** because the parent process is already
+trusted-and-cached.
+
+This bit us on the whiteboard subprocess for months — the original
+fix routed through `Start-Process` to "survive parent kill", but
+that's not what was actually needed; the right detach flags do it.
+
+### What to do when spawning a subprocess
+
+```python
+DETACHED  = 0x00000008  # no console
+NEW_GROUP = 0x00000200  # Ctrl-C isolation
+BREAKAWAY = 0x01000000  # survives parent kill
+proc = subprocess.Popen(
+    [exe, ...args],
+    cwd=working_dir,
+    creationflags=DETACHED | NEW_GROUP | BREAKAWAY,
+    close_fds=True,
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+```
+
+`CREATE_BREAKAWAY_FROM_JOB` is the critical flag — it lets the
+child outlive Hotkeys even when we're inside a Job Object (which
+single_instance.py creates). `DETACHED_PROCESS` is mandatory or
+Python's GC of the Popen handle can SIGSEGV the child a few
+seconds later.
+
+If the child uses single_instance.py to re-exec into a grandchild,
+the grandchild owns the user-visible window with zero linkage to
+the parent — exactly what we wanted from PowerShell, without the
+22-second tax.
+
+### Exceptions
+
+- `explorer.exe`, `notepad.exe`, signed Windows binaries — fine to
+  spawn directly without flags; the OS already vouches for them.
+- ffmpeg / yt-dlp / Whisper subprocesses — direct Popen is fine
+  (they're our own binaries, signed/cached after first scan).
+- One-shot system scripts in `_repair_logs/` — fine, those are not
+  in the user-facing hot path.
+
+---
+
+## ⚠ Prewarm-at-boot rule (any subprocess that owns a heavy native window)
+
+**If a Shift+Fx feature spawns a subprocess that hosts a heavy
+native window (WebView2, Tenacity/Audacity, Edge Chromium, anything
+with multi-second cold-init), pre-warm it hidden at boot and
+hide-on-close at runtime.** First user press must feel instant.
+
+### The pattern
+
+1. **At app boot**, schedule a hidden prewarm:
+   ```python
+   self.root.after(500, self._prewarm_whiteboard)
+   ```
+   500ms is the sweet spot — late enough that the splash and tray
+   are up, early enough that by the time the user hits the hotkey
+   the window is ready.
+
+2. **In the subprocess**, accept a `--prewarm` flag. Create the
+   window **visible at an offscreen position** (`x=-32000`,
+   `y=-32000`), let the GUI framework paint a real frame, then
+   move it on-screen and `ShowWindow(SW_HIDE)` it via Win32.
+   See whiteboard.py `_on_loaded()` for the canonical
+   implementation.
+
+   **Never use `create_window(hidden=True)`** for prewarm —
+   pywebview/WebView2 short-circuits the first render when
+   `hidden=True`, so the next `ShowWindow()` shows a blank white
+   canvas (React never mounted). Offscreen-then-hide forces a real
+   paint and the next show is instant with real content.
+
+3. **At runtime**, when user fires the hotkey:
+   - `EnumWindows` for the exact window title
+   - If found and visible → toggle minimize/foreground
+   - If found and hidden → `ShowWindow(SW_SHOW)` +
+     `_force_foreground` (on a thread — the message pump of a
+     freshly-revealed window can briefly block)
+   - If not found → cold-spawn fallback, with a launching pill
+     that shows elapsed %
+
+4. **On window close** (X button), intercept via the framework's
+   `closing` event and call `window.hide()` instead of letting it
+   destroy. Subsequent presses use path 3 above.
+
+### Why all the moving parts
+
+- **Prewarm**: hides the 30-60s WebView2 / Edge Chromium cold-init
+  cost behind the boot wait
+- **Hide-on-close**: keeps the warm window alive for the rest of
+  the session, so re-opens are 25ms not 30 seconds
+- **Race protection**: a `_xxx_launch_in_flight` flag prevents
+  spam-press from spawning duplicates while the prewarm is still
+  initialising
+- **Pill**: gives users feedback during the rare cold-spawn case
+  (first press before prewarm finishes)
+
+### Apps currently using this pattern
+
+- Whiteboard (`whiteboard.py` + `main.py:_prewarm_whiteboard`)
+- Quick Notes (`main.py:_prewarm_notes_window`) — the in-process
+  variant; no subprocess, just builds the Tk UI tree hidden
+
+### When you add a new heavy subprocess
+
+You must:
+1. Wire a `_prewarm_<feature>()` scheduled from boot
+2. Add a `--prewarm` flag to the child script
+3. Implement offscreen-paint-then-hide in `_on_loaded`
+4. Add the existing-window toggle to the host hotkey handler
+5. Add a `_<feature>_launch_in_flight` re-press guard
+6. Add a launching pill (use the whiteboard pill in overlay.py
+   as the template)
+
+If you skip any of these, Shift+Fx will feel slow on the first
+press and the user will think the app is broken.
+
+---
+
+## ⚠ OS-callback budget rule (Windows hook timeouts)
+
+**Any callback running on a Win32 hook thread (WH_KEYBOARD_LL,
+WH_MOUSE_LL, `keyboard.on_press_key`, `keyboard.on_release_key`,
+pystray menu, etc.) MUST return in <1 ms.** Anything longer trips
+the OS-side timeout and Windows silently disables the hook
+process-wide. The user sees: "hotkey worked yesterday, suddenly
+doesn't, requires restart."
+
+### Why
+
+Windows' `LowLevelHooksTimeout` is 300 ms by default. If a single
+WH_KEYBOARD_LL callback exceeds it, Windows uninstalls the WHOLE
+hook chain — not just the slow callback. Every other hook that
+was sharing that LL slot dies too. We've now been bitten twice:
+
+1. **2026-06-11 PrtSc dead-hook**: `screenshot.py:_hook_proc`
+   called `self.root.after(0, take_screenshot)` synchronously
+   inside the hook. When Tk's main loop was busy (translate worker
+   writing clipboard + result popup painting at the same time),
+   the `after()` blocked for 16 seconds. Windows nuked the hook;
+   PrtSc dead until restart.
+
+2. **`keyboard.on_press_key` PTT callbacks** did `self._q.put((...))`
+   (blocking). Same trap — busy consumer → blocked put → killed
+   hook → all keyboard.add_hotkey hotkeys dead too.
+
+### What to do for every hook/callback
+
+The callback may ONLY do:
+
+- A `queue.Queue.put_nowait` (microseconds; raises Full instead of blocking)
+- A `set` / `dict` write to a thread-safe container
+- A counter increment
+
+Everything else — including `logging.info`, foreground-window
+introspection, file I/O, `pyperclip.paste`, `OpenClipboard`,
+`SetForegroundWindow`, even `root.after()` — must be deferred
+to a worker thread that drains the queue.
+
+### Canonical hook pattern
+
+```python
+_worker_q = queue.Queue(maxsize=64)
+
+def _worker():
+    while True:
+        item = _worker_q.get()
+        # heavy work allowed here
+        do_actual_thing(item)
+threading.Thread(target=_worker, daemon=True).start()
+
+def _hook_callback(...):
+    try:
+        _worker_q.put_nowait(item)
+    except queue.Full:
+        pass   # better a dropped event than a dead hook
+```
+
+### Specific traps we already de-fanged
+
+- `screenshot.py:start_prtsc_listener` — hook now enqueue-only,
+  worker thread does logging + FG-window probe + callback.
+- `main.py:_hk_screenshot` — uses `self._q.put_nowait` not
+  `root.after()`.
+- All `keyboard.on_press_key` PTT callbacks — use `put_nowait`.
+- All `self._q.put(((...))` → `self._q.put_nowait(((...))`
+  bulk-converted so a busy consumer can never kill a hook.
+
+### Audit checklist when adding a new hotkey/hook
+
+1. Where does the callback run? (OS hook thread? worker thread?
+   pystray callback thread?)
+2. Could the callback block more than 1 ms under any condition
+   (disk write, network call, lock contention, Tk busy)?
+3. If yes — refactor to enqueue-only and move the work to a
+   worker drained by the main poll or a dedicated thread.
+4. Test under load: e.g. fire the hotkey while a translate is
+   in-flight, while clipboard is being written, while a popup is
+   painting. The hook must survive all of them.
+
+If a hotkey "stops working until I restart the app", this rule
+was violated. Hunt for the slow callback.
+
+---
+
 ## Key architecture rules (see FIXES.md for full history)
 
 1. **One `tk.Tk()` per process** — all windows are `Toplevel` children of `self.root`
@@ -627,3 +849,6 @@ trap that broke `library.py` tab rendering (the rule above) and
 9. **Never destroy `parent.winfo_children()` from a panel you don't fully own** — see "Destroying widget children rule" above
 10. **Tests `test_tab_guard.py` + `test_hwnd_audit.py` must pass before any tab/Win32 change ships**
 11. **Every feature is evaluated against BOTH tray menu actions** (🛑 Stop everything + ↺ Reset everything) — see "Tray menu coverage rule" above. No feature is "done" until both buttons do the right thing for it.
+12. **No PowerShell intermediary for subprocess spawn — direct Popen with detach flags** — see "Subprocess spawn rule" above
+13. **Heavy native subprocesses (WebView2, Tenacity, etc.) must prewarm at boot + hide-on-close** — see "Prewarm-at-boot rule" above
+14. **Every Win32 hook callback must return in <1 ms — enqueue-only, never `put` (blocking), never `root.after`, never `logging.info`** — see "OS-callback budget rule" above

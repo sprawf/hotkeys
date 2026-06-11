@@ -58,21 +58,31 @@ class AskPill:
 
     def __init__(self, root: tk.Tk, question: str, provider,
                  static: str = None, on_close=None,
-                 prepared_answer: str = None) -> None:
+                 prepared_answer: str = None,
+                 on_followup=None) -> None:
         """
         prepared_answer : if set, skip the LLM call and render this string as
                           the answer directly. Used by features like the
                           screenshot "Translate to English" flow where the
                           OCR + translate has already happened upstream.
+        on_followup     : optional callback fired when the user clicks the
+                          "Follow up" affordance after an answer renders.
+                          Receives (question, answer); host (main.py)
+                          creates a chat-kind note pre-loaded with this
+                          Q/A pair and opens Quick Notes so the user can
+                          continue the conversation. If None, the
+                          Follow up affordance is omitted entirely.
         """
-        self._root      = root
-        self._question  = (question or '').strip()
-        self._provider  = provider
-        self._answer    = ''
-        self._auto_id   = None
-        self._canvas    = None
-        self._copy_id   = None
-        self._on_close  = on_close   # called once when the pill closes
+        self._root        = root
+        self._question    = (question or '').strip()
+        self._provider    = provider
+        self._answer      = ''
+        self._auto_id     = None
+        self._canvas      = None
+        self._copy_id     = None
+        self._followup_id = None
+        self._on_close    = on_close   # called once when the pill closes
+        self._on_followup = on_followup
 
         self._win = tk.Toplevel(root)
         self._win.overrideredirect(True)
@@ -219,7 +229,7 @@ class AskPill:
         c.create_text(pad_l, ans_y, text=text, width=text_w,
                       anchor='nw', font=_FONT, fill=_TEXT_CLR)
 
-        # Footer, Copy (left) and ✕ (right)
+        # Footer, Copy (left) — Follow up (centre, only when wired) — × (right)
         self._copy_id = c.create_text(
             pad_l, footer_y, text='⎘  Copy',
             anchor='nw', font=_FONT_S, fill=_MUTED)
@@ -227,8 +237,45 @@ class AskPill:
             w - pad_r, footer_y, text='×',
             anchor='ne', font=_FONT_S, fill=_MUTED)
 
-        # Hover highlights for Copy and ×
-        for item in (self._copy_id, close_id):
+        hover_items = [self._copy_id, close_id]
+
+        # Follow up affordance: use a real Label widget over the canvas
+        # rather than a canvas text item. Spent too many cycles fighting
+        # tk canvas hit-testing edge cases; a Label binds <Button-1>
+        # cleanly and ignores all the canvas tag_bind / 'break' /
+        # grab_set gotchas that were eating our clicks.
+        self._followup_id = None
+        if self._on_followup is not None and self._answer:
+            fu_lbl = tk.Label(
+                c, text='↺  Follow up',
+                bg=_PILL_BG, fg=_MUTED,
+                font=_FONT_S, cursor='hand2',
+                padx=6, pady=2,
+            )
+            # Place over the canvas at the footer y position, between
+            # Copy (left) and × (right). create_window anchors a widget
+            # to a canvas coordinate.
+            fu_x = pad_l + 78
+            self._followup_id = c.create_window(
+                fu_x, footer_y, anchor='nw', window=fu_lbl)
+
+            def _fu_click(_e=None):
+                logger.info('AskPill: Follow up clicked, dispatching to host.')
+                try:
+                    if self._on_followup:
+                        q, a = self._question, self._answer
+                        self._on_followup(q, a)
+                except Exception as _exc:
+                    logger.warning('AskPill follow-up failed: %s', _exc)
+                self._close()
+                return 'break'
+
+            fu_lbl.bind('<Button-1>', _fu_click)
+            fu_lbl.bind('<Enter>', lambda e: fu_lbl.configure(fg=_TEXT_CLR))
+            fu_lbl.bind('<Leave>', lambda e: fu_lbl.configure(fg=_MUTED))
+
+        # Hover highlights for footer items
+        for item in hover_items:
             c.tag_bind(item, '<Enter>', lambda e, i=item: c.itemconfig(i, fill=_TEXT_CLR))
             c.tag_bind(item, '<Leave>', lambda e, i=item: c.itemconfig(i, fill=_MUTED))
 
@@ -237,6 +284,12 @@ class AskPill:
             self._copy()
             return 'break'
         c.tag_bind(self._copy_id, '<ButtonPress-1>', _on_copy)
+
+        # Follow up click is handled by the Label widget itself (see
+        # earlier in this method). No canvas tag_bind needed — and
+        # in fact we MUST NOT bind to self._followup_id at the canvas
+        # level, because it's a create_window item and the user's
+        # click goes to the embedded Label, never to the canvas.
 
         # × and everything else on the canvas, close
         c.tag_bind(close_id, '<ButtonPress-1>', lambda e: self._close())

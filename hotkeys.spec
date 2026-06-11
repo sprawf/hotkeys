@@ -134,6 +134,28 @@ else:
     print(f'!! audio_editor_assets/tenacity missing — see audio_editor.py'
           f' header for bundling steps')
 
+
+# ── Tesseract language packs (Scan-doc: auto-orient + Extract text) ─────────
+# main.py's scan-preview code points TESSDATA_PREFIX at <app>/tessdata when
+# present, so Tesseract uses our bundled ara/eng/osd traineddata even if
+# the user has only English installed system-wide. Without this, Arabic
+# OCR + Tesseract OSD auto-orient silently fall back to whatever the
+# system tesseract.exe ships (usually English-only).
+#   ara.traineddata  ~16 MB  Arabic OCR
+#   eng.traineddata  ~22 MB  English OCR
+#   osd.traineddata  ~10 MB  Orientation + Script Detection (--psm 0)
+# Total ~37 MB — acceptable for a plug-and-play dist that "just works"
+# for Arabic + auto-orient without any user-side install.
+_tess_dir = ROOT / 'tessdata'
+if _tess_dir.exists():
+    for _p in _tess_dir.iterdir():
+        if _p.is_file() and _p.suffix in ('.traineddata',):
+            datas += [(str(_p), 'tessdata')]
+else:
+    print(f'!! tessdata/ missing — auto-orient + Arabic OCR will fall '
+          f'back to system Tesseract language packs.')
+
+
 # ── Binaries (native shared libs) ─────────────────────────────────────────────
 
 binaries = []

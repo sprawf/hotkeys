@@ -12,6 +12,13 @@ pynput>=1.7.6          # macro recorder keyboard/mouse capture & replay
 # ── System tray ───────────────────────────────────────────────────────────────
 pystray>=0.19.5
 
+# ── Whiteboard (pywebview / Edge WebView2) ───────────────────────────────────
+# whiteboard.py embeds the offline JS bundle in an Edge WebView2 window.
+# pythonnet is the Windows backend pywebview uses to bridge to the WinForms
+# WebView2 control.
+pywebview>=5.0
+pythonnet>=3.0.3; sys_platform == "win32"
+
 # ── Text-refine providers ─────────────────────────────────────────────────────
 groq>=0.4.0
 cerebras-cloud-sdk>=1.0.0
@@ -32,6 +39,15 @@ psutil>=5.9.0          # process utilities (used by screen recorder)
 
 # ── Spell check ──────────────────────────────────────────────────────────────
 pyspellchecker>=0.7.0
+
+# ── Translation (screenshot "Translate (Google)" menu item) ─────────────────
+deep-translator>=1.11.4   # scrapes Google Translate web endpoint, free + no API key
+
+# ── Offline OCR (screenshot "Translate (Offline Arabic OCR)" menu item) ─────
+# Needs system Tesseract binary + ara.traineddata in <app>/tessdata/.
+# See PROJECT.md "Tesseract Arabic OCR" section for dist bundling notes.
+pytesseract>=0.3.10
+opencv-python-headless>=4.8.0   # OCR image preprocessing (denoise / deskew / threshold)
 
 # ── Optional: local Qwen GGUF (heavy — skip for cloud-only builds) ────────────
 # llama-cpp-python>=0.2.0

@@ -60,27 +60,52 @@ if sys.platform == 'win32':
         user32.SendInput(len(inputs), arr, ctypes.sizeof(INPUT))
 
     def copy_to_clipboard(text: str):
-        """Copy text to the Windows clipboard."""
+        """Copy text to the Windows clipboard.
+
+        Defensive against the (rare but severe) failure mode where
+        OpenClipboard succeeds but Empty/SetClipboardText raises:
+        without a try/finally we'd leave the clipboard OPENED, holding
+        a global lock that makes every other app's clipboard ops fail
+        until Hotkeys exits. Same defence on the ctypes fallback: free
+        hMem on every path so we don't leak global heap."""
         try:
             import win32clipboard
             win32clipboard.OpenClipboard()
-            win32clipboard.EmptyClipboard()
-            win32clipboard.SetClipboardText(text, win32clipboard.CF_UNICODETEXT)
-            win32clipboard.CloseClipboard()
-        except Exception:
             try:
-                CF_UNICODETEXT = 13
+                win32clipboard.EmptyClipboard()
+                win32clipboard.SetClipboardText(
+                    text, win32clipboard.CF_UNICODETEXT)
+            finally:
+                try: win32clipboard.CloseClipboard()
+                except Exception: pass
+        except Exception:
+            CF_UNICODETEXT = 13
+            hMem = None
+            opened = False
+            try:
                 data = (text + '\0').encode('utf-16-le')
                 hMem = ctypes.windll.kernel32.GlobalAlloc(0x0042, len(data))
+                if not hMem:
+                    return
                 pMem = ctypes.windll.kernel32.GlobalLock(hMem)
                 ctypes.memmove(pMem, data, len(data))
                 ctypes.windll.kernel32.GlobalUnlock(hMem)
                 if user32.OpenClipboard(None):
+                    opened = True
                     user32.EmptyClipboard()
-                    user32.SetClipboardData(CF_UNICODETEXT, hMem)
-                    user32.CloseClipboard()
+                    if user32.SetClipboardData(CF_UNICODETEXT, hMem):
+                        # Clipboard now owns hMem; do NOT free it.
+                        hMem = None
             except Exception:
                 pass
+            finally:
+                if opened:
+                    try: user32.CloseClipboard()
+                    except Exception: pass
+                if hMem is not None:
+                    # We allocated but ownership wasn't taken; free it.
+                    try: ctypes.windll.kernel32.GlobalFree(hMem)
+                    except Exception: pass
 
     def copy_selection():
         """Simulate Ctrl+C to copy the current selection into the clipboard."""

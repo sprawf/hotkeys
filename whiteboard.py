@@ -561,6 +561,20 @@ def main():
     from win_geometry import center_on_work_area
     x, y, W, H = center_on_work_area(1216, 796)
 
+    prewarm = '--prewarm' in sys.argv
+    # NOTE: we deliberately don't use create_window(hidden=True) for prewarm.
+    # pywebview's hidden flag creates the WebView2 control without painting,
+    # which leaves the React app un-rendered until something forces a redraw.
+    # The result: subsequent ShowWindow() displays a blank white surface
+    # because the React tree was never given a chance to mount.
+    # Instead we always create visible, position the window briefly offscreen
+    # (so the user never sees the splash) and hide it via ShowWindow inside
+    # the `loaded` event after the first paint completes. That gives us a
+    # fully-rendered window that just happens to be hidden, so any later
+    # ShowWindow() is instant and shows real content.
+    if prewarm:
+        # Offscreen until loaded → hidden
+        x, y = -32000, -32000
     window = webview.create_window(
         title='Whiteboard (Shift+F8)',
         url=url,
@@ -581,7 +595,61 @@ def main():
         _setup_window_icon(window)
         _force_light_titlebar(window)
         _auto_handle_permissions(window)
+        # Prewarm finalize: window has now painted at the offscreen
+        # position with a fully-mounted React tree, so a Win32 ShowWindow
+        # later will reveal real content (not a blank white canvas).
+        # Move the window to the proper on-screen position BEFORE hiding,
+        # so when the host app fires SW_SHOW the window appears where
+        # the user expects, not at -32000,-32000.
+        if prewarm:
+            try:
+                import ctypes as _c
+                from ctypes import wintypes as _wt
+                from win_geometry import center_on_work_area as _cw
+                _u = _c.windll.user32
+                _x, _y, _w, _h = _cw(1216, 796)
+                WB_TITLE = 'Whiteboard (Shift+F8)'
+                hwnd_found = [0]
+                EnumProc = _c.WINFUNCTYPE(_wt.BOOL, _wt.HWND, _wt.LPARAM)
+                def _cb(h, _):
+                    buf = _c.create_unicode_buffer(64)
+                    _u.GetWindowTextW(h, buf, 64)
+                    if buf.value == WB_TITLE:
+                        hwnd_found[0] = h
+                        return False
+                    return True
+                _u.EnumWindows(EnumProc(_cb), 0)
+                hwnd = hwnd_found[0]
+                if hwnd:
+                    SWP_NOSIZE = 0x0001; SWP_NOZORDER = 0x0004
+                    SWP_NOACTIVATE = 0x0010
+                    _u.SetWindowPos(hwnd, 0, _x, _y, 0, 0,
+                                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)
+                    SW_HIDE = 0
+                    _u.ShowWindow(hwnd, SW_HIDE)
+                    _dbg('[prewarm] window painted, moved on-screen, hidden')
+                else:
+                    _dbg('[prewarm] could not find hwnd to hide')
+            except Exception as e:
+                _dbg(f'[prewarm] hide failed: {e}')
     window.events.loaded += _on_loaded
+    # Hide-on-close: clicking X keeps the subprocess alive with the
+    # window hidden. Subsequent Shift+F8 from the host app reuses the
+    # existing window via win32 ShowWindow(SW_SHOW) → sub-100 ms
+    # re-open. The subprocess only really exits when Hotkeys itself
+    # exits (handle severed by the PowerShell intermediary).
+    #
+    # (Investigated and exonerated re: a BSOD reported 2026-06-10 —
+    # the stop code 0x000000D1 was caused by a TPM hardware error
+    # logged 6 s before the crash; user-mode Python/Tk cannot produce
+    # kernel-mode IRQL violations.)
+    def _on_closing():
+        try:
+            window.hide()
+        except Exception:
+            return True   # let pywebview proceed if hide() can't fire
+        return False      # cancel the actual close
+    window.events.closing += _on_closing
 
     try:
         webview.start(

@@ -1904,6 +1904,13 @@ class TranscribePanel:
                 if not job.segments:
                     skipped.append(f'{f.name} (no speech)')
                     continue
+                # Cancelled mid-file → transcribe_file returns a PARTIAL
+                # job. Writing it as the .srt would leave a truncated
+                # subtitle on disk that the next batch run would skip
+                # forever (the existence check would say "already done").
+                if self._cancel.is_set():
+                    skipped.append(f'{f.name} (cancelled mid-file)')
+                    continue
                 # Hand off to the standard SRT exporter so the format
                 # exactly matches what the manual Export → SRT writes.
                 _export(job, 'srt', srt_target)
@@ -2013,6 +2020,27 @@ class TranscribePanel:
         if self._worker and self._worker.is_alive() and not self._destroyed:
             self._poll_id = self.parent.after(150, self._poll)
         else:
+            # Worker died between the drain at the top and now. There's
+            # a window where it could have posted 'done' / 'error' /
+            # 'cancelled' on its way out; do one FINAL drain so we
+            # don't leave the run stuck on "in progress" with the
+            # terminal message stranded in the queue.
+            try:
+                while True:
+                    kind, a, b, c = self._msg_q.get_nowait()
+                    if kind == 'done':
+                        self._finish_job(a, b)
+                        return
+                    if kind == 'cancelled':
+                        self._cancelled()
+                        return
+                    if kind == 'error':
+                        self._errored(a, b, c)
+                        return
+                    if kind == 'phase':
+                        self._update_phase(a, b, c)
+            except queue.Empty:
+                pass
             self._poll_id = None
 
     def _update_phase(self, phase: str, pct: float, label: str | None) -> None:

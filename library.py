@@ -1850,10 +1850,12 @@ class LibraryWindow:
         self._tab_built.add(tab)
 
     def _render_cards(self) -> None:
-        """Data-mutation entry: invalidate the active tab and rebuild it.
-        Tab switches should call _show_active_tab instead, which preserves
-        the cache."""
-        self._invalidate_tab(self._active_tab)
+        """Data-mutation entry for the PROMPTS tab. Always invalidates
+        'prompts' explicitly; previously this used self._active_tab,
+        which meant edit-a-prompt-from-elsewhere left the prompts tab
+        cache stale AND destroyed whichever tab (e.g. Transcribe with
+        a live worker) the user happened to be looking at."""
+        self._invalidate_tab('prompts')
 
     # ── Tab render safety guard ──────────────────────────────────────────────
     #

@@ -144,6 +144,14 @@ class Transcriber:
         self._model_ready   = threading.Event()
         self._queue         = queue.Queue()
         self._cancelled     = threading.Event()
+        # Per-job generation counter. Bumped on every submit() AND
+        # cancel(). The worker tags each in-flight job with the gen it
+        # observed at start; on completion it re-checks self._gen and
+        # drops the result if it has moved. Without this, a job that
+        # was cancelled mid-_transcribe_hybrid could deliver as the
+        # next job's result (the global event gets cleared by submit()).
+        self._gen = 0
+        self._gen_lock = threading.Lock()
 
         self._preview_model      = None
         self._preview_model_lock = threading.Lock()   # guards concurrent use of _preview_model
@@ -326,10 +334,22 @@ class Transcriber:
 
     def submit(self, audio: np.ndarray):
         self._cancelled.clear()
-        self._queue.put(audio)
+        with self._gen_lock:
+            self._gen += 1
+            job_gen = self._gen
+        # Queue the (gen, audio) pair so the worker can verify on
+        # completion that this job is still the "current" one.
+        self._queue.put((job_gen, audio))
 
     def cancel(self):
         self._cancelled.set()
+        # Bump gen so any in-flight job, when it finishes, sees the
+        # mismatch and drops its result. Without this, finishing job A
+        # after cancel and the user re-submitting job B would deliver
+        # A's text as if it were B's (the _cancelled flag was cleared
+        # by submit(B)).
+        with self._gen_lock:
+            self._gen += 1
         for q in (self._queue, self._preview_queue):
             while not q.empty():
                 try:
@@ -339,10 +359,17 @@ class Transcriber:
 
     def _worker(self):
         while True:
-            audio = self._queue.get()
-            if audio is None:
+            item = self._queue.get()
+            if item is None:
                 break
-            if self._cancelled.is_set():
+            # Tolerate the historical shape: an old caller might still
+            # put a bare ndarray on the queue. Treat that as gen=0
+            # (always stale; will drop).
+            if isinstance(item, tuple) and len(item) == 2:
+                job_gen, audio = item
+            else:
+                job_gen, audio = 0, item
+            if self._cancelled.is_set() or job_gen != self._gen:
                 continue
             ready = self._model_ready.wait(timeout=60)
             if not ready or self._model is None:
@@ -352,14 +379,20 @@ class Transcriber:
             self._on_status('transcribing')
             try:
                 text, language, duration = self._transcribe_hybrid(audio)
-                if not self._cancelled.is_set():
+                # Recheck after transcription: a cancel that happened
+                # WHILE we were in _transcribe_hybrid would set
+                # _cancelled, but a subsequent submit() would clear
+                # it and then the result would deliver as if it were
+                # the new job. The gen check catches this.
+                if (not self._cancelled.is_set()
+                        and job_gen == self._gen):
                     self._on_result(text, language, duration)
             except Exception:
-                if not self._cancelled.is_set():
+                if not self._cancelled.is_set() and job_gen == self._gen:
                     self._on_status('error')
                 self._dump_traceback()
             finally:
-                if not self._cancelled.is_set():
+                if not self._cancelled.is_set() and job_gen == self._gen:
                     self._on_status('idle')
 
     # ── Hybrid cloud-first transcription ──────────────────────────────────────

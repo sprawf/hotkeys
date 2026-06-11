@@ -5,12 +5,15 @@ Reuses ScreenCapture from screen_recorder.py.
 Encoding uses Pillow (already a dependency).
 """
 
+import logging
 import os
 import threading
 import time
 import tkinter as tk
 import tkinter.filedialog as fd
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 import customtkinter as ctk
 from PIL import Image
@@ -50,12 +53,19 @@ class GifRecorder:
         fps: int = 10,
         max_width: int = 640,
         max_duration_s: float = 30.0,
+        # ~1.5 GB worth of raw RGB frames (PIL.Image in RAM). The 1280px
+        # 5-minute combo is uncapped ≈ 12 GB and OOMs, plus the encode
+        # path makes a second quantized copy. This cap stops capture
+        # cleanly before either runs out of memory; the user sees the
+        # already-recorded portion encode and save.
+        max_total_bytes: int = 1_500 * 1024 * 1024,
     ) -> None:
-        self.hwnd           = hwnd
-        self.mon            = mon
-        self.fps            = max(1, min(fps, 30))
-        self.max_width      = max(240, max_width)
-        self.max_duration_s = max(5.0, max_duration_s)
+        self.hwnd            = hwnd
+        self.mon             = mon
+        self.fps             = max(1, min(fps, 30))
+        self.max_width       = max(240, max_width)
+        self.max_duration_s  = max(5.0, max_duration_s)
+        self.max_total_bytes = int(max_total_bytes)
 
         self._recording     = False
         self._encoding      = False
@@ -149,6 +159,10 @@ class GifRecorder:
             interval = 1.0 / self.fps
             t_start  = time.perf_counter()
             next_t   = t_start
+            # Approx bytes per uncompressed RGB frame.
+            bytes_per_frame = out_w * out_h * 3
+            # How many frames we can hold before we'd exceed the cap.
+            max_frames = max(1, self.max_total_bytes // bytes_per_frame)
 
             while not self._stop_event.is_set():
                 # Max duration cap
@@ -158,6 +172,21 @@ class GifRecorder:
                             on_cap_reached()
                         except Exception:
                             pass
+                    break
+
+                # Max RAM cap (hard stop). Prevents the documented
+                # ~12 GB OOM at 1280px × 15fps × 5min. We've already
+                # recorded `max_frames` worth; stop and encode what we have.
+                with self._lock:
+                    n = len(self._frames_rgb)
+                if n >= max_frames:
+                    logger.warning(
+                        f'GIF: RAM cap reached after {n} frames '
+                        f'(~{n * bytes_per_frame // (1024*1024)} MB); '
+                        f'stopping early to encode what we have.')
+                    if on_cap_reached:
+                        try: on_cap_reached()
+                        except Exception: pass
                     break
 
                 # Precise timing, wait until next frame slot

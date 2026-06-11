@@ -286,6 +286,7 @@ Voice-to-text (Whisper), file transcription, speaker diarization, and the whiteb
 | 🎬 | **Screen recorder** | MP4, optional mic audio, any window or region (`Shift+F2`) |
 | 🎞️ | **GIF recorder** | Animated GIF, any region, adjustable FPS (`Shift+F3`) |
 | 📸 | **AI screenshot** | Capture + ask AI anything about it (`PrtSc`) |
+| 📄 | **Scan & edit** | Document scanner + Lightroom-lite editor in one window. 4-corner perspective fix, Magic Color / Grayscale / B&W modes, auto-orient via Tesseract OCR, free 8-handle crop, ✨ Auto Enhance, sliders for Brightness/Contrast/Saturation/Sharpness/Warmth, undo (`Ctrl+Z`), Save PDF, Copy, Extract text. Right-click any screenshot region → **Scan document**. |
 | 📝 | **Quick Notes** | Floating scratchpad with image-paste OCR (`Shift+F7`) |
 | 🔗 | **Web search** | Quick-launch web search with selection (`Shift+F5`) |
 | ⛓️ | **Prompt chains** | Run several prompts in sequence on the same text (`Shift+F6`) |

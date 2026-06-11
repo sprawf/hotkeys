@@ -20,7 +20,7 @@ from theme import (
     FONT_FAMILY,
     OK, WARN, ERR,
 )
-from storage import load_notes, save_notes
+from storage import load_notes, save_notes, save_notes_coalesced
 from dialogs import PopupMenu, confirm, alert
 
 logger = logging.getLogger(__name__)
@@ -31,6 +31,70 @@ _MAX_RENDERED = 250        # max note rows rendered in list (virtual perf cap)
 
 _W, _H  = 1216, 796        # window size, matches Claude desktop app
 _LIST_W = 300              # left panel fixed width
+
+# Chat-kind notes (Shift+F4 follow-ups) use the existing
+# provider.refine() single-call API; the conversation is packed into
+# the user text with "[YOU]" / "[ASSISTANT]" labels. The system prompt
+# below is intentionally hard-handed: weaker phrasing made the model
+# autocomplete the transcript and hallucinate dozens of fake turns of
+# both sides. Marker tokens use [YOU] / [ASSISTANT] (square-bracket
+# style) rather than "User:" / "Assistant:" so the input looks less
+# like a transcript completion prompt to the underlying LLM.
+_CHAT_SYSTEM_PROMPT = (
+    'CRITICAL OUTPUT RULES — read carefully:\n'
+    '\n'
+    'The user message contains a multi-turn conversation transcript '
+    'where each turn is prefixed by [YOU] or [ASSISTANT]. The LAST line '
+    'prefixed [YOU] is the user\'s CURRENT question. Every earlier '
+    'turn is just CONTEXT.\n'
+    '\n'
+    '1. Output ONLY your reply to the final [YOU] line.\n'
+    '2. NEVER prefix your reply with "Assistant:", "[ASSISTANT]", '
+    'or any role label. The reply text starts directly.\n'
+    '3. NEVER invent additional turns. Do not write "User:" or "[YOU]" '
+    'or pretend the user asked anything else.\n'
+    '4. NEVER continue the transcript past your single reply.\n'
+    '5. Answer concisely — two or three plain-text sentences. No '
+    'markdown, no bullet points, no caveats, no conversational filler.\n'
+    '\n'
+    'If you produce a transcript continuation, role labels, or '
+    'multiple turns, you have failed the task.'
+)
+
+
+# Patterns the model still sometimes leaks into the start of its reply
+# despite the rules above. We strip them defensively so the user never
+# sees "Assistant: ..." prefixes.
+_LEADING_LABEL_RE = None  # lazily compiled below
+
+def _clean_chat_reply(text: str) -> str:
+    """Strip any leading role label and cut off hallucinated transcript
+    continuation. Keeps only the model's reply to the LAST user turn.
+
+    Defensive layer on top of _CHAT_SYSTEM_PROMPT — even with a strong
+    prompt, smaller / cheaper LLMs sometimes leak a leading
+    "Assistant: " or invent extra "User: ..." turns. We chop both.
+    """
+    import re
+    global _LEADING_LABEL_RE
+    if _LEADING_LABEL_RE is None:
+        _LEADING_LABEL_RE = re.compile(
+            r'^\s*(\[?(assistant|ai|model|bot)\]?\s*[:\-]?\s*)',
+            re.IGNORECASE)
+    out = text or ''
+    # 1. Strip leading role label.
+    out = _LEADING_LABEL_RE.sub('', out, count=1)
+    # 2. If the model hallucinated a "User:" / "[YOU]" continuation,
+    #    cut everything from that marker onward — that's our cue.
+    cut_markers = ('\n[YOU]', '\nUser:', '\n[USER]', '\nuser:',
+                   '\nYou:', '\nQ:', '\n>>> ', '\nUSER:')
+    earliest = len(out)
+    for m in cut_markers:
+        idx = out.find(m)
+        if idx != -1 and idx < earliest:
+            earliest = idx
+    out = out[:earliest].rstrip()
+    return out
 
 # ── Palette, left panel follows app theme; editor stays dark/neutral ─────────
 _WIN    = '#0e0e0e'        # outermost bg  (app BG)
@@ -151,8 +215,36 @@ def _word_count(text: str) -> str:
     return f'{n}w' if n else ''
 
 
+def _note_kind(note: dict) -> str:
+    """'chat' for chat-kind notes (Shift+F4 Ask follow-ups), else 'text'.
+    Legacy notes without the `kind` field default to 'text', so existing
+    data continues to render and save through the original code path."""
+    return 'chat' if note.get('kind') == 'chat' else 'text'
+
+
+def _chat_title_from_messages(messages: list, fallback: str = 'New chat') -> str:
+    """First non-empty user message becomes the auto-title for a chat
+    note. Truncated to keep list rows tidy."""
+    for m in messages or []:
+        if m.get('role') == 'user':
+            c = (m.get('content') or '').strip()
+            if c:
+                return c[:80]
+    return fallback
+
+
 def _note_title(note: dict) -> str:
-    # Unified notes: prefer text first line, then checklist, then voice
+    # Chat-kind: prefer the explicit (editable) title, fall back to the
+    # first user message. We do NOT mix in the text-note fallbacks
+    # because a chat note has its own fields.
+    if _note_kind(note) == 'chat':
+        t = (note.get('title') or '').strip()
+        if t:
+            return t[:48]
+        derived = _chat_title_from_messages(note.get('messages', []),
+                                            fallback='')
+        return derived[:48] if derived else '(new chat)'
+    # Text notes: prefer text first line, then checklist, then voice
     raw = note.get('text', '').strip()
     if raw:
         lines = [l.strip() for l in raw.splitlines() if l.strip()]
@@ -168,7 +260,17 @@ def _note_title(note: dict) -> str:
 
 
 def _note_preview(note: dict) -> str:
-    # Unified notes: text body → checklist count → voice snippet
+    # Chat-kind: last AI line (so the list shows what the chat is about).
+    if _note_kind(note) == 'chat':
+        msgs = note.get('messages', [])
+        for m in reversed(msgs):
+            if m.get('role') == 'assistant':
+                c = (m.get('content') or '').strip()
+                if c:
+                    return c.splitlines()[0][:58]
+        n = sum(1 for m in msgs if m.get('content'))
+        return f'{n} message(s)' if n else 'New chat'
+    # Text notes: text body → checklist count → voice snippet
     raw = note.get('text', '').strip()
     if raw:
         lines = [l.strip() for l in raw.splitlines() if l.strip()]
@@ -375,6 +477,36 @@ class QuickNotesWindow(ctk.CTkToplevel):
         self._voice_transcript = ''
         self._editing_nid: str | None = None   # nid of note open in editor, or None for new
         self._prev_note_nid: str | None = None # nid of note open before current (for swipe-back)
+
+        # ── Chat-kind notes (Shift+F4 follow-ups) ─────────────────────────────
+        # Chat state is fully isolated from text-note state above:
+        # nothing in the text-note code path touches these, and the
+        # chat code path never touches the text-note fields. Lets us
+        # keep the rest of Quick Notes' editor untouched.
+        self._chat_messages: list = []        # [{role,content}, ...]
+        self._chat_title:    str  = ''        # editable, derived from msg[0] if blank
+        self._chat_inflight_gen: int = 0      # bump → drop stale completions
+        # Reuse the same LLM provider the rest of Hotkeys uses; falls
+        # back to None when launched without one (chat send will then
+        # render an inline error instead of crashing).
+        self._chat_provider = provider
+        self._chat_pending:  bool = False     # "Working..." placeholder visible
+        # Debounced title save+refresh: cancel-and-reschedule pattern
+        # so the left list updates ~200ms after the user stops typing,
+        # not on every keystroke (which would hammer save_notes).
+        self._chat_title_save_after_id = None
+        # User-editable rendered transcript. Stored as the note's
+        # `text` field on disk so the user's edits persist; absent on
+        # newly created chats (then we render from messages instead).
+        self._chat_text_override: str = ''
+        self._chat_text_save_after_id = None
+        self._chat_text_render_in_progress = False
+        # Widget refs; cleared by _show_panel each rebuild.
+        self._chat_transcript = None
+        self._chat_input      = None
+        self._chat_send_btn   = None
+        self._chat_stop_btn   = None
+        self._chat_title_var  = None
 
         # OCR state
         self._ocr_pending         = False
@@ -602,6 +734,19 @@ class QuickNotesWindow(ctk.CTkToplevel):
         )
         nb.pack(side='right', padx=(0, 10), pady=6)
         _attach_tooltip(nb, 'New note  (saves current)')
+
+        # New-chat button, same size, sits just to the left of New-note.
+        # Creates a chat-kind note (Shift+F4 Ask-style follow-up thread).
+        cb = ctk.CTkButton(
+            hdr, text='💬', width=32, height=32,
+            fg_color=_SURF2, hover_color=_SURF3,
+            text_color=_T1, font=(FONT_FAMILY, 14),
+            corner_radius=8, cursor='hand2',
+            anchor='center',
+            command=self._new_chat,
+        )
+        cb.pack(side='right', padx=(0, 4), pady=6)
+        _attach_tooltip(cb, 'New chat  (Ask-style follow-up thread)')
 
         # Separator
         tk.Frame(parent, bg=_DIV, height=1).pack(fill='x')
@@ -993,6 +1138,11 @@ class QuickNotesWindow(ctk.CTkToplevel):
     def _make_note_row(self, note: dict) -> None:
         nid    = note.get('id', '')
         title  = _note_title(note)
+        # Tag chat-kind rows visually so the user can tell at a glance.
+        # Bare '💬 ' prefix is cheaper than another widget and matches
+        # the rest of the list's title-only rendering.
+        if _note_kind(note) == 'chat':
+            title = '💬  ' + title
         prev   = _note_preview(note)
         ts     = _rel_time(note.get('created_at', ''))
         ntype  = note.get('type', 'text')
@@ -1076,7 +1226,14 @@ class QuickNotesWindow(ctk.CTkToplevel):
             prev_lbl.pack(side='left', fill='x', expand=True)
 
         # ── Hover / selection state ───────────────────────────────────────────
+        # IMPORTANT: include prev_lbl. Without it, the preview-text
+        # Label silently eats clicks (Tk doesn't bubble events to
+        # parents). For chat-kind rows the preview is the last AI reply
+        # — a multi-line block that fills most of the row's clickable
+        # area. The user then has to hunt for the small title to land
+        # a click; symptom was "needs 2-3 clicks to open chat note".
         tk_widgets = [row, content, top, bot, title_lbl]
+        if prev_lbl: tk_widgets.append(prev_lbl)
         if pin_lbl:  tk_widgets.append(pin_lbl)
         if prev_lbl: tk_widgets.append(prev_lbl)
         _active = [False]
@@ -1147,7 +1304,7 @@ class QuickNotesWindow(ctk.CTkToplevel):
                 break
         self._notes_cache = notes
         self._notes_dirty = False
-        threading.Thread(target=lambda: save_notes(notes), daemon=True).start()
+        save_notes_coalesced(notes)
         if self._editing_nid == nid:
             self._editing_nid = None
             self._reset_editor()
@@ -1165,7 +1322,7 @@ class QuickNotesWindow(ctk.CTkToplevel):
                 break
         self._notes_cache = notes
         self._notes_dirty = False
-        threading.Thread(target=lambda: save_notes(notes), daemon=True).start()
+        save_notes_coalesced(notes)
         self._refresh_list()
 
     def _del_note_permanent(self, nid: str) -> None:
@@ -1174,7 +1331,7 @@ class QuickNotesWindow(ctk.CTkToplevel):
         notes = [n for n in self._notes_cache if n.get('id') != nid]
         self._notes_cache = notes
         self._notes_dirty = False
-        threading.Thread(target=lambda: save_notes(notes), daemon=True).start()
+        save_notes_coalesced(notes)
         if self._editing_nid == nid:
             self._editing_nid = None
             self._reset_editor()
@@ -1185,11 +1342,35 @@ class QuickNotesWindow(ctk.CTkToplevel):
         """Load an existing note into the editor for viewing / editing."""
         if self._editing_nid == nid:
             return  # already open
-        # Save any unsaved current draft first (new note only)
+        # Save any unsaved edits in the CURRENT editor before switching.
+        # Previously this only handled the new-draft case; editing an
+        # existing note then clicking another row silently dropped the
+        # edits. Branches on what's currently open.
         if self._editing_nid is None:
+            # Brand-new unsaved draft.
             data = self._get_note_data()
             if data:
                 self._save_current_as_new()
+        elif self._is_chat_mode():
+            # Chat note: persist title + messages.
+            self._save_current_chat()
+        else:
+            # Existing text-kind note: persist text/items/voice/pinned.
+            data = self._get_note_data()
+            if data:
+                try:
+                    notes = load_notes()
+                    for n in notes:
+                        if n.get('id') == self._editing_nid:
+                            n['text']   = data['text']
+                            n['items']  = data['items']
+                            n['voice']  = data['voice']
+                            n['pinned'] = self._pinned
+                            break
+                    self._invalidate_notes_cache()
+                    save_notes_coalesced(notes)
+                except Exception:
+                    logger.exception('save-on-navigate failed for text note')
         self._prev_note_nid = self._editing_nid   # remember for swipe-back
         note = next((n for n in load_notes() if n.get('id') == nid), None)
         if note is None:
@@ -1197,6 +1378,27 @@ class QuickNotesWindow(ctk.CTkToplevel):
         self._editing_nid = nid
         self._pinned      = bool(note.get('pinned', False))
         self._color       = None
+
+        # ── Chat-kind note: skip text-note load path entirely ────────────────
+        # This is a fully separate code path from the unified text editor;
+        # zero out the text-note fields so a later save can never write
+        # chat content into text fields by accident.
+        if _note_kind(note) == 'chat':
+            self._chat_messages = [dict(m) for m in note.get('messages', [])]
+            self._chat_title = (note.get('title') or '').strip()
+            # Restore the user-edited rendered transcript if one exists,
+            # so opening a chat the user edited preserves their edits.
+            self._chat_text_override = note.get('text', '') or ''
+            self._chat_inflight_gen += 1   # cancel anything in flight
+            self._chat_pending = False
+            self._text_content     = ''
+            self._checklist_items  = [{'text': '', 'checked': False}]
+            self._voice_transcript = ''
+            try: self._pin_btn.configure(fg='#d4aa00' if self._pinned else _T3)
+            except Exception: pass
+            self._show_panel()
+            self._refresh_list()
+            return
 
         # ── Unified load with backwards compat ───────────────────────────────
         ntype = note.get('type', 'text')   # legacy field
@@ -1241,7 +1443,11 @@ class QuickNotesWindow(ctk.CTkToplevel):
         self.after(30, self._focus_content)
 
     def _save_current_as_new(self) -> None:
-        """Persist the current editor draft as a brand-new note (no nid)."""
+        """Persist the current editor draft as a brand-new note (no nid).
+        Chat-kind notes have their own persistence path; this method
+        is a no-op when a chat note is the current editor."""
+        if self._is_chat_mode():
+            return
         data = self._get_note_data()
         if not data:
             return
@@ -1286,6 +1492,13 @@ class QuickNotesWindow(ctk.CTkToplevel):
     def _new_note(self) -> None:
         """Save current note (new draft or update existing), then open a fresh editor."""
         self._prev_note_nid = self._editing_nid   # remember for swipe-back
+        # Chat-kind current editor saves itself on every reply; just
+        # close out the chat without going through the text-note save
+        # flow (which would clobber chat data with empty text fields).
+        if self._is_chat_mode():
+            self._save_current_chat()
+            self._reset_editor()
+            return
         data = self._get_note_data()
         if data:
             if self._editing_nid:
@@ -1299,7 +1512,7 @@ class QuickNotesWindow(ctk.CTkToplevel):
                         n['pinned'] = self._pinned
                         break
                 self._invalidate_notes_cache()
-                threading.Thread(target=lambda: save_notes(notes), daemon=True).start()
+                save_notes_coalesced(notes)
                 logger.info('Quick note updated via New')
             else:
                 note = {
@@ -1314,7 +1527,7 @@ class QuickNotesWindow(ctk.CTkToplevel):
                 notes = load_notes()
                 notes.append(note)
                 self._invalidate_notes_cache()
-                threading.Thread(target=lambda: save_notes(notes), daemon=True).start()
+                save_notes_coalesced(notes)
                 logger.info('Quick note saved via New')
 
         self._reset_editor()
@@ -1425,7 +1638,7 @@ class QuickNotesWindow(ctk.CTkToplevel):
                 n['pinned'] = not n.get('pinned', False)
                 break
         self._invalidate_notes_cache()
-        threading.Thread(target=lambda: save_notes(notes), daemon=True).start()
+        save_notes_coalesced(notes)
         # If this note is open in the editor, update the in-memory pin state too
         if self._editing_nid == nid:
             self._pinned = not self._pinned
@@ -2043,13 +2256,39 @@ class QuickNotesWindow(ctk.CTkToplevel):
     def _show_panel(self) -> None:
         for w in self._content_host.winfo_children():
             w.destroy()
-        self._panel_unified()
+        # Chat-kind widget refs were children of _content_host; the
+        # destroy above invalidated them. Null them so any in-flight
+        # update_idle work doesn't talk to a dead Tk widget.
+        self._chat_transcript = None
+        self._chat_input      = None
+        self._chat_send_btn   = None
+        self._chat_stop_btn   = None
+        self._chat_title_var  = None
+        # Dispatch on whether we're editing a chat-kind note.
+        if self._is_chat_mode():
+            self._panel_chat()
+        else:
+            self._panel_unified()
         # _content_host's children were all destroyed including the OCR
         # overlay widgets (status strip + preview thumbnail). Without
         # rebuilding them, self._ocr_status_lbl points at a dead widget
         # and any subsequent paste / OCR call fails silently with
         # "invalid command name". Rebuild every time the panel rebuilds.
         self._build_ocr_overlays()
+
+    def _is_chat_mode(self) -> bool:
+        """True iff the editor is currently showing a chat-kind note.
+        Detected by looking up the open note's `kind` in the on-disk
+        list; falls back to False on any error so text behavior is
+        the safe default."""
+        if not self._editing_nid:
+            return False
+        try:
+            note = next((n for n in load_notes()
+                         if n.get('id') == self._editing_nid), None)
+            return note is not None and _note_kind(note) == 'chat'
+        except Exception:
+            return False
 
     def _build_ocr_overlays(self) -> None:
         """(Re)construct the OCR status banner + preview thumbnail as
@@ -2150,6 +2389,785 @@ class QuickNotesWindow(ctk.CTkToplevel):
         self._tb._textbox.bind('<Button-1>', self._on_body_click, add='+')
 
         pass  # no spell-check in notes, keep editor clean
+
+    # ── Chat-kind note panel ─────────────────────────────────────────────────
+
+    def _panel_chat(self) -> None:
+        """Chat panel for chat-kind notes. Layout:
+
+            ┌──────────────────────────────────────┐
+            │ <editable title>                     │
+            │ ──────────────────────────────────── │
+            │                                      │
+            │ You: ...                             │
+            │ AI:  ...                             │
+            │ ...                                  │   ← scrollable transcript
+            │                                      │
+            ├──────────────────────────────────────┤
+            │ [ Ask follow-up...      ] [Send/Stop]│
+            └──────────────────────────────────────┘
+
+        Transcript is a read-only CTkTextbox so the user can select
+        and copy any text. Send button becomes Stop while a reply is
+        in flight; clicking Stop bumps _chat_inflight_gen so the
+        worker's result is dropped on arrival."""
+        outer = tk.Frame(self._content_host, bg=_EDIT)
+        outer.pack(fill='both', expand=True)
+
+        # ── Single textbox (title line + transcript), matches normal note ──
+        # No separate title widget — line 1 is the title, rest is the body,
+        # exactly like a regular text note. The title gets the same
+        # `title_line` tag treatment (20 bold) the normal editor uses.
+        self._chat_title_var = tk.StringVar(
+            value=(self._chat_title
+                   or _chat_title_from_messages(self._chat_messages)))
+        self._chat_transcript = ctk.CTkTextbox(
+            outer, font=(_ACTIVE_FF, 17), fg_color=_EDIT,
+            text_color=_T1, border_width=0,
+            scrollbar_button_color='#333',
+            scrollbar_button_hover_color='#444',
+            wrap='word', corner_radius=0,
+        )
+        self._chat_transcript.pack(fill='both', expand=True,
+                                    padx=18, pady=(14, 4))
+        tb = self._chat_transcript._textbox
+        tb.configure(undo=True, maxundo=100)
+        tb.tag_configure('title_line', font=(_ACTIVE_FF, 20, 'bold'))
+        tb.tag_configure('placeholder', foreground=_T3,
+                         font=(_ACTIVE_FF, 17, 'italic'))
+        # Standard editor bindings: same right-click menu, smart paste,
+        # undo, swipe-save. These mirror the regular text-note editor
+        # bindings in _panel_unified so the chat note feels identical
+        # to a normal note from the user's perspective.
+        tb.bind('<KeyRelease>',        self._on_chat_transcript_keyrelease)
+        tb.bind('<Button-3>',          self._on_chat_transcript_rclick)
+        tb.bind('<Control-v>',         self._on_chat_ctrl_v)
+        tb.bind('<Control-V>',         self._on_chat_ctrl_v)
+        tb.bind('<ButtonPress-1>',     self._swipe_press,   add='+')
+        tb.bind('<ButtonRelease-1>',   self._swipe_release, add='+')
+        tb.bind('<ButtonPress-3>',     self._swipe_press,   add='+')
+        tb.bind('<ButtonRelease-3>',   self._swipe_release, add='+')
+
+        # ── Bottom input bar ─────────────────────────────────────────────
+        bar = tk.Frame(outer, bg=_EDIT)
+        bar.pack(fill='x', padx=18, pady=(0, 14))
+
+        # Multi-line entry would be nice but a single-line CTkEntry is
+        # consistent with the rest of the app's input affordances. Enter
+        # sends; nothing else.
+        self._chat_input = ctk.CTkEntry(
+            bar, placeholder_text='Ask follow-up…',
+            placeholder_text_color=_T3,
+            font=(_ACTIVE_FF, 13), fg_color=_SURF2,
+            border_color=_DIV, border_width=1, text_color=_T1,
+            height=34,
+        )
+        self._chat_input.pack(side='left', fill='x', expand=True)
+        self._chat_input.bind('<Return>', lambda e: self._on_chat_send())
+        # Standard Cut / Copy / Paste / Select All right-click menu.
+        # Bind on both the CTk wrapper AND the underlying tk.Entry so
+        # the menu fires regardless of which pixel the right-click lands
+        # on (CTk's frame catches some clicks, the inner Entry catches
+        # others).
+        try:
+            self._chat_input.bind('<Button-3>', self._on_chat_input_rclick)
+            inner = getattr(self._chat_input, '_entry', None)
+            if inner is not None:
+                inner.bind('<Button-3>', self._on_chat_input_rclick)
+        except Exception:
+            pass
+
+        # Send / Stop button (same slot, label flips during stream).
+        self._chat_send_btn = ctk.CTkButton(
+            bar, text='Send', width=72, height=34,
+            fg_color=_ACCENT, hover_color='#6d28d9',
+            text_color='#ffffff', font=(FONT_FAMILY, 12, 'bold'),
+            corner_radius=8, command=self._on_chat_send,
+        )
+        self._chat_send_btn.pack(side='right', padx=(8, 0))
+
+        # Render the existing transcript so a reopen shows past turns.
+        self._render_chat_transcript()
+        self._chat_input.focus_set()
+
+    def _on_chat_input_rclick(self, event) -> None:
+        """Right-click menu for the chat input box: Cut / Copy / Paste /
+        Select All. Items dim when not applicable (no selection = no
+        Copy/Cut; empty clipboard = no Paste). Matches the editor's
+        existing context-menu styling so the rest of Quick Notes looks
+        consistent."""
+        if self._chat_input is None:
+            return
+        entry = getattr(self._chat_input, '_entry', None) or self._chat_input
+        # Has a selection in the entry?
+        try:
+            has_sel = entry.selection_present()
+        except Exception:
+            has_sel = False
+        # Anything in the system clipboard? Use Tk's own clipboard_get
+        # so we don't depend on pyperclip in this code path.
+        try:
+            cb = entry.clipboard_get()
+            has_clipboard = bool(cb)
+        except Exception:
+            has_clipboard = False
+        try:
+            has_text = bool(entry.get())
+        except Exception:
+            has_text = False
+
+        def _cut():
+            try: entry.event_generate('<<Cut>>')
+            except Exception: pass
+
+        def _copy():
+            try: entry.event_generate('<<Copy>>')
+            except Exception: pass
+
+        def _paste():
+            try: entry.event_generate('<<Paste>>')
+            except Exception: pass
+
+        def _select_all():
+            try:
+                entry.selection_range(0, 'end')
+                entry.icursor('end')
+            except Exception:
+                pass
+
+        m = self._popup()
+        m.add('Cut',         _cut,        enabled=has_sel)
+        m.add('Copy',        _copy,       enabled=has_sel)
+        m.add('Paste',       _paste,      enabled=has_clipboard)
+        m.separator()
+        m.add('Select All',  _select_all, enabled=has_text)
+        m.show(event.x_root, event.y_root)
+        return 'break'
+
+    def _on_chat_transcript_rclick(self, event) -> str | None:
+        """Right-click menu for the editable chat transcript. Mirrors
+        the regular text-note editor's menu so the chat behaves like a
+        normal note: Cut / Copy / Paste / Search Google / Proofread /
+        Paste & Extract Image."""
+        # Suppress menu if L is still held, OR if a swipe just completed
+        if self._swipe_btn1_down or self._swipe_just_completed:
+            self._swipe_just_completed = False
+            return 'break'
+        import webbrowser, urllib.parse
+        w = event.widget
+        try:
+            has_sel = bool(w.tag_ranges('sel'))
+        except Exception:
+            has_sel = False
+        try:
+            has_text = bool(w.get('1.0', 'end-1c').strip())
+        except Exception:
+            has_text = False
+        can_proofread = bool(
+            self._chat_provider
+            and getattr(self._chat_provider, 'ready', False)
+            and has_text)
+        proofread_label = 'Proofread selection' if has_sel else 'Proofread'
+
+        sel_text = ''
+        if has_sel:
+            try:
+                sel_text = w.get('sel.first', 'sel.last').strip()
+            except tk.TclError:
+                pass
+        if sel_text:
+            search_label = (f'Search Google for "{sel_text[:28]}…"'
+                            if len(sel_text) > 28
+                            else f'Search Google for "{sel_text}"')
+        else:
+            search_label = 'Search Google'
+
+        def _search_google():
+            try:
+                q = w.get('sel.first', 'sel.last').strip()
+            except tk.TclError:
+                q = ''
+            if q:
+                webbrowser.open(
+                    f'https://www.google.com/search?q={urllib.parse.quote(q)}')
+
+        def _smart_paste():
+            from vision import get_clipboard_image
+            img, err = get_clipboard_image()
+            if err:
+                self._ocr_show_status(f'⚠  {err}', _WARN_C, dismissable=True)
+                return
+            if img is not None:
+                # OCR the image into the textbox at the cursor.
+                self._chat_ocr_extract(img)
+            else:
+                w.event_generate('<<Paste>>')
+
+        pm = self._popup()
+        (pm
+            .add('Cut',   lambda: w.event_generate('<<Cut>>'),   enabled=has_sel)
+            .add('Copy',  lambda: w.event_generate('<<Copy>>'),  enabled=has_sel)
+            .add('Paste', lambda: w.event_generate('<<Paste>>'))
+            .separator()
+            .add(search_label,  _search_google, enabled=has_sel)
+            .separator()
+            .add(proofread_label, self._chat_proofread,
+                 enabled=can_proofread)
+            .separator()
+            .add('Paste & Extract Image', _smart_paste)
+            .show(event.x_root, event.y_root))
+        return 'break'
+
+    def _on_chat_ctrl_v(self, event) -> str | None:
+        """Smart paste in the chat transcript: image → OCR text;
+        anything else → standard text paste."""
+        try:
+            from vision import get_clipboard_image
+            img, err = get_clipboard_image()
+            if img is not None:
+                self._chat_ocr_extract(img)
+                return 'break'
+        except Exception:
+            pass
+        return None   # let Tk do the default text paste
+
+    def _chat_ocr_extract(self, img) -> None:
+        """OCR an image into the chat transcript at the cursor."""
+        extractor = self._vision_extractor
+        if extractor is None:
+            self._ocr_show_status(
+                '⚠  Vision provider not available', _WARN_C, dismissable=True)
+            return
+        self._ocr_show_status('Extracting text from image…', _T2)
+        def _run():
+            try:
+                text = (extractor(img) or '').strip()
+            except Exception as exc:
+                self.after(0, lambda: self._ocr_show_status(
+                    f'⚠  OCR failed: {exc}', _ERR, dismissable=True))
+                return
+            def _apply():
+                tb = self._chat_transcript
+                if tb is None or not tb.winfo_exists():
+                    return
+                inner = tb._textbox
+                try:
+                    inner.insert('insert', text)
+                except Exception:
+                    pass
+                self._chat_text_override = inner.get('1.0', 'end-1c')
+                self._chat_text_flush()
+                self._ocr_hide_status()
+            self.after(0, _apply)
+        threading.Thread(target=_run, daemon=True,
+                         name='chat-ocr').start()
+
+    def _chat_proofread(self) -> None:
+        """Proofread selection (or full transcript) via LLM. Mirrors
+        the regular editor's _proofread but targets the chat textbox."""
+        if not self._chat_provider or not getattr(
+                self._chat_provider, 'ready', False):
+            return
+        if self._chat_transcript is None:
+            return
+        tb = self._chat_transcript._textbox
+        try:
+            sel_start = tb.index('sel.first')
+            sel_end   = tb.index('sel.last')
+            text      = tb.get(sel_start, sel_end)
+            selection = True
+        except tk.TclError:
+            text      = tb.get('1.0', 'end-1c')
+            sel_start = sel_end = None
+            selection = False
+        if not text.strip():
+            return
+        self._set_status('Proofreading…', _BLUE)
+        def _run():
+            try:
+                result = self._chat_provider.refine(
+                    text,
+                    'Proofread the following text. Fix spelling, grammar, and '
+                    'punctuation errors. Preserve the original meaning, tone, '
+                    'line breaks, and formatting. Return ONLY the corrected text '
+                    ', no explanations, no commentary.',
+                )
+            except Exception as exc:
+                self.after(0, lambda:
+                    self._set_status(f'⚠ Proofread failed: {exc}', _ERR))
+                return
+            def _apply():
+                try:
+                    if selection:
+                        tb.delete(sel_start, sel_end)
+                        tb.insert(sel_start, result.strip())
+                    else:
+                        tb.delete('1.0', 'end')
+                        tb.insert('1.0', result.strip())
+                    self._chat_text_override = tb.get('1.0', 'end-1c')
+                    self._chat_text_flush()
+                    self._set_status('✓ Proofread done', _OK_C)
+                    self.after(2000, lambda: self._set_status(''))
+                except Exception as exc:
+                    self._set_status(f'⚠ Apply failed: {exc}', _ERR)
+            self.after(0, _apply)
+        threading.Thread(target=_run, daemon=True,
+                         name='chat-proofread').start()
+
+    def _render_chat_transcript(self) -> None:
+        """Repaint the transcript widget. If a user-edited `text` was
+        stored on the note (`self._chat_text_override`), use that as
+        the source of truth so the user's edits aren't blown away on
+        every redraw. Otherwise, build the initial rendering from the
+        messages list with You/AI role labels."""
+        if self._chat_transcript is None:
+            return
+        try:
+            if not self._chat_transcript.winfo_exists():
+                return
+        except Exception:
+            return
+        tb = self._chat_transcript._textbox
+        # Suppress the KeyRelease save handler while we're programmatically
+        # rewriting the textbox; otherwise the save would race against
+        # the very write that's repopulating it.
+        self._chat_text_render_in_progress = True
+        try:
+            tb.delete('1.0', 'end')
+            title = (self._chat_title_var.get() or '').strip()
+            override = (self._chat_text_override or '').strip()
+            if override:
+                body = override
+            else:
+                parts = []
+                for m in self._chat_messages:
+                    content = (m.get('content') or '').strip()
+                    if content:
+                        parts.append(content)
+                body = ('\n\n'.join(parts) + '\n\n') if parts else ''
+            tb.insert('1.0', f'{title}\n{body}')
+            tb.tag_remove('title_line', '1.0', 'end')
+            tb.tag_add('title_line', '1.0', '1.end')
+            if self._chat_pending:
+                tb.insert('end', '…\n\n', 'placeholder')
+            tb.see('end')
+        finally:
+            self._chat_text_render_in_progress = False
+
+    def _on_chat_transcript_keyrelease(self, event) -> None:
+        """User edited the title+transcript widget. Line 1 is title, rest is body.
+        Both saved on a debounce; title also propagates to the left-panel list."""
+        if getattr(self, '_chat_text_render_in_progress', False):
+            return
+        if self._chat_transcript is None:
+            return
+        try:
+            tb = self._chat_transcript._textbox
+            title = tb.get('1.0', '1.end').strip()
+            body  = tb.get('2.0', 'end-1c').lstrip('\n')
+            tb.tag_remove('title_line', '1.0', 'end')
+            tb.tag_add('title_line', '1.0', '1.end')
+        except Exception:
+            return
+        self._chat_text_override = body
+        if title != (self._chat_title or '').strip():
+            self._chat_title = title
+            try:
+                self._chat_title_var.set(title)
+            except Exception:
+                pass
+            self._on_chat_title_change()
+        try:
+            if getattr(self, '_chat_text_save_after_id', None) is not None:
+                self.after_cancel(self._chat_text_save_after_id)
+        except Exception:
+            pass
+        self._chat_text_save_after_id = self.after(
+            300, self._chat_text_flush)
+
+    def _chat_text_flush(self) -> None:
+        """Debounced sync save of the chat's user-edited transcript."""
+        self._chat_text_save_after_id = None
+        nid = self._editing_nid
+        if not nid:
+            return
+        text = self._chat_text_override or ''
+        try:
+            notes = load_notes()
+            for n in notes:
+                if n.get('id') == nid:
+                    n['kind'] = 'chat'
+                    n['text'] = text   # user-edited rendered transcript
+                    break
+            self._invalidate_notes_cache()
+            save_notes(notes)
+        except Exception:
+            logger.exception('chat text flush: save failed')
+
+    def _on_chat_title_change(self) -> None:
+        """User typed in the title bar — propagate to in-memory state
+        and schedule a debounced disk save + list refresh so the left
+        panel reflects the new title shortly after they stop typing.
+        Without the debounce we'd hammer save_notes() on every key."""
+        try:
+            self._chat_title = (self._chat_title_var.get() or '').strip()
+        except Exception:
+            return
+        # Cancel pending save+refresh, schedule a new one 200ms out.
+        try:
+            if self._chat_title_save_after_id is not None:
+                self.after_cancel(self._chat_title_save_after_id)
+        except Exception:
+            pass
+        self._chat_title_save_after_id = self.after(
+            200, self._chat_title_flush)
+
+    def _chat_title_flush(self) -> None:
+        """Debounced SYNC save + left-list refresh. We can't reuse the
+        async _save_current_chat() here because the list reads from
+        disk and would race the background save thread; the user
+        would see the right-panel title update instantly but the left
+        list would lag a frame. The save is a small JSON write, fast
+        enough to do inline."""
+        self._chat_title_save_after_id = None
+        nid = self._editing_nid
+        if not nid:
+            return
+        messages = list(self._chat_messages)
+        title = (self._chat_title or
+                 _chat_title_from_messages(messages, fallback=''))
+        pinned = bool(self._pinned)
+        try:
+            notes = load_notes()
+            for n in notes:
+                if n.get('id') == nid:
+                    n['kind']     = 'chat'
+                    n['messages'] = messages
+                    n['title']    = title
+                    n['pinned']   = pinned
+                    break
+            self._invalidate_notes_cache()
+            save_notes(notes)
+        except Exception:
+            logger.exception('chat title flush: save failed')
+            return
+        try: self._refresh_list()
+        except Exception: pass
+
+    def _on_chat_send(self) -> None:
+        """User pressed Enter / clicked Send. Append the user message,
+        re-render, kick off a worker that calls provider.refine() with
+        the full conversation, then renders the assistant reply on
+        completion.
+
+        Captures the target chat note id at send time so a reply that
+        lands AFTER the user has navigated to another note still saves
+        to the correct chat, instead of stamping `kind='chat'` and the
+        chat history onto whatever note happens to be open."""
+        if self._chat_input is None:
+            return
+        try:
+            text = self._chat_input.get().strip()
+        except Exception:
+            return
+        if not text:
+            return                       # ignore empty / whitespace
+        if self._chat_pending:
+            return                       # one stream at a time
+        provider = self._chat_provider
+        if provider is None:
+            # main.py wires this on every note open. If it's missing,
+            # something's badly broken; show an inline error.
+            self._append_chat_error(
+                'AI provider not connected. Reopen Quick Notes via Shift+F7.')
+            return
+        # Append user message + clear the input
+        self._chat_messages.append({'role': 'user', 'content': text})
+        # If the user has been editing the transcript, append the new
+        # turn to their edited text so their edits aren't blown away
+        # by the re-render. If the override is empty, the render falls
+        # back to building from messages and picks up the new turn
+        # automatically.
+        if self._chat_text_override:
+            extra = self._chat_text_override.rstrip()
+            if extra:
+                extra += '\n\n'
+            self._chat_text_override = f'{extra}{text}\n\n'
+            self._chat_text_flush()
+        try:
+            self._chat_input.delete(0, 'end')
+        except Exception:
+            pass
+        # Set pending state & switch button to Stop
+        self._chat_pending = True
+        self._chat_inflight_gen += 1
+        my_gen = self._chat_inflight_gen
+        my_target_nid = self._editing_nid    # bind target at send time
+        self._flip_send_to_stop()
+        self._render_chat_transcript()
+        self._save_current_chat()   # persist the user message immediately
+
+        # Build the conversation blob for the existing single-call refine().
+        # Engine has no chat-messages API; we serialise the turns into
+        # one user-message body with role tags and rely on the system
+        # prompt below to instruct the model how to read it.
+        convo_blob = self._serialise_chat_for_refine()
+
+        def _worker():
+            try:
+                answer = provider.refine(convo_blob, _CHAT_SYSTEM_PROMPT)
+            except Exception as exc:
+                self.after(0, lambda e=exc:
+                            self._on_chat_error(my_gen, my_target_nid, e))
+                return
+            self.after(0, lambda a=answer:
+                        self._on_chat_reply(my_gen, my_target_nid, a))
+
+        threading.Thread(target=_worker, daemon=True,
+                          name='chat-worker').start()
+
+    def _on_chat_stop(self) -> None:
+        """Cancel the in-flight LLM call. Python threads can't actually
+        be killed, so we bump the gen counter; the worker will check
+        on return and drop its result."""
+        self._chat_inflight_gen += 1
+        self._chat_pending = False
+        self._flip_stop_to_send()
+        # Drop the placeholder. The user's question stays in the
+        # transcript (they typed it; not our place to delete).
+        self._render_chat_transcript()
+
+    def _on_chat_reply(self, gen: int, target_nid: str, answer: str) -> None:
+        """Worker callback: append assistant reply to the chat note that
+        ISSUED the request, even if the user has since navigated away.
+
+        Two cases:
+          (a) Still editing the same chat note → update in-memory state
+              and re-render the transcript.
+          (b) Navigated away → persist the reply to disk against
+              target_nid only; never touch UI or _editing_nid. Prevents
+              the reply from corrupting whatever note is now open.
+
+        The gen check still handles "Stop pressed before reply arrived"."""
+        # Defensive cleanup: strip leading "Assistant:" labels and
+        # chop hallucinated "User:" / "[YOU]" continuations. The
+        # system prompt forbids both but smaller models still leak.
+        cleaned = _clean_chat_reply(answer or '').strip()
+
+        same_target = (self._editing_nid == target_nid
+                       and self._is_chat_mode())
+        if same_target:
+            # Still on the chat that asked. Only drop on explicit Stop.
+            if gen != self._chat_inflight_gen or not self._chat_pending:
+                return
+            self._chat_pending = False
+            self._chat_messages.append({'role': 'assistant',
+                                        'content': cleaned})
+            # Mirror the append into the user-edited override so the
+            # render keeps showing both the user's edits AND the new
+            # AI turn. If no override yet (user hasn't edited), the
+            # render rebuilds from messages naturally.
+            if self._chat_text_override:
+                extra = self._chat_text_override.rstrip()
+                if extra:
+                    extra += '\n\n'
+                self._chat_text_override = f'{extra}{cleaned}\n\n'
+                self._chat_text_flush()
+            self._flip_stop_to_send()
+            self._render_chat_transcript()
+            self._save_current_chat()
+        else:
+            # User navigated away. Append the reply to the target chat
+            # on disk WITHOUT touching the current editor's state.
+            self._save_reply_to_chat_nid_async(target_nid, cleaned)
+        # Refresh list either way so the preview/title update.
+        try: self._refresh_list()
+        except Exception: pass
+
+    def _on_chat_error(self, gen: int, target_nid: str,
+                       exc: Exception) -> None:
+        from engine import friendly_error_message
+        msg = friendly_error_message(exc, feature='Chat')
+        short = msg.split('\n')[0][:160]
+        same_target = (self._editing_nid == target_nid
+                       and self._is_chat_mode())
+        if same_target:
+            if gen != self._chat_inflight_gen:
+                return
+            self._chat_pending = False
+            self._flip_stop_to_send()
+            self._append_chat_error(short)
+        else:
+            # Save the error message to the target chat's history so
+            # the user sees it when they reopen the chat.
+            self._save_reply_to_chat_nid_async(
+                target_nid, f'[error] {short}')
+
+    def _save_reply_to_chat_nid_async(self, nid: str,
+                                       assistant_content: str) -> None:
+        """Append a single assistant message to a chat note's stored
+        messages, by nid, without touching in-memory editor state.
+        Used by _on_chat_reply when the user navigated away while a
+        reply was in flight. The chat note's history stays consistent
+        even though the editor is showing something else."""
+        def _persist():
+            try:
+                notes = load_notes()
+                changed = False
+                for n in notes:
+                    if n.get('id') == nid and _note_kind(n) == 'chat':
+                        msgs = list(n.get('messages', []))
+                        msgs.append({'role': 'assistant',
+                                     'content': assistant_content})
+                        n['messages'] = msgs
+                        changed = True
+                        break
+                if changed:
+                    save_notes(notes)
+            except Exception:
+                logger.exception('save_reply_to_chat_nid: failed')
+        self._invalidate_notes_cache()
+        threading.Thread(target=_persist, daemon=True,
+                          name='chat-reply-save').start()
+
+    def _append_chat_error(self, text: str) -> None:
+        """Show an inline error as the next assistant turn. Persisted
+        like any other message so the user can see what went wrong
+        when they reopen the chat."""
+        self._chat_messages.append({'role': 'assistant',
+                                    'content': f'[error] {text}'})
+        self._render_chat_transcript()
+        self._save_current_chat()
+
+    def _serialise_chat_for_refine(self) -> str:
+        """Pack the conversation into the single text input the
+        existing provider.refine() API takes. Uses [YOU] / [ASSISTANT]
+        markers (not "User: " / "Assistant: ") because the latter look
+        too much like a transcript-completion prompt and the underlying
+        LLM hallucinates a fake multi-turn conversation. The system
+        prompt also explicitly tells the model to reply only to the
+        final [YOU] line."""
+        lines = []
+        for m in self._chat_messages:
+            role = m.get('role', 'user')
+            content = (m.get('content') or '').strip()
+            if not content:
+                continue
+            label = '[YOU]' if role == 'user' else '[ASSISTANT]'
+            lines.append(f'{label}\n{content}')
+        return '\n\n'.join(lines)
+
+    def _flip_send_to_stop(self) -> None:
+        if self._chat_send_btn is None:
+            return
+        try:
+            self._chat_send_btn.configure(
+                text='Stop', fg_color='#7a1f1f',
+                hover_color='#a32626', command=self._on_chat_stop)
+        except Exception:
+            pass
+
+    def _flip_stop_to_send(self) -> None:
+        if self._chat_send_btn is None:
+            return
+        try:
+            self._chat_send_btn.configure(
+                text='Send', fg_color=_ACCENT,
+                hover_color='#6d28d9', command=self._on_chat_send)
+        except Exception:
+            pass
+
+    def _save_current_chat(self) -> None:
+        """Persist the chat note's messages + title back to disk.
+        Always async (load_notes/save_notes both touch disk; we don't
+        want a UI hitch on every keystroke / Enter press)."""
+        nid = self._editing_nid
+        if not nid:
+            return
+        messages = list(self._chat_messages)
+        title = (self._chat_title or
+                 _chat_title_from_messages(messages, fallback=''))
+        pinned = bool(self._pinned)
+
+        def _persist():
+            try:
+                notes = load_notes()
+                found = False
+                for n in notes:
+                    if n.get('id') == nid:
+                        n['kind']     = 'chat'
+                        n['messages'] = messages
+                        n['title']    = title
+                        n['pinned']   = pinned
+                        # Don't touch text/items/voice fields here:
+                        # a chat note shouldn't have them set anyway,
+                        # and silently overwriting could confuse a
+                        # future text-note migration.
+                        found = True
+                        break
+                if not found:
+                    return
+                save_notes(notes)
+            except Exception:
+                logger.exception('Failed to save chat note')
+
+        self._invalidate_notes_cache()
+        threading.Thread(target=_persist, daemon=True,
+                          name='chat-save').start()
+
+    def cancel_chat_streams(self) -> None:
+        """Public method called from main.py's Stop-everything handler.
+        Bumps the gen counter so any in-flight provider.refine() result
+        is dropped on arrival, and resets the UI button. Per the tray-
+        coverage rule, every state-holding feature must be reset by
+        the panic button."""
+        self._chat_inflight_gen += 1
+        self._chat_pending = False
+        self._flip_stop_to_send()
+        try: self._render_chat_transcript()
+        except Exception: pass
+
+    def set_chat_provider(self, provider) -> None:
+        """main.py wires the LLM provider so the chat panel can call it.
+        Lives separately from the text-note path so we don't have to
+        touch the existing editor."""
+        self._chat_provider = provider
+
+    def open_chat_note_with_messages(self, title: str,
+                                      messages: list) -> str:
+        """Create a brand-new chat-kind note pre-populated with
+        `messages` (typically the (question, answer) pair from
+        AskPill's Follow-up button), persist it, and select it in the
+        editor. Returns the new note id. Idempotent: a second
+        identical call just creates another chat."""
+        nid = str(uuid.uuid4())
+        note = {
+            'id':         nid,
+            'kind':       'chat',
+            'title':      (title or '').strip()[:80],
+            'messages':   [dict(m) for m in messages],
+            'created_at': datetime.now().isoformat(timespec='seconds'),
+            'pinned':     False,
+        }
+        notes = load_notes()
+        notes.append(note)
+        self._invalidate_notes_cache()
+        # Sync save so the subsequent _open_note() reads it back.
+        save_notes(notes)
+        self._open_note(nid)
+        return nid
+
+    def _new_chat(self) -> None:
+        """User clicked the chat-bubble button in the left header.
+        Saves the current draft (if any), creates an empty chat note,
+        opens it ready for the first question."""
+        self._prev_note_nid = self._editing_nid
+        # Stash any unsaved text-note draft (no-op for chat current)
+        if self._editing_nid is None and not self._is_chat_mode():
+            data = self._get_note_data()
+            if data:
+                self._save_current_as_new()
+        self.open_chat_note_with_messages('', [])
 
     def _apply_title_tag(self) -> None:
         """Re-apply the 'title_line' font tag to line 1 (skipped when placeholder active)."""
@@ -2385,6 +3403,11 @@ class QuickNotesWindow(ctk.CTkToplevel):
             self._stop_rec()
             self.after(320, self._save_and_close)
             return
+        # Chat-kind: persisted on every turn already; just close window.
+        if self._is_chat_mode():
+            self._save_current_chat()
+            self.withdraw()
+            return
         data = self._get_note_data()
         if data:
             if self._editing_nid:
@@ -2515,8 +3538,26 @@ class QuickNotesWindow(ctk.CTkToplevel):
         try:
             fw = self.focus_get()
             # Let the text editor handle its own Ctrl+V
-            if hasattr(self, '_tb') and fw is self._tb._textbox:
-                return None
+            if hasattr(self, '_tb') and self._tb is not None:
+                try:
+                    if fw is self._tb._textbox:
+                        return None
+                except Exception:
+                    pass
+            # Let the chat transcript handle its own Ctrl+V
+            if hasattr(self, '_chat_transcript') and self._chat_transcript is not None:
+                try:
+                    if fw is self._chat_transcript._textbox:
+                        return None
+                except Exception:
+                    pass
+            # Let the chat input (follow-up bar) handle its own Ctrl+V
+            if hasattr(self, '_chat_input') and self._chat_input is not None:
+                try:
+                    if fw is self._chat_input._entry:
+                        return None
+                except Exception:
+                    pass
             # Let the search bar handle its own Ctrl+V
             if hasattr(self, '_srch_entry'):
                 try:

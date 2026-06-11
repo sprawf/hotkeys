@@ -1,6 +1,7 @@
 import re
 import threading
 import logging
+import contextlib
 from abc import ABC, abstractmethod
 
 try:
@@ -438,21 +439,46 @@ class LocalProvider(Provider):
             except Exception as e:
                 err = str(e)
                 if 'SSL' in err or 'certificate' in err.lower():
-                    logger.warning('SSL error, retrying without verification.')
-                    self._ssl_bypass()
-                    return _dl()
+                    logger.warning('SSL error, retrying without verification (scoped).')
+                    with self._ssl_bypass_scope():
+                        return _dl()
                 raise
 
     @staticmethod
-    def _ssl_bypass() -> None:
+    @contextlib.contextmanager
+    def _ssl_bypass_scope():
+        """Temporarily disable SSL verification for `requests` calls
+        within this `with` block. Restores the original Session.send
+        on exit so the rest of the app stays cert-verified.
+
+        Why scoped instead of permanent: the previous implementation
+        replaced `requests.Session.send` at the class level, which
+        silently disabled TLS verification for every HTTPS call in the
+        process (Groq, Cerebras, ask_docs LLM, future plugins) for the
+        rest of the session. A real MITM (public Wi-Fi, hostile proxy)
+        would have gone undetected. Now the bypass is contained to
+        exactly the huggingface download that needed it."""
         import ssl, urllib3, requests
-        ssl._create_default_https_context = ssl._create_unverified_context  # type: ignore
         urllib3.disable_warnings()
-        _orig = requests.Session.send
+        _orig_send = requests.Session.send
+        _orig_ssl_ctx = getattr(ssl, '_create_default_https_context', None)
         def _no_ssl(self_r, req, **kw):
             kw['verify'] = False
-            return _orig(self_r, req, **kw)
+            return _orig_send(self_r, req, **kw)
         requests.Session.send = _no_ssl  # type: ignore
+        ssl._create_default_https_context = ssl._create_unverified_context  # type: ignore
+        try:
+            yield
+        finally:
+            try:
+                requests.Session.send = _orig_send  # type: ignore
+            except Exception:
+                pass
+            try:
+                if _orig_ssl_ctx is not None:
+                    ssl._create_default_https_context = _orig_ssl_ctx  # type: ignore
+            except Exception:
+                pass
 
     def load(self) -> None:
         if self._ready or self._loading:
@@ -489,6 +515,20 @@ class LocalProvider(Provider):
             self._loading = False
 
     def refine(self, text: str, system_prompt: str) -> str:
+        if self._llm is None:
+            # Without this guard `.create_chat_completion(...)` raises
+            # AttributeError on a None target. When this provider is the
+            # primary in a chain, the fallback wrapper interprets that as
+            # generic failure and silently routes to a cloud provider —
+            # the user picked "Local" for privacy, so leaking the prompt
+            # is a real harm. Surface a clean error instead.
+            if not self._loading:
+                # Trigger a load so the next attempt can succeed.
+                try: self.load()
+                except Exception: pass
+            raise RuntimeError(
+                'Local model not loaded yet. Please wait a moment, '
+                'or pick a different provider in Settings.')
         with self._lock:
             out = self._llm.create_chat_completion(  # type: ignore
                 messages=[{'role': 'system', 'content': system_prompt},
@@ -598,6 +638,12 @@ class _OpenAICompatProvider(Provider):
 
         def _call(verify: bool = True) -> str:
             kw = self._client_kwargs(verify)
+            # The OpenAI SDK defaults to a 600 s timeout and 2 internal
+            # retries — blackholed network / dead Ollama host could leave
+            # the "Thinking…" pill stuck for tens of minutes. Match the
+            # Groq / Cerebras `_robust_post` budget instead.
+            kw.setdefault('timeout', 30.0)
+            kw.setdefault('max_retries', 0)
             resp = OpenAI(**kw).chat.completions.create(
                 model=self.model,
                 messages=[{'role': 'system', 'content': system_prompt},
@@ -696,6 +742,12 @@ class AnthropicProvider(Provider):
             kw: dict = {'api_key': self.api_key}
             if not verify and _httpx:
                 kw['http_client'] = _httpx.Client(verify=False)
+            # Bound the call to 30 s + 0 retries, matching Groq/Cerebras.
+            # Without this Anthropic's SDK default (~600 s, 2 retries)
+            # could leave the user staring at "Thinking…" for tens of
+            # minutes when the network is blackholed.
+            kw.setdefault('timeout', 30.0)
+            kw.setdefault('max_retries', 0)
             resp = anthropic.Anthropic(**kw).messages.create(
                 model=self.model,
                 max_tokens=1024,
@@ -720,7 +772,29 @@ class FallbackProvider(Provider):
     def name(self)  -> str:  return self._primary.name
     @property
     def ready(self) -> bool: return self._primary.ready or self._fallback.ready
-    def load(self)  -> None: pass
+    def load(self)  -> None:
+        # Walk the chain (primary may itself be a FallbackProvider) and
+        # kick off `load()` on any LocalProvider tier in a background
+        # thread. Without this the bundled GGUF stays unloaded for the
+        # whole session: main.py only triggers _load_model() when the
+        # active provider is exactly LocalProvider, so a chained Local
+        # tier (active='local' with bundled cloud keys) never loaded,
+        # and the first refine() call AttributeError'd → silent fall to
+        # Cerebras, breaking the "stays on-device" promise.
+        import threading as _threading
+        def _walk(p):
+            if isinstance(p, FallbackProvider):
+                _walk(p._primary)
+                _walk(p._fallback)
+                return
+            if isinstance(p, LocalProvider) and not p.ready and not p._loading:
+                _threading.Thread(target=p.load, daemon=True,
+                                   name='fallback-local-load').start()
+        try:
+            _walk(self._primary)
+            _walk(self._fallback)
+        except Exception:
+            pass
 
     def refine(self, text: str, system_prompt: str) -> str:
         try:

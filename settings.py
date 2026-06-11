@@ -661,8 +661,11 @@ class SettingsWindow:
                     success = True
                 elif provider == 'cerebras':
                     import cerebras.cloud.sdk as _cerebras
+                    # Pull from engine.CEREBRAS_MODELS so the Test
+                    # button doesn't break when Cerebras rotates models.
+                    from engine import CEREBRAS_MODELS
                     _cerebras.Cerebras(api_key=api_key).chat.completions.create(
-                        model='llama3.1-8b',
+                        model=CEREBRAS_MODELS[0],
                         messages=[{'role': 'user', 'content': 'hi'}],
                         max_tokens=1,
                     )

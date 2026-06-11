@@ -30,6 +30,7 @@ if __name__ == '__main__' and '--whiteboard' in sys.argv:
             _wb_tb.print_exc()
     sys.exit(0)
 
+
 import sys as _sys_for_fh
 import faulthandler as _fh
 import time as _time_for_fh
@@ -118,10 +119,18 @@ import ctypes
 import logging
 import logging.handlers
 import threading
+from collections import deque
 import tkinter as tk
 import datetime
 
 import customtkinter as ctk
+# Register HEIC/HEIF opener for Pillow so iPhone photos work in the scan
+# flow when pasted from clipboard / saved as files. Silent if not installed.
+try:
+    import pillow_heif as _pillow_heif
+    _pillow_heif.register_heif_opener()
+except Exception:
+    pass
 import keyboard
 import kbhook  # Bulletproof replacement for keyboard.add_hotkey — see kbhook.py
 import mouse
@@ -537,6 +546,13 @@ class App:
     def __init__(self) -> None:
         self._q: queue.Queue = queue.Queue()
 
+        # ── Accident-protection state (see _check_accident_guards) ───────────
+        # deque keeps last 8 user-initiated event timestamps; flood
+        # detector compares now to times[-4]. _panic_until_ts is the
+        # wall-clock deadline after which silent-drop mode lifts.
+        self._activation_times: deque = deque(maxlen=8)
+        self._panic_until_ts: float = 0.0
+
         # ── Refine state ──────────────────────────────────────────────────────
         self._refine_t0:         float = 0.0
         self._refine_in_progress: bool = False
@@ -678,15 +694,15 @@ class App:
                                       on_feature_hotkey_changed=self._on_feature_hotkey_changed,
                                       on_chains_changed=self._on_chains_changed_cb)
         # Wire the library's recorder tab toggle button → main.py handler
-        self.library._on_recorder_toggle = lambda: self._q.put(('recorder:toggle', None))
+        self.library._on_recorder_toggle = lambda: self._q.put_nowait(('recorder:toggle', None))
         # Wire the library's macros tab right-click record → same queue event as Shift+F1
-        self.library._on_macro_toggle    = lambda: self._q.put(('macro:hotkey',    None))
+        self.library._on_macro_toggle    = lambda: self._q.put_nowait(('macro:hotkey',    None))
         # Wire the macros tab reset button → abort everything and return to idle
-        self.library._on_macro_reset     = lambda: self._q.put(('macro:reset',     None))
+        self.library._on_macro_reset     = lambda: self._q.put_nowait(('macro:reset',     None))
         # Wire the library's GIF tab toggle button → main.py handler
-        self.library._on_gif_toggle      = lambda: self._q.put(('gif:toggle',      None))
+        self.library._on_gif_toggle      = lambda: self._q.put_nowait(('gif:toggle',      None))
         # Wire the library's Ask tab text input → ask handler
-        self.library._on_ask             = lambda text: self._q.put(('ask', text))
+        self.library._on_ask             = lambda text: self._q.put_nowait(('ask', text))
         # Wire the library's Notes tab "New Note" button → open QuickNotesWindow
         self.library._on_new_note        = self._do_open_notes
         # Wire the library's Whiteboard tab "Open" button → open Whiteboard
@@ -695,7 +711,7 @@ class App:
         self.library._on_open_audio_editor = self._do_open_audio_editor
         self.settings = SettingsWindow(self.root, self.config,
                                        on_save=self._on_settings_saved,
-                                       on_restore=lambda: self._q.put(('restore_all_defaults', None)))
+                                       on_restore=lambda: self._q.put_nowait(('restore_all_defaults', None)))
         self.history_win = HistoryWindow(self.root,
                                          on_history_cleared=self._on_history_cleared)
 
@@ -755,6 +771,14 @@ class App:
             'macro:reset':        lambda _: self._macro_reset(),
             'macro:play_saved':   self._on_library_macro_play,
             'screenshot:cancel':  lambda _: self._do_cancel_screenshot(),
+            'screenshot':         lambda _: take_screenshot(
+                self.root,
+                on_extract_text=self._screenshot_extract_text,
+                on_translate=self._screenshot_translate,
+                on_translate_google=self._screenshot_translate_google,
+                on_translate_offline_ar=self._screenshot_translate_offline_ar,
+                on_scan=self._screenshot_scan,
+            ),
             'recorder:toggle':    lambda _: self._on_recorder_toggle(),
             'recorder:cap':       lambda _: self._on_recorder_cap(),
             'recorder:size':      lambda b: None,   # handled by _recorder_tick poll
@@ -818,6 +842,18 @@ class App:
         threading.Thread(target=self._watch_singleton_socket, daemon=True).start()
 
         self.root.after(30, self._poll)
+        # Pre-warm Quick Notes shortly after boot so the first Shift+F7
+        # is a sub-100 ms deiconify instead of a 300-500 ms full UI
+        # build. Deferred so the model/provider load above finishes
+        # first and the user can interact with the tray icon
+        # immediately.
+        self.root.after(1500, self._prewarm_notes_window)
+        # Whiteboard prewarm fires ASAP because WebView2 cold init is
+        # genuinely slow (~30-45s on first boot, then the runtime
+        # caches and re-inits are faster). Even at 500ms head start
+        # we may still race a fast user; in that case _do_open_whiteboard
+        # short-circuits via the _wb_prewarm_pid check below.
+        self.root.after(500, self._prewarm_whiteboard)
         logger.info(f'Hotkeys v{VERSION} started.')
 
     # ── Hotkeys ───────────────────────────────────────────────────────────────
@@ -900,26 +936,26 @@ class App:
             kbhook.add_hotkey(hk.get('library',      'alt+shift+e'), self._hk_library)
             kbhook.add_hotkey(hk.get('undo_refine',  'alt+shift+z'), self._hk_undo_refine)
             kbhook.add_hotkey(hk.get('macro_record', 'shift+f1'),
-                              lambda: self._q.put(('macro:hotkey', None)))
+                              lambda: self._q.put_nowait(('macro:hotkey', None)))
             kbhook.add_hotkey(hk.get('recorder',     'shift+f2'),
-                              lambda: self._q.put(('recorder:toggle', None)))
+                              lambda: self._q.put_nowait(('recorder:toggle', None)))
             kbhook.add_hotkey(hk.get('gif_record',   'shift+f3'),
-                              lambda: self._q.put(('gif:toggle',      None)))
+                              lambda: self._q.put_nowait(('gif:toggle',      None)))
             kbhook.add_hotkey(hk.get('ask',          'shift+f4'),
                               self._hk_ask)
             kbhook.add_hotkey(hk.get('web',          'shift+f5'),
-                              lambda: self._q.put(('web', None)))
+                              lambda: self._q.put_nowait(('web', None)))
             kbhook.add_hotkey(hk.get('chain',        'shift+f6'),
                               self._hk_chain)
             kbhook.add_hotkey(hk.get('notes',        'shift+f7'),
-                              lambda: self._q.put(('notes',      None)))
+                              lambda: self._q.put_nowait(('notes',      None)))
             kbhook.add_hotkey(hk.get('whiteboard',   'shift+f8'),
-                              lambda: self._q.put(('whiteboard', None)))
+                              lambda: self._q.put_nowait(('whiteboard', None)))
             kbhook.add_hotkey(hk.get('transcribe',   'shift+f9'),
-                              lambda: self._q.put(('transcribe', None)))
+                              lambda: self._q.put_nowait(('transcribe', None)))
             # Shift+F10, bundled audio editor (Tenacity).
             kbhook.add_hotkey(hk.get('audio_editor', 'shift+f10'),
-                              lambda: self._q.put(('audio_editor', None)))
+                              lambda: self._q.put_nowait(('audio_editor', None)))
             kbhook.add_hotkey(hk.get('download_url', 'ctrl+alt+d'),
                               self._hk_download_url)
 
@@ -942,11 +978,21 @@ class App:
 
                 def _on_press(_evt):
                     # Only fire if every required modifier is currently held.
+                    # put_nowait so a busy main loop can never block this
+                    # callback past the 300 ms LowLevelHooksTimeout — Windows
+                    # would uninstall the `keyboard` library's entire LL
+                    # hook (killing ALL hotkeys until restart).
                     if not required_mods or _mods_held():
-                        self._q.put(('whisper:start', None))
+                        try:
+                            self._q.put_nowait(('whisper:start', None))
+                        except queue.Full:
+                            pass
 
                 def _on_release(_evt):
-                    self._q.put(('whisper:stop', None))
+                    try:
+                        self._q.put_nowait(('whisper:stop', None))
+                    except queue.Full:
+                        pass
 
                 keyboard.on_press_key(trigger_key, _on_press, suppress=False)
                 keyboard.on_release_key(trigger_key, _on_release, suppress=False)
@@ -954,12 +1000,13 @@ class App:
                 # Releasing the modifier (e.g. letting Ctrl up while still
                 # holding Enter) also stops the recording — so the user can
                 # cancel by simply lifting Ctrl without releasing Enter.
+                def _stop_nowait(_e):
+                    try:
+                        self._q.put_nowait(('whisper:stop', None))
+                    except queue.Full:
+                        pass
                 for _mod in required_mods:
-                    keyboard.on_release_key(
-                        _mod,
-                        lambda _e: self._q.put(('whisper:stop', None)),
-                        suppress=False,
-                    )
+                    keyboard.on_release_key(_mod, _stop_nowait, suppress=False)
 
                 logger.info(f'PTT mode: hold {whisper_hk!r} '
                             f'(trigger={trigger_key!r}, mods={required_mods})')
@@ -980,7 +1027,7 @@ class App:
                     continue
                 def _make_ph_handler(idx=_idx):
                     def _handler():
-                        self._q.put(('prompt_hotkey', idx))
+                        self._q.put_nowait(('prompt_hotkey', idx))
                     return _handler
                 try:
                     kbhook.add_hotkey(_hk, _make_ph_handler())
@@ -1387,6 +1434,19 @@ class App:
         except Exception:
             pass
 
+        # ── 0b. Cancel any in-flight chat-note LLM stream ────────────────
+        # The chat panel inside Quick Notes (Shift+F4 follow-ups) can
+        # have a refine() worker out talking to Cerebras/Groq. Per the
+        # tray coverage rule, Stop everything must abort that so a
+        # stale answer doesn't land in the transcript after reset.
+        try:
+            notes_win = getattr(self, '_notes_win', None)
+            if notes_win is not None and notes_win.winfo_exists():
+                if hasattr(notes_win, 'cancel_chat_streams'):
+                    notes_win.cancel_chat_streams()
+        except Exception:
+            pass
+
         # ── 1. Reload config from disk so hotkeys reflect the latest saved values ──
         try:
             fresh = load_config()
@@ -1631,6 +1691,75 @@ class App:
         logger.info('Refine hotkey fired.')
         threading.Thread(target=self._capture_and_queue, daemon=True).start()
 
+    @staticmethod
+    def _capture_selection_full(timeout: float = 2.5) -> tuple[str, str]:
+        """Robust Ctrl+C → clipboard read. Returns (captured, prev).
+
+        The naive approach (read prev, send Ctrl+C, poll content for change)
+        misses long selections because:
+        - Chrome/Edge serialize DOM-to-text lazily; clipboard appears empty
+          for ~1s on long articles
+        - AVG inspects every clipboard write, adding 100-500ms
+        - If user copied the same text earlier, content compare fails
+
+        This helper polls Win32 GetClipboardSequenceNumber instead — a
+        kernel counter that bumps atomically the moment the clipboard is
+        updated, regardless of what's actually in it. Once the counter
+        moves, we read content with retries to ride out OpenClipboard
+        contention with the source app.
+
+        `prev` is returned so callers (like the URL downloader) that
+        want to fall back to the pre-existing clipboard as a candidate
+        can do so without a second pyperclip.paste() round-trip.
+        Always restores the original clipboard before returning so the
+        user's pre-existing copy isn't trampled.
+        """
+        if sys.platform == 'win32':
+            _u32 = ctypes.windll.user32
+            seq_before = _u32.GetClipboardSequenceNumber()
+        else:
+            seq_before = 0
+        try:
+            prev = pyperclip.paste()
+        except Exception:
+            prev = ''
+        copy_selection()
+        deadline = time.time() + timeout
+        captured = ''
+        seq_changed = False
+        while time.time() < deadline:
+            time.sleep(0.03)
+            if sys.platform == 'win32':
+                seq_now = _u32.GetClipboardSequenceNumber()
+                if seq_now == seq_before and not seq_changed:
+                    continue   # clipboard hasn't changed yet
+                seq_changed = True
+            try:
+                current = pyperclip.paste()
+            except Exception:
+                # Source app still holds OpenClipboard — wait a tick.
+                continue
+            if current and current.strip() and current != prev:
+                captured = current
+                break
+            # On non-Windows or fallback path, keep polling content too.
+            if sys.platform != 'win32' and current and current != prev:
+                captured = current
+                break
+        if captured:
+            try:
+                pyperclip.copy(prev)
+            except Exception:
+                pass
+        return captured, prev
+
+    @classmethod
+    def _capture_selection_via_clipboard(cls, timeout: float = 2.5) -> str:
+        """Convenience wrapper around _capture_selection_full for callers
+        that only need the captured text."""
+        captured, _prev = cls._capture_selection_full(timeout=timeout)
+        return captured
+
     def _capture_and_queue(self) -> None:
         # Wait until Alt and Shift are physically released before injecting
         # Ctrl+C.  If they're still held, the target app sees Ctrl+Shift+Alt+C
@@ -1657,35 +1786,22 @@ class App:
             except Exception:
                 pass
         time.sleep(0.04)                       # brief settle after release
-        try:
-            prev = pyperclip.paste()
-        except Exception:
-            prev = ''
-        try:
-            pyperclip.copy('')
-        except Exception:
-            pass
-        copy_selection()
-        captured = ''
-        for _ in range(25):                   # up to 0.75 s total
-            time.sleep(0.03)                  # poll every 30 ms (was 50 ms)
-            try:
-                current = pyperclip.paste()
-            except Exception:
-                continue
-            if current and current.strip():
-                captured = current
-                break
-        if not captured:
-            try:
-                pyperclip.copy(prev)
-            except Exception:
-                pass
+        # See _capture_selection_via_clipboard for the full reasoning on
+        # why we use Win32 clipboard-sequence-number polling instead of
+        # raw content compare.
+        captured = self._capture_selection_via_clipboard()
         logger.info(f'Captured text ({len(captured)} chars): {captured[:80]!r}')
-        self._q.put(('refine', captured))
+        self._q.put_nowait(('refine', captured))
 
     def _hk_ask(self) -> None:
         """Shift+F4, capture selected text and show answer pill."""
+        # Re-press guard: a 2nd press while the first is still in flight
+        # would spawn a 2nd clipboard capture (race against the prev
+        # restore) AND fire a 2nd LLM/vision call (real $). Cleared by
+        # _do_ask once the pill is up or the no-text path returns.
+        if getattr(self, '_ask_in_progress', False):
+            return
+        self._ask_in_progress = True
         threading.Thread(target=self._capture_and_queue_ask, daemon=True).start()
 
     def _capture_and_queue_ask(self) -> None:
@@ -1717,9 +1833,9 @@ class App:
                         logger.info(
                             f'Ask: overlay OCR gave ({len(captured)} chars): {captured[:80]!r}')
                         if _ocr_is_no_text(captured):
-                            self._q.put(('ask', _ASK_NO_TEXT))
+                            self._q.put_nowait(('ask', _ASK_NO_TEXT))
                         else:
-                            self._q.put(('ask', captured))
+                            self._q.put_nowait(('ask', captured))
                         return
                     except Exception as exc:
                         logger.warning(f'Ask: overlay OCR failed ({exc}), falling back')
@@ -1735,47 +1851,17 @@ class App:
         time.sleep(0.04)
 
         # ── Priority 1: selected text (CHECK FIRST) ─────────────────────────
-        # Save whatever's in clipboard (could be a stale image), clear, send
-        # Ctrl+C, watch for fresh text to land. If text arrives → that's the
-        # user's selection and wins over any stale clipboard image.
-        try:
-            prev = pyperclip.paste()
-        except Exception:
-            prev = ''
-        try:
-            pyperclip.copy('')
-        except Exception:
-            pass
-        copy_selection()
-        captured = ''
-        for _ in range(25):
-            time.sleep(0.03)
-            try:
-                current = pyperclip.paste()
-            except Exception:
-                continue
-            if current and current.strip():
-                captured = current
-                break
-
+        # Uses Win32 clipboard-sequence-number polling (see
+        # _capture_selection_via_clipboard) so long Chrome/article
+        # selections that take >1s to serialize don't time out as
+        # "no selection".
+        captured = self._capture_selection_via_clipboard()
         if captured:
-            # Restore the previous clipboard contents so we don't leak the
-            # selection into whatever the user had copied before pressing
-            # Shift+F4. (Pyperclip text-only — image clipboard is restored
-            # by the OS since Ctrl+C only overwrites the text format.)
             logger.info(f'Ask: selected-text captured ({len(captured)} chars): {captured[:80]!r}')
-            try:
-                pyperclip.copy(prev)
-            except Exception:
-                pass
-            self._q.put(('ask', captured))
+            self._q.put_nowait(('ask', captured))
             return
 
-        # No selection captured. Restore prev so the image (if any) survives.
-        try:
-            pyperclip.copy(prev)
-        except Exception:
-            pass
+        # No selection captured. prev never changed, so nothing to restore.
 
         # ── Priority 2: image in clipboard → OCR (fallback only) ────────────
         try:
@@ -1788,9 +1874,9 @@ class App:
                     captured  = extractor(img).strip()
                     logger.info(f'Ask: OCR gave ({len(captured)} chars): {captured[:80]!r}')
                     if _ocr_is_no_text(captured):
-                        self._q.put(('ask', _ASK_NO_TEXT))
+                        self._q.put_nowait(('ask', _ASK_NO_TEXT))
                     else:
-                        self._q.put(('ask', captured))
+                        self._q.put_nowait(('ask', captured))
                     return
                 except Exception as exc:
                     logger.warning(f'Ask: clipboard OCR failed ({exc}); no question available')
@@ -1801,7 +1887,7 @@ class App:
 
         # Nothing usable found.
         logger.info('Ask: nothing to ask about (no selection, no clipboard image)')
-        self._q.put(('ask', _ASK_NO_TEXT))
+        self._q.put_nowait(('ask', _ASK_NO_TEXT))
 
     def _close_all_ask_pills(self) -> None:
         """Close every tracked AskPill. Safe to call from main thread."""
@@ -1814,6 +1900,10 @@ class App:
 
     def _do_ask(self, text: str) -> None:
         """Main-thread handler, open the answer pill."""
+        # Clear the in-flight guard set in _hk_ask: by the time we reach
+        # here the capture is done and the pill is about to render (or an
+        # error pill shows). User is free to fire another Shift+F4.
+        self._ask_in_progress = False
         # Close any existing pill before opening a new one, prevents stacking.
         self._close_all_ask_pills()
 
@@ -1848,10 +1938,343 @@ class App:
             self.refine_overlay.show_error('API key required, open Settings')
             threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
             return
-        pill = AskPill(self.root, text.strip(), self.provider)
+        pill = AskPill(self.root, text.strip(), self.provider,
+                       on_followup=self._on_ask_followup)
         pill._on_close = lambda p=pill: _on_pill_close(p)
         self._ask_pills.append(pill)
         threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
+
+    def _test_chat_send_hi(self) -> None:
+        """Debug IPC harness: open a fresh chat note, drop "hi" into
+        the input, fire the real chat send path, and log the assistant
+        reply length so we can confirm hallucinated transcript
+        continuations are getting chopped."""
+        self._on_ask_followup('hi', '')   # creates the chat note + opens QN
+        def _go():
+            notes = getattr(self, '_notes_win', None)
+            if notes is None:
+                logger.warning('TEST chat_hi: notes window missing')
+                return
+            try:
+                # Replace messages with just one "hi" so the assistant
+                # speaks first this time (the on_ask_followup path
+                # primed [user=hi, assistant=''], but blank assistant
+                # is dropped by serialise — we want a clean single-
+                # turn test).
+                notes._chat_messages = [{'role': 'user', 'content': 'hi'}]
+                notes._render_chat_transcript()
+                # Spin through the real chat-send path. Skip the
+                # input-empty guard by writing directly into _chat_input.
+                if notes._chat_input is not None:
+                    try:
+                        notes._chat_input.delete(0, 'end')
+                        notes._chat_input.insert(0, 'tell me one fun fact')
+                    except Exception:
+                        pass
+                notes._on_chat_send()
+            except Exception as e:
+                logger.exception(f'TEST chat_hi setup failed: {e}')
+            # Poll for reply.
+            self.root.after(8000, lambda: self._test_chat_hi_report(notes))
+        # Defer further than _on_ask_followup's 80ms so the chat note
+        # is actually selected before we drive its input.
+        self.root.after(400, _go)
+
+    def _test_chat_editable_transcript(self) -> None:
+        """Drive a fresh chat note through:
+          1. Open empty chat
+          2. Send 'one fact' → receive reply
+          3. Simulate user editing the transcript (set override)
+          4. Send another question → verify reply appended without
+             wiping the override
+          5. Read note from disk → verify text field contains both
+             original turn + user edit + new turn
+        """
+        self._on_ask_followup('initial', '')   # open QN
+        def _go():
+            n = getattr(self, '_notes_win', None)
+            if n is None:
+                logger.warning('TEST editable: notes window missing')
+                return
+            n._chat_messages = []
+            n._chat_text_override = ''
+            n._chat_title = 'editable-transcript-test'
+            n._render_chat_transcript()
+            # Send first question
+            try:
+                n._chat_input.delete(0, 'end')
+                n._chat_input.insert(0, 'tell me one short fact')
+            except Exception:
+                pass
+            n._on_chat_send()
+            self.root.after(8000, lambda: _after_first(n))
+        def _after_first(n):
+            try:
+                turns = sum(1 for m in n._chat_messages if m.get('content'))
+            except Exception:
+                turns = 0
+            logger.info(f'TEST editable: after Q1 turns={turns}')
+            # Simulate the user editing the transcript: prepend a marker.
+            try:
+                inner = n._chat_transcript._textbox
+                inner.insert('1.0', '== USER EDIT MARKER ==\n\n')
+                n._chat_text_override = inner.get('1.0', 'end-1c')
+                n._chat_text_flush()
+            except Exception:
+                logger.exception('TEST editable: edit injection failed')
+            # Send second question
+            try:
+                n._chat_input.delete(0, 'end')
+                n._chat_input.insert(0, 'and another short fact')
+            except Exception:
+                pass
+            n._on_chat_send()
+            self.root.after(8000, lambda: _after_second(n))
+        def _after_second(n):
+            nid = n._editing_nid
+            try:
+                from storage import load_notes
+                notes = load_notes()
+                disk = next((x for x in notes if x.get('id') == nid), None)
+                text = (disk or {}).get('text', '') if disk else ''
+                msgs = len((disk or {}).get('messages', []))
+                has_marker = 'USER EDIT MARKER' in text
+                # The new AI reply should have been appended after the edit
+                has_two_user_turns = sum(1 for m in (disk or {}).get('messages', [])
+                                         if m.get('role') == 'user') == 2
+                if has_marker and has_two_user_turns and msgs >= 4:
+                    logger.info(
+                        f'TEST editable: PASS — marker preserved, '
+                        f'{msgs} messages in canonical history, '
+                        f'text length={len(text)}')
+                else:
+                    logger.warning(
+                        f'TEST editable: FAIL — marker_present={has_marker} '
+                        f'user_turns={has_two_user_turns} msgs={msgs}  '
+                        f'text_preview={text[:200]!r}')
+            except Exception as e:
+                logger.exception(f'TEST editable: disk check failed: {e}')
+        self.root.after(800, _go)
+
+    def _test_chat_title_reflect(self) -> None:
+        """Verify that editing the chat title in the right panel saves
+        to disk and the saved note carries the new title (which the
+        left list reads on _refresh_list)."""
+        # Need QN open first
+        self._on_ask_followup('placeholder', '')
+        def _go():
+            n = getattr(self, '_notes_win', None)
+            if n is None or n._chat_title_var is None:
+                logger.warning('TEST title_reflect: QN/title widget missing')
+                return
+            nid = n._editing_nid
+            new_title = 'EDITED TITLE ' + str(int(time.monotonic()))
+            # Drive through the real StringVar so _on_chat_title_change
+            # fires the same way it does when a human types.
+            n._chat_title_var.set(new_title)
+            n._on_chat_title_change()
+            # Wait past the 200ms debounce, then read disk.
+            def _check():
+                try:
+                    from storage import load_notes
+                    notes = load_notes()
+                    found = next((x for x in notes if x.get('id') == nid), None)
+                    on_disk = (found or {}).get('title', '')
+                    if on_disk == new_title:
+                        logger.info(
+                            f'TEST title_reflect: PASS — disk title='
+                            f'{on_disk!r}')
+                    else:
+                        logger.warning(
+                            f'TEST title_reflect: FAIL — wanted '
+                            f'{new_title!r} got {on_disk!r}')
+                except Exception as e:
+                    logger.exception(f'TEST title_reflect check failed: {e}')
+            self.root.after(400, _check)
+        self.root.after(600, _go)
+
+    def _test_chat_sweep(self) -> None:
+        """Five-question multi-turn sweep. Drives a fresh chat through:
+          1. "hi" (greeting)
+          2. "what causes thunder?"
+          3. "what about lightning?" (follow-up; needs prior context)
+          4. "tell me one historical fact"
+          5. "explain quantum entanglement simply"
+        Plus a side-by-side: same factual question through AskPill's
+        refine path, so we can eyeball whether tone matches."""
+        notes = getattr(self, '_notes_win', None)
+        if notes is None:
+            # Need QN open; spin it up via the followup helper which
+            # already handles the lazy-init dance.
+            self._on_ask_followup('Test sweep starting', '')
+        def _start():
+            n = getattr(self, '_notes_win', None)
+            if n is None:
+                logger.warning('TEST chat_sweep: notes window missing')
+                return
+            # Reset to an empty fresh chat (don't pollute the prior one)
+            n._chat_messages = []
+            n._chat_title = 'Test sweep'
+            n._render_chat_transcript()
+            self._sweep_queue = [
+                'hi',
+                'what causes thunder',
+                'what about lightning',
+                'tell me one historical fact',
+                'explain quantum entanglement simply',
+            ]
+            self._sweep_replies = []
+            self._sweep_step(n)
+        self.root.after(800, _start)
+
+    def _sweep_step(self, notes) -> None:
+        """Pull next question off the queue, fire send, then poll for
+        the assistant reply (no streaming hook to subscribe to)."""
+        if not self._sweep_queue:
+            self._test_chat_sweep_report()
+            return
+        q = self._sweep_queue.pop(0)
+        idx = len(self._sweep_replies)
+        logger.info(f'TEST chat_sweep[{idx}]: sending {q!r}')
+        # Stuff input + fire send through the real path.
+        try:
+            notes._chat_input.delete(0, 'end')
+            notes._chat_input.insert(0, q)
+        except Exception:
+            pass
+        before = len(notes._chat_messages)
+        notes._on_chat_send()
+        self._sweep_wait(notes, q, before, deadline=time.time() + 15.0)
+
+    def _sweep_wait(self, notes, question, before_count, deadline) -> None:
+        """Poll the chat messages list for a new assistant reply."""
+        n_now = len(notes._chat_messages)
+        if n_now >= before_count + 2:    # user + assistant appended
+            reply = notes._chat_messages[-1]
+            text = (reply.get('content') or '').strip()
+            self._sweep_replies.append((question, text))
+            logger.info(
+                f'TEST chat_sweep[{len(self._sweep_replies)-1}]: '
+                f'reply_len={len(text)}  first_line={text.splitlines()[0][:120]!r}')
+            # Brief breather before the next question.
+            self.root.after(700, lambda n=notes: self._sweep_step(n))
+            return
+        if time.time() > deadline:
+            self._sweep_replies.append((question, '[TIMEOUT]'))
+            logger.warning(f'TEST chat_sweep: timeout on {question!r}')
+            self.root.after(100, lambda n=notes: self._sweep_step(n))
+            return
+        self.root.after(250, lambda: self._sweep_wait(
+            notes, question, before_count, deadline))
+
+    def _test_chat_sweep_report(self) -> None:
+        """Print a summary + run the AskPill comparison."""
+        logger.info('========== TEST chat_sweep SUMMARY ==========')
+        all_pass = True
+        for i, (q, r) in enumerate(self._sweep_replies):
+            n = len(r)
+            ok = (n > 0 and n < 1200
+                  and 'User:' not in r and '[YOU]' not in r
+                  and r != '[TIMEOUT]')
+            tag = 'OK ' if ok else 'BAD'
+            all_pass = all_pass and ok
+            logger.info(f'  [{tag}] Q{i+1}({q[:30]!r:32}) → len={n}')
+        # Side-by-side: same factual question through the AskPill path.
+        from explain_pill import _SYSTEM_PROMPT as ASK_PROMPT
+        try:
+            pill_reply = self.provider.refine(
+                'what causes thunder', ASK_PROMPT)
+            chat_reply = next(
+                (r for q, r in self._sweep_replies
+                 if q == 'what causes thunder'), '')
+            logger.info(
+                f'  COMPARE thunder | askpill_len={len(pill_reply)} | '
+                f'chat_len={len(chat_reply)}')
+            logger.info(f'    AskPill: {pill_reply[:200]!r}')
+            logger.info(f'    Chat:    {chat_reply[:200]!r}')
+        except Exception as e:
+            logger.warning(f'AskPill comparison failed: {e}')
+        logger.info(f'========== sweep result: '
+                    f'{"PASS" if all_pass else "FAIL"} ==========')
+
+    def _test_chat_hi_report(self, notes) -> None:
+        try:
+            msgs = list(notes._chat_messages)
+            last = msgs[-1] if msgs else {}
+            content = (last.get('content') or '').strip()
+            role = last.get('role', '?')
+            logger.info(
+                f'TEST chat_hi: final role={role}  reply_len={len(content)}  '
+                f'preview={content[:200]!r}')
+            if role == 'assistant' and 'User:' not in content and \
+                    '[YOU]' not in content and len(content) < 600:
+                logger.info('TEST chat_hi: PASS (clean short reply)')
+            else:
+                logger.warning(
+                    'TEST chat_hi: FAIL — reply too long or contains '
+                    'hallucinated turn markers')
+        except Exception as e:
+            logger.exception(f'TEST chat_hi report failed: {e}')
+
+    def _on_ask_followup(self, question: str, answer: str) -> None:
+        """AskPill user clicked "↺ Follow up" after an answer rendered.
+        Spin up a chat-kind note seeded with the (Q, A) pair and open
+        Quick Notes on it so they can continue the conversation.
+
+        _do_open_notes() is a TOGGLE (closes if open). We can't use it
+        directly: if Quick Notes happens to be open, the toggle would
+        close it. Instead we:
+          1. If the window exists & viewable → use it (leave open)
+          2. If the window exists & hidden → deiconify
+          3. If the window doesn't exist → call _do_open_notes to build
+        Then we hand off the (Q, A) to it as a fresh chat note."""
+        msgs = [
+            {'role': 'user', 'content': question},
+            {'role': 'assistant', 'content': answer},
+        ]
+        notes = getattr(self, '_notes_win', None)
+        need_open = True
+        if notes is not None:
+            try:
+                if notes.winfo_exists():
+                    if not notes.winfo_viewable():
+                        notes.deiconify()
+                    need_open = False
+            except Exception:
+                notes = None
+        if need_open:
+            try:
+                self._do_open_notes()
+            except Exception as e:
+                logger.warning(f'Open Quick Notes for follow-up failed: {e}')
+                return
+            notes = getattr(self, '_notes_win', None)
+        if notes is None:
+            return
+        # Force Quick Notes to the foreground. Just calling lift() isn't
+        # enough on Windows — the foreground app stays in front. The
+        # standard Tk recipe is to flip -topmost on/off, which makes
+        # the OS treat the window as topmost long enough to raise it
+        # to the front of the z-order, then we drop the flag so it
+        # doesn't stay always-on-top.
+        try:
+            notes.lift()
+            notes.attributes('-topmost', True)
+            notes.update_idletasks()
+            notes.attributes('-topmost', False)
+            notes.focus_force()
+        except Exception as e:
+            logger.warning(f'Foreground Quick Notes failed: {e}')
+        try:
+            # Defer a few ms so the Quick Notes window has finished its
+            # initial layout pass. Without this, on a brand-new build
+            # the chat panel can be assembled before _content_host has
+            # been sized, leaving the input row clipped behind the
+            # title bar.
+            notes.after(80, lambda n=notes: n.open_chat_note_with_messages(
+                question[:80], msgs))
+        except Exception as e:
+            logger.warning(f'Open chat note failed: {e}')
 
     def _do_web(self) -> None:
         """Open the active bookmark in the default browser."""
@@ -1884,6 +2307,14 @@ class App:
             except Exception:
                 pass
             self._notes_win = None
+
+        self._build_notes_window()
+
+    def _build_notes_window(self, *, hidden: bool = False) -> None:
+        """Construct the Quick Notes window. Used by _do_open_notes
+        on first show, and by _prewarm_notes_window at app startup
+        with hidden=True so the next Shift+F7 is a fast deiconify
+        instead of a full UI build."""
 
         def _on_close():
             self._notes_win = None
@@ -1932,6 +2363,42 @@ class App:
             initial_theme=self.config.get('notes_theme', 'light'),
             on_theme_change=_on_theme_change,
         )
+        if hidden:
+            # Pre-warm path: hide right after construction so the user
+            # sees nothing until the actual Shift+F7. We use after()
+            # rather than calling withdraw() immediately because the
+            # QuickNotesWindow.__init__ ends with .deiconify().lift()
+            # which is queued on the Tk event loop; withdrawing inline
+            # would race.
+            try:
+                self._notes_win.after(50, self._notes_win.withdraw)
+            except Exception:
+                pass
+
+    def _prewarm_notes_window(self) -> None:
+        """Build the Quick Notes UI tree at app startup (hidden), so
+        the first Shift+F7 is a fast `deiconify()` instead of a 300-
+        500 ms full UI build. Called from the boot sequence at idle."""
+        if self._notes_win is not None:
+            return
+        try:
+            self._build_notes_window(hidden=True)
+            logger.info('Quick Notes pre-warmed (hidden).')
+        except Exception as e:
+            logger.warning(f'Quick Notes pre-warm failed: {e}')
+
+    def _prewarm_whiteboard(self) -> None:
+        """Spawn whiteboard.py hidden at app idle so the first Shift+F8 is
+        an instant ShowWindow on the existing WebView2 window instead of a
+        cold subprocess + Edge Chromium init (~30-45s on first boot). The
+        subprocess stays alive for the session via the existing
+        hide-on-close logic."""
+        try:
+            self._wb_spawn_ts = time.time()
+            self._do_open_whiteboard(prewarm=True)
+            logger.info('Whiteboard pre-warmed (hidden).')
+        except Exception as e:
+            logger.warning(f'Whiteboard pre-warm failed: {e}')
 
     # ── Transcribe (Shift+F9) ────────────────────────────────────────────────
 
@@ -1949,7 +2416,7 @@ class App:
 
     # ── Whiteboard ────────────────────────────────────────────────────────────
 
-    def _do_open_whiteboard(self) -> None:
+    def _do_open_whiteboard(self, prewarm: bool = False) -> None:
         """Shift+F8, toggle the offline-Whiteboard whiteboard subprocess.
 
         Runs whiteboard.py (pywebview + bundled @whiteboard/whiteboard)
@@ -1962,9 +2429,19 @@ class App:
           • minimized     → restore + foreground
           • background    → foreground
           • dead          → respawn
+
+        When `prewarm` is True, spawn the subprocess hidden so the first
+        real Shift+F8 just calls ShowWindow on the existing hidden window.
         """
         import subprocess
         from pathlib import Path as _Path
+
+        # Re-press guard: ignore subsequent presses while a launch is
+        # already in flight so spam-pressing Shift+F8 doesn't queue
+        # multiple spawns / pill rewrites. Existing-window toggle path
+        # past the EnumWindows below isn't gated — that's instant.
+        if not prewarm and getattr(self, '_wb_launch_in_flight', False):
+            return
 
         # When frozen, sys.executable IS the app exe, re-launch self with a
         # sentinel arg that main() catches early and routes into whiteboard
@@ -1981,6 +2458,8 @@ class App:
                 return
             spawn_cmd = [sys.executable, str(script)]
             spawn_cwd = str(script.parent)
+        if prewarm:
+            spawn_cmd.append('--prewarm')
 
         # Find the existing window by title, single_instance.py re-execs
         # pythonw so the window owner is a grandchild we don't directly track.
@@ -1998,7 +2477,17 @@ class App:
                 win32gui.EnumWindows(_cb, None)
                 if found:
                     h = found[0]
-                    if win32gui.IsIconic(h):
+                    # Already alive → prewarm is a no-op.
+                    if prewarm:
+                        return
+                    # Hide-on-close (whiteboard.py): the subprocess keeps
+                    # the WebView2 window alive but invisible after the
+                    # user clicks X. Restoring it is just ShowWindow +
+                    # foreground, no respawn needed.
+                    if not win32gui.IsWindowVisible(h):
+                        win32gui.ShowWindow(h, win32con.SW_SHOW)
+                        self._force_foreground(h)
+                    elif win32gui.IsIconic(h):
                         win32gui.ShowWindow(h, win32con.SW_RESTORE)
                         self._force_foreground(h)
                     elif win32gui.GetForegroundWindow() == h:
@@ -2009,6 +2498,114 @@ class App:
             except Exception as e:
                 logger.warning(f'whiteboard toggle failed, will respawn: {e}')
 
+        # No existing window. If a prewarm spawn is in flight (subprocess
+        # started but WebView2 hasn't finished cold-init yet), avoid
+        # spawning a duplicate — poll a few times and use the prewarm.
+        if not prewarm:
+            # Mark launch in flight for the re-press guard above.
+            self._wb_launch_in_flight = True
+            # Show launching pill immediately so the user knows their
+            # keypress registered. Pill updates every 500ms.
+            user_t0 = time.time()
+            try:
+                self.refine_overlay.show_whiteboard_launching(0.0)
+            except Exception:
+                pass
+
+            def _on_ready(h: int) -> None:
+                # Foreground the window on a thread — SetForegroundWindow
+                # + AttachThreadInput against a freshly-created WebView2
+                # window can briefly block while its message pump catches
+                # up. Doing it inline would stall Tk.
+                def _fg() -> None:
+                    try:
+                        import win32gui as _wg, win32con as _wc
+                        if not _wg.IsWindowVisible(h):
+                            _wg.ShowWindow(h, _wc.SW_SHOW)
+                        self._force_foreground(h)
+                    except Exception:
+                        pass
+                threading.Thread(target=_fg, daemon=True,
+                                 name='wb-fg').start()
+                try:
+                    self.refine_overlay.show_whiteboard_ready(time.time() - user_t0)
+                except Exception:
+                    pass
+                self._wb_launch_in_flight = False
+
+            last_ts = getattr(self, '_wb_spawn_ts', 0)
+            if last_ts and (time.time() - last_ts) < 60:
+                logger.info('whiteboard: prewarm in flight, polling for window…')
+                def _poll(remaining: int) -> None:
+                    if remaining <= 0:
+                        # Give up and respawn (the prewarm process may be dead).
+                        logger.info('whiteboard: prewarm did not surface, respawning')
+                        self._wb_spawn_ts = 0
+                        self._wb_launch_in_flight = False
+                        self._do_open_whiteboard()
+                        return
+                    # Update pill with current elapsed
+                    try:
+                        self.refine_overlay.show_whiteboard_launching(
+                            time.time() - user_t0)
+                    except Exception:
+                        pass
+                    try:
+                        import win32gui as _wg
+                        WB_TITLE = 'Whiteboard (Shift+F8)'
+                        found2 = []
+                        def _cb2(h, _):
+                            if not _wg.IsWindow(h): return
+                            if _wg.GetWindowText(h) == WB_TITLE:
+                                found2.append(h)
+                        _wg.EnumWindows(_cb2, None)
+                        if found2:
+                            _on_ready(found2[0])
+                            return
+                    except Exception:
+                        pass
+                    self.root.after(500, lambda: _poll(remaining - 1))
+                # Up to 120 * 500ms = 60s of polling. WebView2 cold-init
+                # has been observed to take 30-60s on first boot of the
+                # day; we'd rather wait than double-spawn.
+                self.root.after(0, lambda: _poll(120))
+                return
+
+            # No prewarm in flight, cold-spawn path: track the new spawn
+            # and poll for the resulting window so the pill can update.
+            self._wb_user_spawn_t0 = user_t0
+            def _poll_after_spawn(remaining: int) -> None:
+                if remaining <= 0:
+                    try:
+                        self.refine_overlay.show_error(
+                            'Whiteboard launch timed out')
+                    except Exception:
+                        pass
+                    self._wb_launch_in_flight = False
+                    return
+                try:
+                    self.refine_overlay.show_whiteboard_launching(
+                        time.time() - user_t0)
+                except Exception:
+                    pass
+                try:
+                    import win32gui as _wg
+                    WB_TITLE = 'Whiteboard (Shift+F8)'
+                    found3 = []
+                    def _cb3(h, _):
+                        if not _wg.IsWindow(h): return
+                        if _wg.GetWindowText(h) == WB_TITLE:
+                            found3.append(h)
+                    _wg.EnumWindows(_cb3, None)
+                    if found3:
+                        _on_ready(found3[0])
+                        return
+                except Exception:
+                    pass
+                self.root.after(500, lambda: _poll_after_spawn(remaining - 1))
+            # Defer the first poll until after the spawn returns below.
+            self.root.after(750, lambda: _poll_after_spawn(120))
+
         # In dev mode, swap python.exe → pythonw.exe to suppress the console
         # flash. Frozen exe is already windowed.
         if not frozen:
@@ -2017,43 +2614,60 @@ class App:
                 pyw = spawn_cmd[0][:-10] + 'pythonw.exe'
                 if _Path(pyw).exists():
                     spawn_cmd[0] = pyw
-        # Use PowerShell Start-Process as a launcher intermediary. Direct
-        # subprocess.Popen with every isolation flag we tried (DETACHED,
-        # NEW_PROCESS_GROUP, BREAKAWAY_FROM_JOB, DEVNULL stdio) STILL
-        # killed the parent process whenever the child loaded pywebview
-        # / Edge WebView2. PowerShell's Start-Process creates the child
-        # through a PowerShell intermediary which then exits — the final
-        # whiteboard process is orphaned to System and has zero linkage
-        # to us. This is the only launch method we found that survives.
-        if sys.platform == 'win32':
-            arg_str = ' '.join(f'"{a}"' for a in spawn_cmd[1:])
-            ps_script = (
-                f"Start-Process -FilePath '{spawn_cmd[0]}' "
-                + (f"-ArgumentList {arg_str} " if arg_str else '')
-                + f"-WindowStyle Hidden -WorkingDirectory '{spawn_cwd}'"
-            )
-            proc = subprocess.Popen(
-                ['powershell', '-NoProfile', '-WindowStyle', 'Hidden',
-                 '-Command', ps_script],
-                creationflags=subprocess.CREATE_NO_WINDOW,
-                close_fds=True,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            # PowerShell exits within ~1s; we don't track its pid.
-            self._wb_proc = proc
-            self._wb_proc_pid = None  # actual whiteboard pid is unknown; we find it by window title
-        else:
-            proc = subprocess.Popen(
-                spawn_cmd, cwd=spawn_cwd, close_fds=True,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            self._wb_proc = proc
-            self._wb_proc_pid = proc.pid
-        logger.info(f'Launched whiteboard via {"powershell intermediary" if sys.platform == "win32" else "direct"} ({"frozen" if frozen else "source"})')
+        # Direct subprocess.Popen with detach flags. We used to route
+        # through a PowerShell `Start-Process` intermediary because an
+        # earlier round of testing showed direct Popen brought down the
+        # parent when WebView2 init crashed. Measurement on 2026-06-11
+        # found the PowerShell path costs ~22s per launch (AV scanning
+        # the PowerShell host on every invocation), vs ~100ms for direct
+        # Popen with the right flags.
+        #
+        # Flags:
+        #   DETACHED_PROCESS         (0x08)        — no console attached
+        #   CREATE_NEW_PROCESS_GROUP (0x200)       — Ctrl-C isolation
+        #   CREATE_BREAKAWAY_FROM_JOB (0x01000000) — survives parent kill
+        #
+        # single_instance.py inside whiteboard.py re-execs into a fresh
+        # pythonw grandchild, so even if our direct child died, the
+        # grandchild owns the WebView2 window independently.
+        def _spawn_in_bg() -> None:
+            try:
+                if sys.platform == 'win32':
+                    DETACHED = 0x08
+                    NEW_GROUP = 0x200
+                    BREAKAWAY = 0x01000000
+                    proc = subprocess.Popen(
+                        spawn_cmd, cwd=spawn_cwd,
+                        creationflags=DETACHED | NEW_GROUP | BREAKAWAY,
+                        close_fds=True,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                else:
+                    proc = subprocess.Popen(
+                        spawn_cmd, cwd=spawn_cwd, close_fds=True,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                self._wb_proc = proc
+                self._wb_proc_pid = proc.pid
+                # Add to cleanup Job Object so Windows kills it
+                # automatically when this process exits (graceful or
+                # force-kill). Without this, whiteboard prewarm + its
+                # 6 WebView2 children survive Hotkeys quit as orphans.
+                try: self._assign_to_cleanup_job(proc.pid)
+                except Exception: pass
+                logger.info(f'Launched whiteboard via direct Popen ({"frozen" if frozen else "source"}) pid={proc.pid}')
+            except Exception as e:
+                logger.warning(f'whiteboard spawn failed: {e}')
+                # On spawn failure, clear the in-flight flag so the user
+                # can retry. On success the flag is cleared by _on_ready
+                # or the polling timeout.
+                self._wb_launch_in_flight = False
+        threading.Thread(target=_spawn_in_bg, daemon=True,
+                         name='wb-spawn').start()
 
     # ── URL downloader (Ctrl+Alt+D) ─────────────────────────────────────────
 
@@ -2077,39 +2691,17 @@ class App:
                 time.sleep(0.015)
         time.sleep(0.04)
 
-        # Selection first
-        try:
-            prev = pyperclip.paste()
-        except Exception:
-            prev = ''
-        try:
-            pyperclip.copy('')
-        except Exception:
-            pass
-        copy_selection()
-        captured = ''
-        for _ in range(25):
-            time.sleep(0.03)
-            try:
-                cur = pyperclip.paste()
-            except Exception:
-                continue
-            if cur and cur.strip():
-                captured = cur
-                break
+        # Selection first via Win32-sequence-number capture (see
+        # _capture_selection_full for why this beats raw content polling).
+        captured, prev = self._capture_selection_full()
 
-        # Restore clipboard. We extract URLs from BOTH the selection and
-        # the previous clipboard text in case the user copied a URL
-        # earlier rather than selecting it just now.
+        # We extract URLs from BOTH the selection and the previous clipboard
+        # text in case the user copied a URL earlier rather than selecting it.
         candidates = []
         if captured.strip():
             candidates.append(captured.strip())
         if prev and prev.strip() and prev.strip() != captured.strip():
             candidates.append(prev.strip())
-        try:
-            pyperclip.copy(prev)
-        except Exception:
-            pass
 
         import re as _re
         url_re = _re.compile(r'https?://[^\s<>"\'\)]+', _re.IGNORECASE)
@@ -2122,11 +2714,11 @@ class App:
 
         if not url:
             logger.info('Download URL: no URL found in selection or clipboard')
-            self._q.put(('download_url', _DOWNLOAD_NO_URL))
+            self._q.put_nowait(('download_url', _DOWNLOAD_NO_URL))
             return
 
         logger.info(f'Download URL queued: {url[:80]}')
-        self._q.put(('download_url', url))
+        self._q.put_nowait(('download_url', url))
 
     def _do_download_url(self, url) -> None:
         """Main-thread handler: kicks off the yt-dlp download on a worker
@@ -2239,11 +2831,22 @@ class App:
         Pass our Tk root so the launcher can pop a "drop file here"
         hint overlay over the editor on first launch.
         """
+        # Re-press guard: launching a 2nd Tenacity while the 1st is still
+        # cold-starting spawns two instances racing on the same audio
+        # device + window title. 2.5s lock is enough to cover the toggle
+        # call window; subsequent presses after that hit the existing-
+        # window toggle in audio_editor.toggle() which is idempotent.
+        if getattr(self, '_audio_editor_launch_in_flight', False):
+            return
+        self._audio_editor_launch_in_flight = True
         try:
             import audio_editor
             audio_editor.toggle(tk_root=self.root)
         except Exception as e:
             logger.error(f'audio editor toggle failed: {e}')
+        finally:
+            self.root.after(2500,
+                            lambda: setattr(self, '_audio_editor_launch_in_flight', False))
 
     @staticmethod
     def _is_whiteboard_foreground() -> bool:
@@ -2301,6 +2904,13 @@ class App:
 
     def _hk_chain(self) -> None:
         """Shift+F6 (or per-chain hotkey), capture text and run active chain."""
+        # Re-press guard: a 2nd press while the first chain is running
+        # would spawn another runner thread (parallel LLM calls + racing
+        # paste_from_clipboard at the end). Cleared by _run_chain on
+        # completion / error, and by _do_chain on early-return paths.
+        if getattr(self, '_chain_in_progress', False):
+            return
+        self._chain_in_progress = True
         logger.info('Chain hotkey fired.')
         threading.Thread(target=self._capture_and_queue_chain, daemon=True).start()
 
@@ -2325,55 +2935,39 @@ class App:
             except Exception:
                 pass
         time.sleep(0.04)
-        try:
-            prev = pyperclip.paste()
-        except Exception:
-            prev = ''
-        try:
-            pyperclip.copy('')
-        except Exception:
-            pass
-        copy_selection()
-        captured = ''
-        for _ in range(25):
-            time.sleep(0.03)
-            try:
-                current = pyperclip.paste()
-            except Exception:
-                continue
-            if current and current.strip():
-                captured = current
-                break
-        if not captured:
-            try:
-                pyperclip.copy(prev)
-            except Exception:
-                pass
+        # Non-destructive selection capture via Win32-sequence-number
+        # polling (see _capture_selection_via_clipboard).
+        captured = self._capture_selection_via_clipboard()
         logger.info(f'Chain: captured text ({len(captured)} chars): {captured[:80]!r}')
-        self._q.put(('chain', captured))
+        self._q.put_nowait(('chain', captured))
 
     def _do_chain(self, text: str) -> None:
         """Main-thread handler, find active chain and start runner thread."""
         if self._refine_in_progress:
             self.chain_overlay.show_error('Refine in progress, wait for it to finish')
+            self._chain_in_progress = False
             threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
             return
         if self._whisper_recording:
             self.chain_overlay.show_error('Recording in progress, stop first')
+            self._chain_in_progress = False
             threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
             return
         self.chains = load_chains()
         active_chain = next((c for c in self.chains if c.get('active')), None)
         if not self.chains or active_chain is None:
             self.chain_overlay.show_error('No active chain, open Chains tab to set one')
+            self._chain_in_progress = False
             threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
             return
         if not text or not text.strip():
             self.chain_overlay.show_no_selection()
+            self._chain_in_progress = False
             threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
             return
         if not self.provider.ready:
             self.chain_overlay.show_error('API key required, open Settings')
+            self._chain_in_progress = False
             threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
             return
         threading.Thread(
@@ -2387,6 +2981,7 @@ class App:
         steps = chain.get('steps', [])
         if not steps:
             self.root.after(0, lambda: self.chain_overlay.show_error('Chain has no steps'))
+            self._chain_in_progress = False
             return
         current_text = text
         try:
@@ -2417,6 +3012,10 @@ class App:
                 active_provider=self.config.get('active_provider', ''))
             self.root.after(0, lambda e=err_msg: self.chain_overlay.show_error(e))
             self.root.after(0, self._reregister_after_action)
+        finally:
+            # Clear re-press guard regardless of success/failure so the
+            # user can run the chain again immediately.
+            self._chain_in_progress = False
 
     def _do_chain_named(self, chain: dict) -> None:
         """Main-thread handler for per-chain hotkeys, captures text then runs that chain."""
@@ -2448,30 +3047,9 @@ class App:
             except Exception:
                 pass
         time.sleep(0.04)
-        try:
-            prev = pyperclip.paste()
-        except Exception:
-            prev = ''
-        try:
-            pyperclip.copy('')
-        except Exception:
-            pass
-        copy_selection()
-        captured = ''
-        for _ in range(25):
-            time.sleep(0.03)
-            try:
-                current = pyperclip.paste()
-            except Exception:
-                continue
-            if current and current.strip():
-                captured = current
-                break
-        if not captured:
-            try:
-                pyperclip.copy(prev)
-            except Exception:
-                pass
+        # Non-destructive selection capture via Win32-sequence-number
+        # polling (see _capture_selection_via_clipboard).
+        captured = self._capture_selection_via_clipboard()
         if not captured or not captured.strip():
             self.root.after(0, lambda: self.chain_overlay.show_no_selection())
             self.root.after(0, lambda: threading.Thread(
@@ -2512,7 +3090,7 @@ class App:
             try:
                 handle = kbhook.add_hotkey(
                     hk,
-                    lambda c=chain: self._q.put(('chain_named', c)),
+                    lambda c=chain: self._q.put_nowait(('chain_named', c)),
                 )
                 self._chain_saved_hks.append(handle)
                 logger.info(f'Chain hotkey registered: {hk!r} -> "{cname}"')
@@ -2520,23 +3098,29 @@ class App:
                 logger.warning(f'Could not register chain hotkey {hk!r}: {e}')
 
     def _hk_undo_refine(self) -> None:
-        self._q.put(('undo_refine', None))
+        self._q.put_nowait(('undo_refine', None))
 
     def _hk_library(self) -> None:
-        self._q.put(('library', None))
+        self._q.put_nowait(('library', None))
 
     def _hk_whisper(self) -> None:
         if not self._whisper_recording:
-            self._q.put(('whisper:start', None))
+            self._q.put_nowait(('whisper:start', None))
         else:
-            self._q.put(('whisper:stop', None))
+            self._q.put_nowait(('whisper:stop', None))
 
     def _hk_screenshot(self) -> None:
-        self.root.after(0, lambda: take_screenshot(
-            self.root,
-            on_extract_text=self._screenshot_extract_text,
-            on_translate=self._screenshot_translate,
-        ))
+        # Route through the event queue, NOT root.after(). The PrtSc
+        # WH_KEYBOARD_LL hook in screenshot.py calls this synchronously
+        # inside the hook context with a hard <300ms budget — if Tk's
+        # main loop is busy (worker thread writing clipboard, previous
+        # result popup still painting, etc.), root.after can block long
+        # enough that Windows uninstalls the hook entirely and PrtSc
+        # goes dead until restart. Queue put_nowait is always microsecs.
+        try:
+            self._q.put_nowait(('screenshot', None))
+        except Exception as e:
+            logger.warning(f'screenshot enqueue failed: {e}')
 
     def _screenshot_extract_text(self, img) -> None:
         """Context-menu "Extract text" from screenshot. OCR the image,
@@ -2548,20 +3132,2027 @@ class App:
         ).start()
 
     def _screenshot_translate(self, img) -> None:
-        """Context-menu "Translate to English" from screenshot. OCR the image,
-        translate the extracted text via the configured LLM provider, copy
-        result to clipboard, show in result popup."""
+        """Context-menu "Translate to English (AI)" from screenshot. OCR the
+        image, translate the extracted text via the configured LLM provider,
+        copy result to clipboard, show in result popup."""
         threading.Thread(
             target=self._screenshot_ocr_worker,
             args=(img, True),
-            daemon=True, name='screenshot-translate',
+            kwargs={'engine': 'llm'},
+            daemon=True, name='screenshot-translate-llm',
         ).start()
 
-    def _screenshot_ocr_worker(self, img, translate: bool) -> None:
+    def _screenshot_translate_google(self, img) -> None:
+        """Context-menu "Translate to English (Google)" from screenshot. OCR
+        the image, translate via the Google Translate web endpoint
+        (deep-translator scrape). Lets the user compare Google's neural
+        output against the LLM result."""
+        threading.Thread(
+            target=self._screenshot_ocr_worker,
+            args=(img, True),
+            kwargs={'engine': 'google'},
+            daemon=True, name='screenshot-translate-google',
+        ).start()
+
+    # ── Document scan ("📄 Scan document") ─────────────────────────────────
+
+    @staticmethod
+    def _scan_detect_page(bgr):
+        """Return a 4-point contour of the largest 4-sided shape (page),
+        or None if no clear document edge is found. Coords are in the
+        input image's pixel space. We search at a downscaled resolution
+        for speed, then map points back."""
+        import numpy as _np
+        import cv2 as _cv
+        h, w = bgr.shape[:2]
+        # Downscale for speed; we only need approximate corner locations.
+        scale = 600.0 / max(h, w) if max(h, w) > 600 else 1.0
+        small = _cv.resize(bgr, (int(w * scale), int(h * scale)),
+                           interpolation=_cv.INTER_AREA) if scale < 1 else bgr
+        gray = _cv.cvtColor(small, _cv.COLOR_BGR2GRAY)
+        gray = _cv.GaussianBlur(gray, (5, 5), 0)
+        edges = _cv.Canny(gray, 75, 200)
+        # Dilate to close small gaps in detected edges.
+        edges = _cv.dilate(edges, _np.ones((3, 3), _np.uint8), iterations=1)
+        contours, _ = _cv.findContours(
+            edges, _cv.RETR_EXTERNAL, _cv.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+        contours = sorted(contours, key=_cv.contourArea, reverse=True)[:5]
+        img_area = small.shape[0] * small.shape[1]
+        for c in contours:
+            peri = _cv.arcLength(c, True)
+            approx = _cv.approxPolyDP(c, 0.02 * peri, True)
+            if len(approx) == 4 and _cv.contourArea(c) > img_area * 0.25:
+                pts = approx.reshape(4, 2).astype('float32')
+                if scale < 1:
+                    pts /= scale
+                return pts
+        return None
+
+    @staticmethod
+    def _scan_warp_to_rect(bgr, pts):
+        """Given the original BGR image and 4 corner points (any order),
+        return a top-down perspective-corrected crop of the document."""
+        import numpy as _np
+        import cv2 as _cv
+        # Order corners: TL, TR, BR, BL via sum/diff trick.
+        rect = _np.zeros((4, 2), dtype='float32')
+        s = pts.sum(axis=1)
+        rect[0] = pts[_np.argmin(s)]   # TL has smallest sum
+        rect[2] = pts[_np.argmax(s)]   # BR has largest sum
+        diff = _np.diff(pts, axis=1)
+        rect[1] = pts[_np.argmin(diff)]  # TR has smallest diff
+        rect[3] = pts[_np.argmax(diff)]  # BL has largest diff
+        (tl, tr, br, bl) = rect
+        widthA = _np.linalg.norm(br - bl)
+        widthB = _np.linalg.norm(tr - tl)
+        maxW = max(int(widthA), int(widthB))
+        heightA = _np.linalg.norm(tr - br)
+        heightB = _np.linalg.norm(tl - bl)
+        maxH = max(int(heightA), int(heightB))
+        if maxW < 10 or maxH < 10:
+            return None
+        dst = _np.array([
+            [0, 0], [maxW - 1, 0],
+            [maxW - 1, maxH - 1], [0, maxH - 1]], dtype='float32')
+        M = _cv.getPerspectiveTransform(rect, dst)
+        return _cv.warpPerspective(bgr, M, (maxW, maxH))
+
+    @staticmethod
+    def _shadow_remove(bgr):
+        """Remove shadows / uneven illumination from a paper photo.
+
+        Algorithm: estimate the "no-text" background by dilating each
+        channel (which spreads light areas into dark ones) and then
+        median-blurring it, then divide the original by the background.
+        Pixels under shadows get brightened; pixels under text stay dark
+        relative to their local background.
+
+        Critical for Magic Color mode on phone photos — without this,
+        side-lit pages have a gradient dark→light across the page and
+        Magic Color "sees" that as a colour cast and over-corrects."""
+        import numpy as _np
+        import cv2 as _cv
+        result_channels = []
+        for ch in _cv.split(bgr):
+            # Dilate with a fairly large kernel so the structuring
+            # element jumps over most text strokes and only "sees" the
+            # paper background. 7×7 works well for normal-size text.
+            dilated = _cv.dilate(ch, _np.ones((7, 7), _np.uint8))
+            # Smooth the background estimate so individual character
+            # holes don't leave bright spots after division.
+            bg = _cv.medianBlur(dilated, 21)
+            # Subtract background from itself (so values are 0 where the
+            # original matched the bg) then invert so light = paper.
+            diff = 255 - _cv.absdiff(ch, bg)
+            # Stretch to full dynamic range so shadow areas come up to
+            # the same brightness as well-lit areas.
+            norm = _cv.normalize(diff, None, alpha=0, beta=255,
+                                 norm_type=_cv.NORM_MINMAX)
+            result_channels.append(norm)
+        return _cv.merge(result_channels)
+
+    @staticmethod
+    def _scan_enhance(bgr, mode: str = 'magic'):
+        """CamScanner-style enhancement. Modes:
+          - 'magic'    → shadow-removal + auto white-balance + CLAHE +
+                        mild sharpen. CamScanner's default.
+          - 'gray'     → grayscale + shadow-removal + CLAHE + sharpen.
+          - 'bw'       → adaptive threshold black-and-white "scan look".
+          - 'original' → return BGR unchanged (so the preview can flip
+                        back to compare against the cleaned version).
+        Input is BGR uint8; output is BGR uint8 (so the preview can
+        always display via Pillow without per-mode branching)."""
+        import numpy as _np
+        import cv2 as _cv
+        if mode == 'original':
+            return bgr.copy()
+        if mode == 'bw':
+            # Shadow removal first so adaptive threshold has uniform
+            # background to work against — eliminates the splotchy
+            # dark blobs we used to get on side-lit photos.
+            cleaned = App._shadow_remove(bgr)
+            gray = _cv.cvtColor(cleaned, _cv.COLOR_BGR2GRAY)
+            bw = _cv.adaptiveThreshold(
+                gray, 255,
+                _cv.ADAPTIVE_THRESH_GAUSSIAN_C,
+                _cv.THRESH_BINARY, 31, 12)
+            return _cv.cvtColor(bw, _cv.COLOR_GRAY2BGR)
+        if mode == 'gray':
+            cleaned = App._shadow_remove(bgr)
+            gray = _cv.cvtColor(cleaned, _cv.COLOR_BGR2GRAY)
+            clahe = _cv.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+            gray = clahe.apply(gray)
+            blur = _cv.GaussianBlur(gray, (0, 0), sigmaX=1.2)
+            gray = _cv.addWeighted(gray, 1.5, blur, -0.5, 0)
+            return _cv.cvtColor(gray, _cv.COLOR_GRAY2BGR)
+        # 'magic' (default)
+        # 1. Shadow removal — neutralises uneven lighting before colour
+        # correction sees the resulting tone shift.
+        out = App._shadow_remove(bgr)
+        # 2. Simple grey-world white balance — divide each channel by
+        # its mean and re-scale. Kills warm/cool paper tints.
+        out = out.astype(_np.float32)
+        means = out.reshape(-1, 3).mean(axis=0)
+        avg = means.mean()
+        for i in range(3):
+            out[:, :, i] *= avg / max(means[i], 1.0)
+        out = _np.clip(out, 0, 255).astype(_np.uint8)
+        # 3. CLAHE on luminance channel (preserves colour)
+        lab = _cv.cvtColor(out, _cv.COLOR_BGR2LAB)
+        l, a, b = _cv.split(lab)
+        clahe = _cv.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        l = clahe.apply(l)
+        out = _cv.cvtColor(_cv.merge((l, a, b)), _cv.COLOR_LAB2BGR)
+        # 4. Mild unsharp for text crispness
+        blur = _cv.GaussianBlur(out, (0, 0), sigmaX=1.2)
+        out = _cv.addWeighted(out, 1.4, blur, -0.4, 0)
+        return out
+
+    @staticmethod
+    def _scan_auto_crop(bgr, padding: int = 24):
+        """Crop white / near-white margins around the content. Finds the
+        bounding box of darker pixels (text + shapes), expands by
+        `padding` pixels, returns the cropped image. Saves screen real
+        estate in the preview and trims the PDF file size."""
+        import numpy as _np
+        import cv2 as _cv
+        gray = _cv.cvtColor(bgr, _cv.COLOR_BGR2GRAY)
+        # Threshold the inverse so dark pixels become "foreground".
+        _, binary = _cv.threshold(gray, 230, 255, _cv.THRESH_BINARY_INV)
+        coords = _cv.findNonZero(binary)
+        if coords is None or len(coords) < 100:
+            return bgr   # nothing to crop to; bail
+        x, y, w, h = _cv.boundingRect(coords)
+        H, W = bgr.shape[:2]
+        # Don't crop tighter than 95% of the image — if we couldn't find
+        # solid margins, leave things alone.
+        if w * h > H * W * 0.95:
+            return bgr
+        x0 = max(0, x - padding)
+        y0 = max(0, y - padding)
+        x1 = min(W, x + w + padding)
+        y1 = min(H, y + h + padding)
+        return bgr[y0:y1, x0:x1]
+
+    @staticmethod
+    def _scan_auto_orient(bgr):
+        """Use Tesseract OSD (--psm 0) to detect if the image is sideways
+        or upside down (90/180/270 from upright) and rotate it to
+        upright. Tesseract OSD reports the rotation that makes text
+        upright; we apply that rotation.
+
+        Best-effort: if Tesseract OSD fails or returns 0°, returns the
+        image unchanged. Doesn't crash on small images or no-text
+        regions."""
+        import cv2 as _cv
+        try:
+            import pytesseract as _pt
+            # Tesseract OSD needs the binary path set the same way our
+            # main OCR does — re-use the same resolution logic.
+            from pathlib import Path as _P
+            import os as _os
+            _candidates = [
+                str(_P(__file__).resolve().parent / 'bin' / 'tesseract.exe'),
+                str(_P(__file__).resolve().parent / 'tesseract' / 'tesseract.exe'),
+                r'C:\Program Files\Tesseract-OCR\tesseract.exe',
+                r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
+            ]
+            _bin = next((p for p in _candidates if _os.path.isfile(p)), None)
+            if _bin is None:
+                return bgr
+            _pt.pytesseract.tesseract_cmd = _bin
+            _tessdata = _P(__file__).resolve().parent / 'tessdata'
+            if _tessdata.is_dir():
+                _os.environ['TESSDATA_PREFIX'] = str(_tessdata)
+            from PIL import Image as _Im
+            rgb = _cv.cvtColor(bgr, _cv.COLOR_BGR2RGB)
+            pil = _Im.fromarray(rgb)
+            osd = _pt.image_to_osd(pil, config='--psm 0')
+            import re as _re
+            m = _re.search(r'Rotate:\s*(\d+)', osd)
+            conf_m = _re.search(r'Orientation confidence:\s*([\d.]+)', osd)
+            if not m:
+                return bgr
+            angle = int(m.group(1))
+            confidence = float(conf_m.group(1)) if conf_m else 0.0
+            # Tesseract OSD often misidentifies screenshots (mixed UI +
+            # text + icons) as 180° rotated when confidence is low. Only
+            # auto-rotate if confidence is solid (≥ 2.0 is the
+            # documented "very probable" threshold) AND skip 180° flips
+            # entirely on lowish confidence — those are the most common
+            # misclassification.
+            if confidence < 2.0:
+                logger.info(
+                    f'Auto-orient skipped: detected {angle}° but low '
+                    f'confidence {confidence:.2f}')
+                return bgr
+            if angle == 180 and confidence < 3.5:
+                logger.info(
+                    f'Auto-orient skipped: 180° flip needs confidence '
+                    f'≥3.5 (got {confidence:.2f}) to avoid upside-down '
+                    f'screenshots from sparse-text misclassification')
+                return bgr
+            if angle == 90:
+                logger.info(f'Auto-orient: rotating 90° CW (conf {confidence:.2f})')
+                return _cv.rotate(bgr, _cv.ROTATE_90_CLOCKWISE)
+            if angle == 180:
+                logger.info(f'Auto-orient: rotating 180° (conf {confidence:.2f})')
+                return _cv.rotate(bgr, _cv.ROTATE_180)
+            if angle == 270:
+                logger.info(f'Auto-orient: rotating 90° CCW (conf {confidence:.2f})')
+                return _cv.rotate(bgr, _cv.ROTATE_90_COUNTERCLOCKWISE)
+            return bgr
+        except Exception as e:
+            logger.info(f'Auto-orient skipped: {e}')
+            return bgr
+
+    @staticmethod
+    def _scan_text_deskew_angle(bgr) -> float:
+        """Detect the dominant rotation angle of text in the image, in
+        degrees. Used when no document corners are found — same role
+        CamScanner's "align text" pass plays. Returns the angle the
+        image needs to ROTATE BY to make text horizontal (positive =
+        counter-clockwise).
+
+        Strategy: threshold to get text-pixel cloud, then run minAreaRect
+        on the connected components. The rectangle's angle tells us
+        which way the text lines run. We use the median across multiple
+        large components for robustness against noise / single skewed
+        characters.
+
+        Returns 0.0 if no reliable angle could be determined."""
+        import numpy as _np
+        import cv2 as _cv
+        h, w = bgr.shape[:2]
+        scale = 800.0 / max(h, w) if max(h, w) > 800 else 1.0
+        small = (_cv.resize(bgr, (int(w * scale), int(h * scale)),
+                            interpolation=_cv.INTER_AREA)
+                 if scale < 1 else bgr)
+        gray = _cv.cvtColor(small, _cv.COLOR_BGR2GRAY)
+        # Adaptive threshold isolates text on uneven lighting.
+        binr = _cv.adaptiveThreshold(
+            gray, 255, _cv.ADAPTIVE_THRESH_GAUSSIAN_C,
+            _cv.THRESH_BINARY_INV, 31, 12)
+        # Dilate horizontally so adjacent characters merge into "lines".
+        # Wider kernel → joins more aggressively; we want lines, not
+        # characters or paragraphs.
+        k = _cv.getStructuringElement(_cv.MORPH_RECT, (25, 3))
+        merged = _cv.dilate(binr, k, iterations=1)
+        contours, _ = _cv.findContours(
+            merged, _cv.RETR_EXTERNAL, _cv.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return 0.0
+        # Only consider contours that look like text lines:
+        # - area at least 1% of image
+        # - aspect ratio > 3:1 (wider than tall)
+        candidates = []
+        img_area = small.shape[0] * small.shape[1]
+        for c in contours:
+            area = _cv.contourArea(c)
+            if area < img_area * 0.005:
+                continue
+            rect = _cv.minAreaRect(c)
+            (cx, cy), (rw, rh), angle = rect
+            if rw < 1 or rh < 1:
+                continue
+            # OpenCV's minAreaRect angle wraps weirdly; normalise to
+            # the rotation needed to make the LONGER side horizontal.
+            if rw < rh:
+                rw, rh = rh, rw
+                angle = angle + 90
+            # Aspect ratio gate: text lines are at least 3× wider than tall
+            if rw / rh < 3.0:
+                continue
+            # Normalise to (-45, 45]
+            while angle > 45:
+                angle -= 90
+            while angle <= -45:
+                angle += 90
+            candidates.append(angle)
+        if not candidates:
+            return 0.0
+        # Median is robust against the occasional misclassified contour
+        median_angle = float(_np.median(candidates))
+        # If the result is suspiciously close to 0, return exactly 0
+        # so we don't introduce sub-degree jitter.
+        if abs(median_angle) < 0.3:
+            return 0.0
+        # Sanity cap — text lines shouldn't be tilted >35° on a real photo
+        if abs(median_angle) > 35:
+            return 0.0
+        return median_angle
+
+    @staticmethod
+    def _scan_rotate(bgr, angle_deg: float):
+        """Rotate BGR image by angle_deg counter-clockwise around its
+        centre, expanding the canvas to fit. White-fills the corners
+        so they look like blank paper."""
+        import numpy as _np
+        import cv2 as _cv
+        if abs(angle_deg) < 0.3:
+            return bgr
+        (h, w) = bgr.shape[:2]
+        cx, cy = w / 2.0, h / 2.0
+        M = _cv.getRotationMatrix2D((cx, cy), angle_deg, 1.0)
+        # Expand canvas so corners don't crop
+        cos = abs(M[0, 0]); sin = abs(M[0, 1])
+        new_w = int(h * sin + w * cos)
+        new_h = int(h * cos + w * sin)
+        M[0, 2] += (new_w / 2.0) - cx
+        M[1, 2] += (new_h / 2.0) - cy
+        return _cv.warpAffine(
+            bgr, M, (new_w, new_h),
+            flags=_cv.INTER_CUBIC,
+            borderMode=_cv.BORDER_CONSTANT,
+            borderValue=(255, 255, 255))
+
+    @staticmethod
+    def _scan_pipeline_with_corners(pil_img, corners, mode: str = 'magic'):
+        """Same as _scan_pipeline but uses the supplied 4-corner quad
+        instead of auto-detecting. Used by the manual-corner editor so
+        the user's adjustments persist across mode changes."""
+        import numpy as _np
+        import cv2 as _cv
+        from PIL import Image as _Im
+        bgr = _cv.cvtColor(_np.array(pil_img.convert('RGB')), _cv.COLOR_RGB2BGR)
+        if corners is None or mode == 'original':
+            warped = bgr
+        else:
+            warped = App._scan_warp_to_rect(bgr, _np.asarray(corners, dtype='float32'))
+            if warped is None:
+                warped = bgr
+        try:
+            warped = App._scan_auto_orient(warped)
+        except Exception:
+            pass
+        enhanced = App._scan_enhance(warped, mode=mode)
+        if mode != 'original':
+            try:
+                enhanced = App._scan_auto_crop(enhanced)
+            except Exception:
+                pass
+        return _Im.fromarray(_cv.cvtColor(enhanced, _cv.COLOR_BGR2RGB))
+
+    @staticmethod
+    def _scan_pipeline(pil_img, mode: str = 'magic'):
+        """Full CamScanner-style pipeline:
+          1. Try document-corner detection → perspective-flatten if found
+          2. If no doc found, fall back to TEXT-LEVEL deskew — rotate so
+             text lines are horizontal (this is the key CamScanner
+             behaviour that was missing in my earlier pass)
+          3. Enhance (Magic Color / Grayscale / B&W)
+
+        Returns a PIL Image. Always tries to make text horizontal even
+        when no document edges can be located."""
+        import numpy as _np
+        import cv2 as _cv
+        from PIL import Image as _Im
+        bgr = _cv.cvtColor(_np.array(pil_img.convert('RGB')), _cv.COLOR_RGB2BGR)
+        # Step 1: corner-detect + perspective warp
+        pts = App._scan_detect_page(bgr)
+        warped = None
+        if pts is not None:
+            warped = App._scan_warp_to_rect(bgr, pts)
+        if warped is None:
+            warped = bgr
+            # Step 2: no document detected → text-level deskew. This is
+            # what makes "photo of a page with paper filling the frame
+            # at a slight tilt" come out properly horizontal even though
+            # we couldn't find the paper edges.
+            try:
+                angle = App._scan_text_deskew_angle(warped)
+                if angle != 0.0:
+                    warped = App._scan_rotate(warped, angle)
+                    logger.info(f'Scan: text-deskewed by {angle:.1f}°')
+            except Exception as e:
+                logger.warning(f'Text deskew failed: {e}')
+        # Step 3: auto-orient (silent rotate 90/180/270 if needed). Done
+        # before enhance so the enhance pipeline always sees upright text.
+        try:
+            warped = App._scan_auto_orient(warped)
+        except Exception:
+            pass
+        # Step 4: enhance
+        enhanced = App._scan_enhance(warped, mode=mode)
+        # Step 5: auto-crop margins. Skipped for 'original' so the
+        # before/after compare in the preview stays geometry-identical.
+        if mode != 'original':
+            try:
+                enhanced = App._scan_auto_crop(enhanced)
+            except Exception:
+                pass
+        return _Im.fromarray(_cv.cvtColor(enhanced, _cv.COLOR_BGR2RGB))
+
+    def _screenshot_scan(self, img) -> None:
+        """Context-menu "📄 Scan document" handler. Runs the CamScanner-
+        style pipeline on a worker thread (corner detect, perspective
+        flatten, enhance) then opens the preview popup on the main
+        thread with mode toggle + save options. Original image is
+        kept around so mode switches in the preview don't re-detect
+        corners."""
+        def _go():
+            try:
+                cleaned = App._scan_pipeline(img, mode='magic')
+            except Exception as exc:
+                logger.warning(f'Scan pipeline failed: {exc}')
+                cleaned = img   # fall back to original
+            self.root.after(0, self._show_scan_preview, img, cleaned)
+        threading.Thread(target=_go, daemon=True,
+                         name='screenshot-scan').start()
+
+    # ── Win32 cleanup Job Object ────────────────────────────────────────
+    # Created lazily on first spawn. Owns every editor / whiteboard /
+    # audio editor subprocess; KILL_ON_JOB_CLOSE makes Windows reap them
+    # automatically when our process exits — gracefully or otherwise.
+    def _ensure_cleanup_job(self) -> int:
+        """Return a handle to the per-app cleanup Job Object, creating
+        it if needed. Returns 0 on non-Windows or on failure (caller
+        falls back to the existing _quit() PID-walker)."""
+        if sys.platform != 'win32':
+            return 0
+        if getattr(self, '_cleanup_job', None):
+            return self._cleanup_job
+        try:
+            import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.windll.kernel32
+
+            # JOB_OBJECT_BASIC_LIMIT_INFORMATION + EXTENDED variant
+            class IO_COUNTERS(ctypes.Structure):
+                _fields_ = [('ReadOperationCount', ctypes.c_ulonglong),
+                            ('WriteOperationCount', ctypes.c_ulonglong),
+                            ('OtherOperationCount', ctypes.c_ulonglong),
+                            ('ReadTransferCount', ctypes.c_ulonglong),
+                            ('WriteTransferCount', ctypes.c_ulonglong),
+                            ('OtherTransferCount', ctypes.c_ulonglong)]
+
+            class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+                _fields_ = [('PerProcessUserTimeLimit', wintypes.LARGE_INTEGER),
+                            ('PerJobUserTimeLimit',     wintypes.LARGE_INTEGER),
+                            ('LimitFlags',              wintypes.DWORD),
+                            ('MinimumWorkingSetSize',   ctypes.c_size_t),
+                            ('MaximumWorkingSetSize',   ctypes.c_size_t),
+                            ('ActiveProcessLimit',      wintypes.DWORD),
+                            ('Affinity',                ctypes.c_size_t),
+                            ('PriorityClass',           wintypes.DWORD),
+                            ('SchedulingClass',         wintypes.DWORD)]
+
+            class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+                _fields_ = [('BasicLimitInformation', JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                            ('IoInfo',                IO_COUNTERS),
+                            ('ProcessMemoryLimit',    ctypes.c_size_t),
+                            ('JobMemoryLimit',        ctypes.c_size_t),
+                            ('PeakProcessMemoryUsed', ctypes.c_size_t),
+                            ('PeakJobMemoryUsed',     ctypes.c_size_t)]
+
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+            JobObjectExtendedLimitInformation  = 9
+
+            hjob = k32.CreateJobObjectW(None, None)
+            if not hjob:
+                logger.warning('CreateJobObjectW failed')
+                return 0
+            info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            ok = k32.SetInformationJobObject(
+                hjob, JobObjectExtendedLimitInformation,
+                ctypes.byref(info), ctypes.sizeof(info))
+            if not ok:
+                logger.warning('SetInformationJobObject failed')
+                k32.CloseHandle(hjob)
+                return 0
+            self._cleanup_job = hjob
+            self._cleanup_job_k32 = k32   # keep a ref so it isn't GC'd
+            logger.info(f'Cleanup Job Object created (handle={hjob:#x}, '
+                        f'KILL_ON_JOB_CLOSE set)')
+            return hjob
+        except Exception as e:
+            logger.warning(f'cleanup job creation failed: {e}')
+            return 0
+
+    def _assign_to_cleanup_job(self, pid: int) -> bool:
+        """Add a freshly-spawned PID to the cleanup job. Caller MUST have
+        used CREATE_BREAKAWAY_FROM_JOB so the assign isn't refused."""
+        if sys.platform != 'win32':
+            return False
+        hjob = self._ensure_cleanup_job()
+        if not hjob:
+            return False
+        try:
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            PROCESS_SET_QUOTA   = 0x0100
+            PROCESS_TERMINATE   = 0x0001
+            hproc = k32.OpenProcess(
+                PROCESS_SET_QUOTA | PROCESS_TERMINATE, False, pid)
+            if not hproc:
+                logger.warning(f'OpenProcess({pid}) failed')
+                return False
+            ok = bool(k32.AssignProcessToJobObject(hjob, hproc))
+            k32.CloseHandle(hproc)
+            if ok:
+                logger.info(f'pid {pid} assigned to cleanup job')
+            else:
+                logger.warning(f'AssignProcessToJobObject({pid}) failed')
+            return ok
+        except Exception as e:
+            logger.warning(f'_assign_to_cleanup_job failed: {e}')
+            return False
+
+    # ── Image editor (miniPaint via pywebview, like whiteboard) ─────────
+
+    def _show_scan_preview(self, original, cleaned) -> None:
+        """Focused scan-preview popup. Single window, all controls
+        visible at once (no mode toggle).
+
+        Document tools — top bar + Edit corners:
+          • Magic Color / Grayscale / B&W / Original mode buttons
+            (re-runs upstream _scan_pipeline on switch)
+          • Rotate 90° L/R
+          • Manual 4-corner perspective editor
+          • Crop with 8-handle frame
+
+        Photo tools — right panel:
+          • Brightness / Contrast / Saturation / Sharpness / Warmth
+            sliders (-100..+100, non-destructive overlay)
+
+        Save options — bottom bar:
+          • Save PDF
+          • Copy image to clipboard
+          • Extract text (OCR result popup)
+          • Close
+
+        state['pil'] is the developed image (post-mode + post-rotation
+        + post-crop). Sliders apply on top non-destructively at render
+        and save time so reset is always a single zero-out.
+        """
+        try:
+            from PIL import ImageTk as _ImTk, Image as _Im, ImageEnhance as _IE
+            from theme import SURFACE, BORDER, TEXT_P, TEXT_S, ACCENT, FONT_FAMILY
+            from win_geometry import center_on_work_area
+            import tkinter as _tk
+
+            win = ctk.CTkToplevel(self.root)
+            win.title('Hotkeys — Scan & edit')
+            win.configure(fg_color=SURFACE)
+            _W, _H = 1280, 820
+            x, y, W, H = center_on_work_area(_W, _H)
+            win.geometry(f'{W}x{H}+{x}+{y}')
+            win.minsize(1000, 650)
+            win.attributes('-topmost', True)
+            try: win.after(2000, lambda: win.attributes('-topmost', False))
+            except Exception: pass
+
+            state = {
+                'mode': 'magic', 'pil': cleaned, 'original': original,
+                'extra_rotation': 0, 'manual_corners': None, 'zoom': 1.0,
+                'crop_active': False, '_crop_img_rect': None, '_crop_drag': None,
+                'adjustments': {'brightness': 0, 'contrast': 0,
+                                'saturation': 0, 'sharpness': 0, 'warmth': 0},
+                '_enhance_undo': None,   # last pre-auto-enhance state['pil']
+                # Display-size cache: a downsampled copy of state['pil']
+                # at the current canvas-fit ratio. Slider drags only need
+                # to apply adjustments to THIS, never redo the LANCZOS of
+                # the full image. Invalidated on mode / rotate / crop /
+                # auto-enhance / canvas resize.
+                '_disp_cache': None,        # PIL Image at fit-size
+                '_disp_cache_key': None,    # (id(pil), avail_w, avail_h)
+                # True while a heavy long-running op (rotate, enhance,
+                # mode switch) is running so the user sees feedback and
+                # we suppress duplicate clicks.
+                '_busy': False,
+                # ── Undo stack (Ctrl+Z) ──────────────────────────────
+                # Each entry is a snapshot dict: label + the mutable
+                # bits of state. Slider drags coalesce into one entry
+                # via _slider_session_dirty so a 5-second drag doesn't
+                # pollute the stack with 30 entries.
+                '_undo_stack': [],
+                '_slider_session_dirty': False,
+            }
+            _UNDO_MAX = 30
+            ACTIVE_BG, INACTIVE_BG = ACCENT, '#2a2a2a'
+            CROP_HANDLE_R = 8
+
+            # ── Tiny hover tooltip helper (no external dep) ──────────
+            def _tip(widget, text):
+                """Attach a hover tooltip to *widget*. Works on CTkButton,
+                CTkSlider, plain tk widgets — anything with bind()."""
+                state_ = {'tw': None, 'after': None}
+                def _show(_e=None):
+                    state_['after'] = None
+                    if state_['tw'] is not None:
+                        return
+                    try:
+                        x = widget.winfo_rootx() + widget.winfo_width() // 2
+                        y = widget.winfo_rooty() + widget.winfo_height() + 6
+                        tw = _tk.Toplevel(widget)
+                        tw.wm_overrideredirect(True)
+                        tw.attributes('-topmost', True)
+                        try: tw.attributes('-alpha', 0.96)
+                        except Exception: pass
+                        lbl = _tk.Label(tw, text=text,
+                            font=(FONT_FAMILY, 9),
+                            bg='#1a1a1a', fg='#f0f0f0',
+                            padx=8, pady=4, relief='solid', borderwidth=1)
+                        lbl.pack()
+                        tw.update_idletasks()
+                        w_ = tw.winfo_width()
+                        tw.wm_geometry(f'+{x - w_ // 2}+{y}')
+                        state_['tw'] = tw
+                    except Exception: pass
+                def _schedule(_e=None):
+                    _hide()
+                    try:
+                        state_['after'] = widget.after(450, _show)
+                    except Exception: pass
+                def _hide(_e=None):
+                    if state_['after']:
+                        try: widget.after_cancel(state_['after'])
+                        except Exception: pass
+                        state_['after'] = None
+                    if state_['tw']:
+                        try: state_['tw'].destroy()
+                        except Exception: pass
+                        state_['tw'] = None
+                widget.bind('<Enter>', _schedule, add='+')
+                widget.bind('<Leave>', _hide, add='+')
+                widget.bind('<ButtonPress>', _hide, add='+')
+
+            # ── Photo adjustments (sliders, non-destructive overlay) ──
+            def _apply_adjustments(pil):
+                adj = state['adjustments']
+                if not any(adj.values()):
+                    return pil
+                try:
+                    img = pil.convert('RGB')
+                    if adj['brightness']:
+                        img = _IE.Brightness(img).enhance(1.0 + adj['brightness']/100.0)
+                    if adj['contrast']:
+                        img = _IE.Contrast(img).enhance(1.0 + adj['contrast']/100.0)
+                    if adj['saturation']:
+                        img = _IE.Color(img).enhance(1.0 + adj['saturation']/100.0)
+                    if adj['sharpness']:
+                        img = _IE.Sharpness(img).enhance(1.0 + adj['sharpness']/50.0)
+                    if adj['warmth']:
+                        import numpy as _np
+                        arr = _np.array(img).astype(_np.float32)
+                        t = adj['warmth'] / 100.0
+                        arr[..., 0] = _np.clip(arr[..., 0] + t * 28, 0, 255)
+                        arr[..., 2] = _np.clip(arr[..., 2] - t * 28, 0, 255)
+                        img = _Im.fromarray(arr.astype(_np.uint8), 'RGB')
+                    return img
+                except Exception as e:
+                    logger.warning(f'apply_adjustments failed: {e}')
+                    return pil
+
+            def _final_pil():
+                return _apply_adjustments(state['pil'])
+
+            def _push_undo(label: str) -> None:
+                """Snapshot mutable state before a mutating action. The
+                slider-session flag is reset so the next slider tick is
+                treated as a new edit (and pushed); any subsequent
+                slider ticks within that session coalesce into the same
+                snapshot."""
+                state['_undo_stack'].append({
+                    'label': label,
+                    'pil': state['pil'],
+                    'mode': state['mode'],
+                    'extra_rotation': state['extra_rotation'],
+                    'manual_corners': state['manual_corners'],
+                    'adjustments': dict(state['adjustments']),
+                    '_enhance_undo': state.get('_enhance_undo'),
+                })
+                if len(state['_undo_stack']) > _UNDO_MAX:
+                    state['_undo_stack'].pop(0)
+                state['_slider_session_dirty'] = False
+
+            def _undo(_e=None):
+                if not state['_undo_stack']:
+                    _toast('Nothing to undo', 'warn')
+                    return 'break'
+                snap = state['_undo_stack'].pop()
+                state['pil']            = snap['pil']
+                state['mode']           = snap['mode']
+                state['extra_rotation'] = snap['extra_rotation']
+                state['manual_corners'] = snap['manual_corners']
+                state['adjustments']    = snap['adjustments']
+                state['_enhance_undo']  = snap['_enhance_undo']
+                state['_disp_cache_key'] = None
+                state['_slider_session_dirty'] = False
+                # Resync mode-button highlight + slider widgets
+                try: _highlight()
+                except Exception: pass
+                for k, (sl, vl) in sliders.items():
+                    v = state['adjustments'].get(k, 0)
+                    try: sl.set(v); vl.configure(text=str(v))
+                    except Exception: pass
+                _render(state['pil'])
+                _toast(f'Undid: {snap["label"]}')
+                return 'break'
+
+            # ── Brief toast (in-window) for save/copy feedback ────────
+            _toast_after_id = {'id': None}
+            def _toast(text, kind='ok'):
+                """Brief overlay near the top-center of the canvas.
+                kind='ok' (green) | 'warn' (amber) | 'err' (red)."""
+                try:
+                    color = {'ok': '#10b981', 'warn': '#f59e0b',
+                             'err':  '#ef4444'}.get(kind, '#10b981')
+                    if _toast_after_id['id']:
+                        try: win.after_cancel(_toast_after_id['id'])
+                        except Exception: pass
+                    canvas.delete('toast')
+                    cw = canvas.winfo_width()
+                    tx, ty = cw // 2, 22
+                    pad_x, pad_y = 14, 7
+                    # text dims (rough)
+                    canvas.create_rectangle(
+                        tx - len(text)*4 - pad_x, ty - pad_y,
+                        tx + len(text)*4 + pad_x, ty + pad_y,
+                        fill='#1e1e1e', outline=color, width=2,
+                        tags='toast')
+                    canvas.create_text(tx, ty, text=text, fill='#f0f0f0',
+                                       font=(FONT_FAMILY, 11, 'bold'),
+                                       tags='toast')
+                    _toast_after_id['id'] = win.after(
+                        1800, lambda: canvas.delete('toast'))
+                except Exception: pass
+
+            def _auto_enhance():
+                """One-click image improvement. CV pipeline runs on a
+                background thread; UI stays interactive while gray-world
+                WB + CLAHE + unsharp + sat lift + sigmoid contrast cook
+                a 4K image. Pushes an undo snapshot so Ctrl+Z restores
+                the pre-enhance state.
+
+                Parameters tuned for clearly visible "pop" even on
+                already-cleaned documents/screenshots:
+                  • CLAHE clipLimit 3.5   (was 2.0 — local contrast)
+                  • Unsharp weight 1.9    (was 1.5 — edge sharpening)
+                  • Saturation × 1.30     (was 1.12 — color punch)
+                  • Sigmoid S-curve       (NEW — global tonal pop)
+                These produce 8-15% per-pixel delta on UI screenshots
+                vs. ~2% with the old "photo-cast" tuning that did
+                nothing visible to already-balanced inputs."""
+                if state.get('_busy'):
+                    _toast('Working — please wait', 'warn'); return
+                _push_undo('Auto Enhance')
+                state['_busy'] = True
+                state['_enhance_undo'] = state['pil']
+                src = state['pil']
+                _toast('Enhancing…', 'ok')
+                def _work():
+                    import numpy as _np
+                    import cv2 as _cv
+                    pil = src.convert('RGB')
+                    bgr = _cv.cvtColor(_np.array(pil), _cv.COLOR_RGB2BGR)
+                    # 1. Gray-world white balance
+                    mb, mg, mr = (float(bgr[..., i].mean()) for i in range(3))
+                    ma = (mb + mg + mr) / 3.0
+                    if ma > 1e-3:
+                        bgr = bgr.astype(_np.float32)
+                        bgr[..., 0] *= ma / max(mb, 1e-3)
+                        bgr[..., 1] *= ma / max(mg, 1e-3)
+                        bgr[..., 2] *= ma / max(mr, 1e-3)
+                        bgr = _np.clip(bgr, 0, 255).astype(_np.uint8)
+                    # 2. CLAHE on luminance — clipLimit 3.5 for stronger
+                    #    local contrast than the photo-tuned 2.0 default.
+                    lab = _cv.cvtColor(bgr, _cv.COLOR_BGR2LAB)
+                    L, A, B = _cv.split(lab)
+                    L = _cv.createCLAHE(clipLimit=3.5,
+                                        tileGridSize=(8, 8)).apply(L)
+                    bgr = _cv.cvtColor(_cv.merge((L, A, B)),
+                                       _cv.COLOR_LAB2BGR)
+                    # 3. Stronger unsharp mask (text edges)
+                    blurred = _cv.GaussianBlur(bgr, (0, 0), sigmaX=1.3)
+                    bgr = _cv.addWeighted(bgr, 1.9, blurred, -0.9, 0)
+                    # 4. Saturation × 1.30 (was 1.12 — barely visible)
+                    hsv = _cv.cvtColor(bgr, _cv.COLOR_BGR2HSV).astype(_np.float32)
+                    hsv[..., 1] = _np.clip(hsv[..., 1] * 1.30, 0, 255)
+                    bgr = _cv.cvtColor(hsv.astype(_np.uint8),
+                                       _cv.COLOR_HSV2BGR)
+                    # 5. Sigmoid S-curve — gentle global contrast pop
+                    #    that lands on top of any input, so even
+                    #    already-balanced documents look snappier. The
+                    #    curve is anchored at (0,0) and (1,1) so blacks
+                    #    stay black and whites stay white; midtones
+                    #    spread outward.
+                    arr = bgr.astype(_np.float32) / 255.0
+                    k = 5.0  # steepness — 5 ≈ +25% midtone contrast
+                    sig = 1.0 / (1.0 + _np.exp(-k * (arr - 0.5)))
+                    lo  = 1.0 / (1.0 + _np.exp(k * 0.5))
+                    hi  = 1.0 / (1.0 + _np.exp(-k * 0.5))
+                    arr = (sig - lo) / (hi - lo)
+                    bgr = _np.clip(arr * 255.0, 0, 255).astype(_np.uint8)
+                    rgb = _cv.cvtColor(bgr, _cv.COLOR_BGR2RGB)
+                    new_pil = _Im.fromarray(rgb, 'RGB')
+                    def _done():
+                        state['pil'] = new_pil
+                        state['_disp_cache_key'] = None  # invalidate
+                        state['_busy'] = False
+                        _render(state['pil'])
+                        _toast('✨ Enhanced')
+                        logger.info('auto-enhance applied')
+                    self.root.after(0, _done)
+                def _runner():
+                    try: _work()
+                    except Exception as e:
+                        logger.warning(f'auto-enhance failed: {e}')
+                        def _err():
+                            state['_busy'] = False
+                            _toast('Enhance failed', 'err')
+                        self.root.after(0, _err)
+                threading.Thread(target=_runner, daemon=True,
+                                 name='scan-enhance').start()
+
+            # ── Top bar (mode + rotate + crop) ────────────────────────
+            top = ctk.CTkFrame(win, fg_color='transparent')
+            top.pack(fill='x', padx=14, pady=(12, 6))
+            ctk.CTkLabel(top, text='Mode:', font=(FONT_FAMILY, 12, 'bold'),
+                         text_color=TEXT_S, anchor='w').pack(side='left', padx=(0, 8))
+            mode_buttons = {}
+            def _highlight():
+                cur = state['mode']
+                for k, b in mode_buttons.items():
+                    try: b.configure(fg_color=ACTIVE_BG if k == cur else INACTIVE_BG)
+                    except Exception: pass
+
+            # ── Middle: canvas + adjustment panel ─────────────────────
+            middle = ctk.CTkFrame(win, fg_color='transparent')
+            middle.pack(fill='both', expand=True, padx=14, pady=(0, 8))
+            canvas = _tk.Canvas(middle, bg='#0e0e0e', highlightthickness=0)
+            canvas.pack(side='left', fill='both', expand=True)
+            adj_panel = ctk.CTkScrollableFrame(
+                middle, width=240, fg_color='#181818', corner_radius=8,
+                scrollbar_button_color='#444',
+                scrollbar_button_hover_color='#666')
+            adj_panel.pack(side='right', fill='y', padx=(8, 0))
+
+            def _render(pil):
+                canvas.update_idletasks()
+                avail_w = max(200, canvas.winfo_width())
+                avail_h = max(200, canvas.winfo_height())
+                pw, ph = pil.size
+                fit = min(avail_w / pw, avail_h / ph, 1.0)
+                ratio = fit * state.get('zoom', 1.0)
+                disp_w = max(1, int(pw * ratio))
+                disp_h = max(1, int(ph * ratio))
+                # Display-image cache. The LANCZOS resize of a 4K source
+                # is the single most expensive thing in a render call
+                # (~80 ms on 4K); we redo it only when state['pil']
+                # actually changed or the canvas geometry changed.
+                # Slider drags / zoom-by-1.15 hit this fast path.
+                key = (id(pil), disp_w, disp_h)
+                if state.get('_disp_cache_key') != key:
+                    state['_disp_cache'] = pil.resize(
+                        (disp_w, disp_h),
+                        resample=getattr(_Im, 'LANCZOS', 1))
+                    state['_disp_cache_key'] = key
+                disp = _apply_adjustments(state['_disp_cache'])
+                tk_img = _ImTk.PhotoImage(disp)
+                state['_img_ref'] = tk_img
+                canvas.delete('all')
+                cx = max(0, (avail_w - disp_w) // 2)
+                cy = max(0, (avail_h - disp_h) // 2)
+                canvas.create_image(cx, cy, anchor='nw', image=tk_img, tags='img')
+                canvas.config(scrollregion=(0, 0,
+                                            max(disp_w, avail_w),
+                                            max(disp_h, avail_h)))
+                if state['crop_active']:
+                    _draw_crop()
+
+            def _on_wheel(e):
+                z = state.get('zoom', 1.0)
+                z = min(8.0, z * 1.15) if e.delta > 0 else max(0.2, z * 0.85)
+                state['zoom'] = z
+                _render(state['pil'])
+            def _on_double_click(_e):
+                state['zoom'] = 1.0
+                _render(state['pil'])
+            def _on_pan_start(e):
+                canvas.scan_mark(e.x, e.y)
+            def _on_pan_move(e):
+                canvas.scan_dragto(e.x, e.y, gain=1)
+            canvas.bind('<MouseWheel>', _on_wheel)
+            canvas.bind('<Double-Button-1>', _on_double_click)
+            canvas.bind('<ButtonPress-1>', _on_pan_start)
+            canvas.bind('<B1-Motion>', _on_pan_move)
+
+            def _c2i(cx, cy):
+                canvas.update_idletasks()
+                avail_w = max(200, canvas.winfo_width())
+                avail_h = max(200, canvas.winfo_height())
+                pw, ph = state['pil'].size
+                fit = min(avail_w / pw, avail_h / ph, 1.0)
+                ratio = fit * state.get('zoom', 1.0)
+                disp_w = max(1, int(pw * ratio))
+                disp_h = max(1, int(ph * ratio))
+                cx0 = max(0, (avail_w - disp_w) // 2)
+                cy0 = max(0, (avail_h - disp_h) // 2)
+                vx = canvas.canvasx(cx); vy = canvas.canvasy(cy)
+                return max(0, min(pw, (vx - cx0) / ratio)), \
+                       max(0, min(ph, (vy - cy0) / ratio))
+            def _i2c(ix, iy):
+                canvas.update_idletasks()
+                avail_w = max(200, canvas.winfo_width())
+                avail_h = max(200, canvas.winfo_height())
+                pw, ph = state['pil'].size
+                fit = min(avail_w / pw, avail_h / ph, 1.0)
+                ratio = fit * state.get('zoom', 1.0)
+                disp_w = max(1, int(pw * ratio))
+                disp_h = max(1, int(ph * ratio))
+                cx0 = max(0, (avail_w - disp_w) // 2)
+                cy0 = max(0, (avail_h - disp_h) // 2)
+                return cx0 + ix * ratio, cy0 + iy * ratio
+
+            def _draw_crop():
+                canvas.delete('cropframe', 'crophandle')
+                if state.get('_crop_img_rect') is None:
+                    return
+                ix1, iy1, ix2, iy2 = state['_crop_img_rect']
+                x1, y1 = _i2c(ix1, iy1); x2, y2 = _i2c(ix2, iy2)
+                for x1d, y1d, x2d, y2d in [
+                    (0, 0, max(0, x1), canvas.winfo_height()),
+                    (min(x2, canvas.winfo_width()), 0,
+                     canvas.winfo_width(), canvas.winfo_height()),
+                    (x1, 0, x2, max(0, y1)),
+                    (x1, min(y2, canvas.winfo_height()),
+                     x2, canvas.winfo_height()),
+                ]:
+                    canvas.create_rectangle(x1d, y1d, x2d, y2d,
+                        fill='#000000', stipple='gray50', outline='',
+                        tags='cropframe')
+                canvas.create_rectangle(x1, y1, x2, y2,
+                    outline='#00ff88', width=2, tags='cropframe')
+                mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+                for hx, hy in [(x1, y1), (mx, y1), (x2, y1),
+                               (x2, my), (x2, y2),
+                               (mx, y2), (x1, y2), (x1, my)]:
+                    canvas.create_rectangle(
+                        hx - CROP_HANDLE_R, hy - CROP_HANDLE_R,
+                        hx + CROP_HANDLE_R, hy + CROP_HANDLE_R,
+                        fill='#00ff88', outline='white', width=1,
+                        tags='crophandle')
+
+            def _hit_crop(x, y):
+                if state.get('_crop_img_rect') is None: return None
+                ix1, iy1, ix2, iy2 = state['_crop_img_rect']
+                x1, y1 = _i2c(ix1, iy1); x2, y2 = _i2c(ix2, iy2)
+                mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+                r = CROP_HANDLE_R + 4
+                if abs(x-x1) <= r and abs(y-y1) <= r: return 'tl'
+                if abs(x-x2) <= r and abs(y-y1) <= r: return 'tr'
+                if abs(x-x1) <= r and abs(y-y2) <= r: return 'bl'
+                if abs(x-x2) <= r and abs(y-y2) <= r: return 'br'
+                if abs(x-mx) <= r and abs(y-y1) <= r: return 't'
+                if abs(x-mx) <= r and abs(y-y2) <= r: return 'b'
+                if abs(y-my) <= r and abs(x-x1) <= r: return 'l'
+                if abs(y-my) <= r and abs(x-x2) <= r: return 'r'
+                if x1 <= x <= x2 and y1 <= y <= y2: return 'inside'
+                return None
+
+            def _on_crop_press(e):
+                hit = _hit_crop(e.x, e.y)
+                if not hit: return
+                state['_crop_drag'] = {'kind': hit, 'px': e.x, 'py': e.y,
+                                       'r0': tuple(state['_crop_img_rect'])}
+            def _on_crop_drag(e):
+                d = state.get('_crop_drag')
+                if not d: return
+                ix, iy = _c2i(e.x, e.y)
+                kind = d['kind']
+                x1, y1, x2, y2 = d['r0']
+                pw, ph = state['pil'].size
+                if kind == 'inside':
+                    px, py = _c2i(d['px'], d['py'])
+                    dx, dy = ix - px, iy - py
+                    if x1 + dx < 0: dx = -x1
+                    if y1 + dy < 0: dy = -y1
+                    if x2 + dx > pw: dx = pw - x2
+                    if y2 + dy > ph: dy = ph - y2
+                    state['_crop_img_rect'] = (x1+dx, y1+dy, x2+dx, y2+dy)
+                else:
+                    nx1, ny1, nx2, ny2 = x1, y1, x2, y2
+                    if 'l' in kind: nx1 = max(0, min(ix, x2 - 10))
+                    if 'r' in kind: nx2 = min(pw, max(ix, x1 + 10))
+                    if 't' in kind: ny1 = max(0, min(iy, y2 - 10))
+                    if 'b' in kind: ny2 = min(ph, max(iy, y1 + 10))
+                    state['_crop_img_rect'] = (nx1, ny1, nx2, ny2)
+                _draw_crop()
+            def _on_crop_release(_e):
+                state['_crop_drag'] = None
+
+            def _enter_crop():
+                if state['crop_active']:
+                    _cancel_crop(); return
+                state['crop_active'] = True
+                pw, ph = state['pil'].size
+                # Start at the FULL image bounds — no inset. The user
+                # captured the region they wanted; the frame should
+                # match that capture exactly so nothing is hidden behind
+                # the dimmed-out area. Drag handles inward to refine.
+                state['_crop_img_rect'] = (0, 0, pw, ph)
+                _draw_crop()
+                canvas.bind('<ButtonPress-1>', _on_crop_press)
+                canvas.bind('<B1-Motion>', _on_crop_drag)
+                canvas.bind('<ButtonRelease-1>', _on_crop_release)
+                try: crop_btn.configure(text='✂ Crop (active)', fg_color=ACCENT)
+                except Exception: pass
+            def _cancel_crop():
+                state['crop_active'] = False
+                state['_crop_img_rect'] = None
+                state['_crop_drag'] = None
+                canvas.delete('cropframe', 'crophandle')
+                canvas.bind('<ButtonPress-1>', _on_pan_start)
+                canvas.bind('<B1-Motion>', _on_pan_move)
+                canvas.bind('<ButtonRelease-1>', lambda e: None)
+                try: crop_btn.configure(text='✂ Crop', fg_color='#2a2a2a')
+                except Exception: pass
+            def _apply_crop():
+                r = state.get('_crop_img_rect')
+                if r is None: _cancel_crop(); return
+                ix1, iy1, ix2, iy2 = r
+                lo_x, hi_x = sorted([ix1, ix2])
+                lo_y, hi_y = sorted([iy1, iy2])
+                if hi_x - lo_x < 10 or hi_y - lo_y < 10:
+                    _cancel_crop(); return
+                _push_undo('Crop')
+                cropped = state['pil'].crop((int(lo_x), int(lo_y),
+                                              int(hi_x), int(hi_y)))
+                state['pil'] = cropped
+                state['original'] = cropped
+                state['manual_corners'] = None
+                state['zoom'] = 1.0
+                state['_disp_cache_key'] = None  # invalidate cache
+                _cancel_crop()
+                _render(state['pil'])
+
+            # ── Mode + rotate ────────────────────────────────────────
+            def _apply_rot(pil):
+                deg = state.get('extra_rotation', 0) % 360
+                if deg == 0: return pil
+                return pil.rotate(deg, expand=True, fillcolor=(255, 255, 255))
+
+            def _switch_mode(new):
+                if state['mode'] == new: return
+                if state.get('_busy'):
+                    _toast('Working — please wait', 'warn'); return
+                _push_undo('Mode change')
+                state['_busy'] = True
+                state['mode'] = new
+                _highlight()
+                _toast('Re-rendering…', 'ok')
+                def _bg():
+                    try:
+                        if state.get('manual_corners') is not None:
+                            out = App._scan_pipeline_with_corners(
+                                state['original'], state['manual_corners'], mode=new)
+                        else:
+                            out = App._scan_pipeline(state['original'], mode=new)
+                        out = _apply_rot(out)
+                    except Exception:
+                        out = state['original']
+                    def _done():
+                        state['pil'] = out
+                        state['_disp_cache_key'] = None  # invalidate
+                        state['_busy'] = False
+                        _render(out)
+                    self.root.after(0, _done)
+                threading.Thread(target=_bg, daemon=True, name='scan-mode').start()
+
+            def _auto_orient_now():
+                """Manual Auto-orient trigger. Re-runs Tesseract OSD
+                (--psm 0) on the CURRENT state['pil'] and applies any
+                rotation it suggests with ≥2.0 confidence (3.5 for
+                180° flips — the common misfire). Useful when the auto-
+                pass at window open skipped due to 'too few characters'
+                (typical for UI screenshots) but the user has since
+                cropped to a more text-heavy region. Silent if Tesseract
+                returns no confident rotation."""
+                if state.get('_busy'):
+                    _toast('Working — please wait', 'warn'); return
+                state['_busy'] = True
+                src = state['pil']
+                _toast('Detecting orientation…', 'ok')
+                def _work():
+                    import cv2 as _cv
+                    import numpy as _np
+                    bgr_in = _cv.cvtColor(_np.array(src.convert('RGB')),
+                                          _cv.COLOR_RGB2BGR)
+                    bgr_out = App._scan_auto_orient(bgr_in)
+                    # Detect whether _scan_auto_orient actually rotated:
+                    # different shape (90°/270° swap) or different pixels.
+                    rotated = (bgr_out.shape != bgr_in.shape
+                               or not _np.array_equal(bgr_in, bgr_out))
+                    if not rotated:
+                        def _noop():
+                            state['_busy'] = False
+                            _toast('Already upright', 'warn')
+                        self.root.after(0, _noop)
+                        return
+                    # Genuine rotation — push undo NOW that we know
+                    # something will change.
+                    rgb = _cv.cvtColor(bgr_out, _cv.COLOR_BGR2RGB)
+                    new_pil = _Im.fromarray(rgb, 'RGB')
+                    def _done():
+                        _push_undo('Auto-orient')
+                        state['pil'] = new_pil
+                        state['_disp_cache_key'] = None
+                        state['_busy'] = False
+                        _render(state['pil'])
+                        _toast('Auto-oriented')
+                    self.root.after(0, _done)
+                threading.Thread(target=_work, daemon=True,
+                                 name='scan-orient').start()
+
+            def _rotate(deg):
+                """Rotate by *deg* (multiple of 90°). The full upstream
+                scan_pipeline is rerun because mode-specific enhancement
+                (Magic Color / Gray / B&W) is orientation-sensitive
+                (e.g. shadow removal uses vertical kernels). On a 4K
+                source that pipeline takes 1-3 s, so move to a worker
+                thread and show a toast."""
+                if state.get('_busy'):
+                    _toast('Working — please wait', 'warn'); return
+                _push_undo('Rotate')
+                state['_busy'] = True
+                state['extra_rotation'] = (state.get('extra_rotation', 0) + deg) % 360
+                _toast('Rotating…', 'ok')
+                def _work():
+                    try:
+                        if state.get('manual_corners') is not None:
+                            base = App._scan_pipeline_with_corners(
+                                state['original'], state['manual_corners'],
+                                mode=state['mode'])
+                        else:
+                            base = App._scan_pipeline(state['original'],
+                                                      mode=state['mode'])
+                        out = _apply_rot(base)
+                    except Exception as exc:
+                        logger.warning(f'rotate pipeline failed: {exc}')
+                        out = state['original']
+                    def _done():
+                        state['pil'] = out
+                        state['_disp_cache_key'] = None
+                        state['_busy'] = False
+                        _render(out)
+                    self.root.after(0, _done)
+                threading.Thread(target=_work, daemon=True,
+                                 name='scan-rotate').start()
+
+            _MODE_TIPS = {
+                'magic':    'Magic Color: contrast + brightness boost\n'
+                            'best for color documents & receipts',
+                'gray':     'Grayscale: monochrome, sharp text\n'
+                            'best for printed pages',
+                'bw':       'Black & White: high-contrast binarized\n'
+                            'best for clean text-only scans',
+                'original': 'Original: skip the scan-cleanup pipeline\n'
+                            'leave the captured pixels untouched',
+            }
+            def _mode_btn(label, key):
+                b = ctk.CTkButton(top, text=label, width=100, height=28,
+                    fg_color=ACTIVE_BG if key == state['mode'] else INACTIVE_BG,
+                    hover_color='#6d28d9', text_color='#fff',
+                    font=(FONT_FAMILY, 11, 'bold'), corner_radius=6,
+                    command=lambda k=key: _switch_mode(k))
+                mode_buttons[key] = b
+                _tip(b, _MODE_TIPS.get(key, label))
+                return b
+            _mode_btn('Magic Color', 'magic').pack(side='left', padx=4)
+            _mode_btn('Grayscale', 'gray').pack(side='left', padx=4)
+            _mode_btn('B&W', 'bw').pack(side='left', padx=4)
+            _mode_btn('Original', 'original').pack(side='left', padx=4)
+
+            ctk.CTkLabel(top, text='  |  ', text_color=TEXT_S,
+                         font=(FONT_FAMILY, 14)).pack(side='left', padx=4)
+            _rot_l = ctk.CTkButton(top, text='⤺ Rotate L', width=100, height=28,
+                fg_color='#2a2a2a', hover_color='#3a3a3a', text_color=TEXT_P,
+                font=(FONT_FAMILY, 11), corner_radius=6,
+                command=lambda: _rotate(90))
+            _rot_l.pack(side='left', padx=4)
+            _tip(_rot_l, 'Rotate 90° counter-clockwise')
+            _rot_r = ctk.CTkButton(top, text='Rotate R ⤻', width=100, height=28,
+                fg_color='#2a2a2a', hover_color='#3a3a3a', text_color=TEXT_P,
+                font=(FONT_FAMILY, 11), corner_radius=6,
+                command=lambda: _rotate(-90))
+            _rot_r.pack(side='left', padx=4)
+            _tip(_rot_r, 'Rotate 90° clockwise')
+
+            _auto_orient_btn = ctk.CTkButton(top, text='↻ Auto', width=80, height=28,
+                fg_color='#2a2a2a', hover_color='#3a3a3a', text_color=TEXT_P,
+                font=(FONT_FAMILY, 11), corner_radius=6,
+                command=_auto_orient_now)
+            _auto_orient_btn.pack(side='left', padx=4)
+            _tip(_auto_orient_btn,
+                'Auto-detect orientation via Tesseract OCR\n'
+                'and rotate so text reads top-to-bottom.\n'
+                'Needs enough text in view to be confident.')
+
+            ctk.CTkLabel(top, text='  |  ', text_color=TEXT_S,
+                         font=(FONT_FAMILY, 14)).pack(side='left', padx=4)
+            crop_btn = ctk.CTkButton(top, text='✂ Crop', width=90, height=28,
+                fg_color='#2a2a2a', hover_color='#3a3a3a', text_color=TEXT_P,
+                font=(FONT_FAMILY, 11), corner_radius=6,
+                command=_enter_crop)
+            crop_btn.pack(side='left', padx=4)
+            _tip(crop_btn, 'Show / hide the crop frame')
+            _confirm_btn = ctk.CTkButton(top, text='✓ Confirm', width=90, height=28,
+                fg_color=ACCENT, hover_color='#6d28d9', text_color='#fff',
+                font=(FONT_FAMILY, 11, 'bold'), corner_radius=6,
+                command=_apply_crop)
+            _confirm_btn.pack(side='left', padx=2)
+            _tip(_confirm_btn, 'Apply the crop (Enter)')
+            _skip_btn = ctk.CTkButton(top, text='✕ Skip', width=70, height=28,
+                fg_color='#2a2a2a', hover_color='#3a3a3a', text_color=TEXT_P,
+                font=(FONT_FAMILY, 11), corner_radius=6,
+                command=_cancel_crop)
+            _skip_btn.pack(side='left', padx=2)
+            _tip(_skip_btn, 'Cancel cropping, keep full image (Esc)')
+
+            # Auto Enhance, packed to the right so it stands alone as a
+            # discoverable one-click action.
+            _enh_btn = ctk.CTkButton(top, text='✨ Auto Enhance', width=140, height=28,
+                fg_color='#10b981', hover_color='#059669', text_color='#fff',
+                font=(FONT_FAMILY, 11, 'bold'), corner_radius=6,
+                command=_auto_enhance)
+            _enh_btn.pack(side='right', padx=4)
+            _tip(_enh_btn,
+                'One-click image polish:\n'
+                '• White balance  • Local contrast\n'
+                '• Sharpen        • Saturation boost\n'
+                'Ctrl+Z undoes it. Reset all also reverts.')
+
+            # ── Right adjustments panel ──────────────────────────────
+            sliders = {}
+            def _schedule_render():
+                if not hasattr(_schedule_render, 'after_id'):
+                    _schedule_render.after_id = None
+                if _schedule_render.after_id:
+                    try: win.after_cancel(_schedule_render.after_id)
+                    except Exception: pass
+                _schedule_render.after_id = win.after(
+                    25, lambda: _render(state['pil']))
+            def _reset_all():
+                # Stack-push BEFORE mutating so Ctrl+Z can restore the
+                # pre-reset state.
+                _push_undo('Reset all')
+                # Restore pre-enhance pixels if user enhanced earlier.
+                if state.get('_enhance_undo') is not None:
+                    state['pil'] = state['_enhance_undo']
+                    state['_enhance_undo'] = None
+                    state['_disp_cache_key'] = None  # invalidate cache
+                for k in list(state['adjustments'].keys()):
+                    state['adjustments'][k] = 0
+                for sl, vl in sliders.values():
+                    try: sl.set(0); vl.configure(text='0')
+                    except Exception: pass
+                _render(state['pil'])
+                _toast('Reset')
+            def _make_slider(key, label):
+                wrap = ctk.CTkFrame(adj_panel, fg_color='transparent')
+                wrap.pack(fill='x', padx=8, pady=(2, 2))
+                row = ctk.CTkFrame(wrap, fg_color='transparent')
+                row.pack(fill='x')
+                lbl = ctk.CTkLabel(row, text=label, font=(FONT_FAMILY, 10),
+                                   text_color=TEXT_S, anchor='w', width=80)
+                lbl.pack(side='left')
+                vl = ctk.CTkLabel(row, text='0', font=(FONT_FAMILY, 10),
+                                  text_color=TEXT_P, anchor='e', width=34)
+                vl.pack(side='right')
+                def _on(v):
+                    # Coalesce slider drags into one undo entry per
+                    # "session": the first change after any non-slider
+                    # action pushes a snapshot, subsequent ticks (this
+                    # slider or any other slider, until the next mode /
+                    # rotate / crop / enhance / reset action) don't.
+                    if not state.get('_slider_session_dirty'):
+                        _push_undo('Adjustment')
+                        state['_slider_session_dirty'] = True
+                    iv = int(round(float(v)))
+                    vl.configure(text=str(iv))
+                    state['adjustments'][key] = iv
+                    _schedule_render()
+                def _reset_one(_e=None):
+                    sl.set(0); vl.configure(text='0')
+                    state['adjustments'][key] = 0
+                    _render(state['pil'])
+                sl = ctk.CTkSlider(wrap, from_=-100, to=100, number_of_steps=200,
+                    command=_on, height=14, button_color=ACCENT,
+                    button_hover_color='#6d28d9', progress_color=ACCENT)
+                sl.set(0); sl.pack(fill='x', pady=(0, 4))
+                lbl.bind('<Double-Button-1>', _reset_one)
+                vl.bind('<Double-Button-1>', _reset_one)
+                sliders[key] = (sl, vl)
+
+            hdr = ctk.CTkFrame(adj_panel, fg_color='transparent')
+            hdr.pack(fill='x', padx=6, pady=(2, 6))
+            ctk.CTkLabel(hdr, text='Adjustments', font=(FONT_FAMILY, 14, 'bold'),
+                         text_color=TEXT_P, anchor='w').pack(side='left')
+            ctk.CTkButton(hdr, text='Reset all', width=68, height=22,
+                fg_color='#2a2a2a', hover_color='#3a3a3a', text_color=TEXT_S,
+                font=(FONT_FAMILY, 10), corner_radius=4,
+                command=_reset_all).pack(side='right')
+            for k, lbl in [('brightness', 'Brightness'),
+                           ('contrast',   'Contrast'),
+                           ('saturation', 'Saturation'),
+                           ('sharpness',  'Sharpness'),
+                           ('warmth',     'Warmth')]:
+                _make_slider(k, lbl)
+            ctk.CTkLabel(adj_panel,
+                text='Double-click a label to reset that slider.',
+                font=(FONT_FAMILY, 9, 'italic'), text_color=TEXT_S,
+                anchor='w', justify='left', wraplength=200).pack(
+                    fill='x', padx=8, pady=(14, 6))
+
+            # ── Bottom bar ────────────────────────────────────────────
+            btns = ctk.CTkFrame(win, fg_color='transparent')
+            btns.pack(fill='x', padx=14, pady=(0, 14))
+
+            from tkinter import filedialog as _fd
+
+            def _ts_name(ext: str) -> str:
+                """scan-2026-06-11-1334.<ext> — friendlier than scan.<ext>."""
+                from datetime import datetime as _dt
+                return f'scan-{_dt.now().strftime("%Y-%m-%d-%H%M")}.{ext}'
+
+            def _initial_dir() -> str:
+                """Return the directory the save dialog should open in.
+                Sticky across saves in this window: first save uses
+                Pictures/Hotkeys (creating it lazily)."""
+                d = state.get('_last_save_dir')
+                if d and os.path.isdir(d):
+                    return d
+                pics = os.path.join(os.environ.get('USERPROFILE', ''),
+                                    'Pictures', 'Hotkeys')
+                try: os.makedirs(pics, exist_ok=True)
+                except Exception: pass
+                if os.path.isdir(pics):
+                    state['_last_save_dir'] = pics
+                    return pics
+                return os.path.expanduser('~')
+
+            def _async(work, label='Working'):
+                """Run *work()* in a background thread and toast the
+                outcome. Saving / encoding a 4K image takes 1-10 seconds
+                of CPU; doing it on the Tk main thread freezes the window
+                (slider sluggish, toast doesn't paint). The worker calls
+                _toast via root.after so widget mutations stay on the
+                UI thread."""
+                def _runner():
+                    try:
+                        msg = work() or 'Done'
+                        self.root.after(0, _toast, msg)
+                    except Exception as e:
+                        logger.warning(f'{label} failed: {e}')
+                        self.root.after(0, _toast,
+                                        f'{label} failed', 'err')
+                threading.Thread(target=_runner, daemon=True,
+                                 name=f'scan-{label.lower()}').start()
+
+            def _save_pdf():
+                # Native shell dialog — fast for PDF because the .pdf
+                # filter doesn't trigger Windows' image-thumbnail
+                # IShellItemImageFactory init (which was the slowdown on
+                # the now-removed PNG path). Re-using the native dialog
+                # here gets us the full Windows save UX (recent-folders
+                # sidebar, breadcrumbs, OneDrive, network shares) without
+                # paying the image-handler cost.
+                p = _fd.asksaveasfilename(parent=win, defaultextension='.pdf',
+                    initialfile=_ts_name('pdf'),
+                    initialdir=_initial_dir(),
+                    filetypes=[('PDF document', '*.pdf'), ('All files', '*.*')],
+                    title='Save PDF')
+                if not p: return
+                state['_last_save_dir'] = os.path.dirname(p)
+                img = _final_pil()
+                _toast('Saving…', 'ok')
+                def _work():
+                    img.convert('RGB').save(p, 'PDF', resolution=300.0)
+                    logger.info(f'Saved PDF → {p}')
+                    return f'Saved {os.path.basename(p)}'
+                _async(_work, 'Save')
+
+            def _copy_img():
+                """Put the final image on the clipboard as CF_DIB,
+                encoded on a worker thread so the UI doesn't freeze
+                on big screenshots. Uses pywin32's win32clipboard
+                because the raw ctypes route silently truncated 64-bit
+                HGLOBAL handles to 32 bits."""
+                img = _final_pil()
+                _toast('Copying…', 'ok')
+                def _work():
+                    import io as _io
+                    out = _io.BytesIO()
+                    img.convert('RGB').save(out, 'BMP')
+                    # Strip the 14-byte BMP file header — CF_DIB is the
+                    # BITMAPINFOHEADER + pixel bytes, not the .bmp file.
+                    data = out.getvalue()[14:]
+                    import win32clipboard, win32con
+                    # OpenClipboard can race with antivirus / OS Snipping
+                    # Tool; retry a few times before giving up.
+                    opened = False
+                    for _ in range(5):
+                        try:
+                            win32clipboard.OpenClipboard()
+                            opened = True
+                            break
+                        except Exception:
+                            import time as _t
+                            _t.sleep(0.05)
+                    if not opened:
+                        raise RuntimeError('clipboard busy (antivirus shield?)')
+                    try:
+                        win32clipboard.EmptyClipboard()
+                        win32clipboard.SetClipboardData(win32con.CF_DIB, data)
+                    finally:
+                        win32clipboard.CloseClipboard()
+                    return 'Copied to clipboard'
+                _async(_work, 'Copy')
+
+            def _extract():
+                threading.Thread(target=self._screenshot_ocr_worker,
+                    args=(_final_pil(), False),
+                    kwargs={'engine': 'llm', 'ocr': 'tesseract-ara'},
+                    daemon=True, name='scan-extract').start()
+                _toast('Extracting text…')
+
+            def _open_corner_editor():
+                self._open_scan_corner_editor(state, _render)
+
+            _edit_corners_btn = ctk.CTkButton(btns, text='✎ Edit corners',
+                width=130, height=32,
+                fg_color='#2a2a2a', hover_color='#3a3a3a', text_color=TEXT_P,
+                font=(FONT_FAMILY, 11), corner_radius=8,
+                command=_open_corner_editor)
+            _edit_corners_btn.pack(side='left', padx=4)
+            _tip(_edit_corners_btn,
+                'Manual perspective fix:\n'
+                'drag 4 corners over the document\'s\nactual edges, then Apply.')
+
+            _save_pdf_btn = ctk.CTkButton(btns, text='Save PDF',
+                width=100, height=32,
+                fg_color=ACCENT, hover_color='#6d28d9', text_color='#fff',
+                font=(FONT_FAMILY, 12, 'bold'), corner_radius=8,
+                command=lambda: _save_pdf())
+            _save_pdf_btn.pack(side='left', padx=4)
+            _tip(_save_pdf_btn, 'Save PDF  (Ctrl+S)')
+
+            _copy_btn = ctk.CTkButton(btns, text='Copy', width=70, height=32,
+                fg_color='#2a2a2a', hover_color='#3a3a3a', text_color=TEXT_P,
+                font=(FONT_FAMILY, 11), corner_radius=8,
+                command=_copy_img)
+            _copy_btn.pack(side='left', padx=4)
+            _tip(_copy_btn, 'Copy image to clipboard  (Ctrl+C)')
+
+            _extract_btn = ctk.CTkButton(btns, text='Extract', width=80, height=32,
+                fg_color='#2a2a2a', hover_color='#3a3a3a', text_color=TEXT_P,
+                font=(FONT_FAMILY, 11), corner_radius=8,
+                command=_extract)
+            _extract_btn.pack(side='left', padx=4)
+            _tip(_extract_btn,
+                'OCR-extract the text\n'
+                'opens result in a popup  (Ctrl+E)')
+
+            _close_btn = ctk.CTkButton(btns, text='Close', width=70, height=32,
+                fg_color='#2a2a2a', hover_color='#3a3a3a', text_color=TEXT_P,
+                font=(FONT_FAMILY, 11), corner_radius=8,
+                command=win.destroy)
+            _close_btn.pack(side='right', padx=4)
+            _tip(_close_btn, 'Close window  (Esc)')
+
+            # ── Right-click context menu on the canvas ────────────────
+            # Mirrors the most-used actions so users can drive everything
+            # by right-clicking the image. Built each call so the action
+            # bindings stay current with closure state (e.g. mode).
+            def _ctx_menu(event):
+                m = _tk.Menu(win, tearoff=0,
+                    bg='#1a1a1a', fg='#f0f0f0',
+                    activebackground=ACCENT, activeforeground='#fff',
+                    bd=0, font=(FONT_FAMILY, 10))
+                m.add_command(label='↶  Undo (Ctrl+Z)',  command=_undo)
+                m.add_command(label='✨  Auto Enhance',   command=_auto_enhance)
+                m.add_command(label='↻  Reset all',      command=_reset_all)
+                m.add_separator()
+                m.add_command(label='Magic Color', command=lambda: _switch_mode('magic'))
+                m.add_command(label='Grayscale',   command=lambda: _switch_mode('gray'))
+                m.add_command(label='B&W',         command=lambda: _switch_mode('bw'))
+                m.add_command(label='Original',    command=lambda: _switch_mode('original'))
+                m.add_separator()
+                m.add_command(label='⤺  Rotate left',  command=lambda: _rotate(90))
+                m.add_command(label='Rotate right  ⤻', command=lambda: _rotate(-90))
+                m.add_command(label='↻  Auto-orient',  command=_auto_orient_now)
+                m.add_command(label='✂  Toggle crop',  command=_enter_crop)
+                m.add_command(label='✎  Edit corners…', command=_open_corner_editor)
+                m.add_separator()
+                m.add_command(label='Save PDF…       Ctrl+S',         command=lambda: _save_pdf())
+                m.add_command(label='Copy to clipboard  Ctrl+C',      command=_copy_img)
+                m.add_command(label='Extract text  Ctrl+E',           command=_extract)
+                m.add_separator()
+                m.add_command(label='Close   Esc', command=win.destroy)
+                try:
+                    m.tk_popup(event.x_root, event.y_root)
+                finally:
+                    m.grab_release()
+                return 'break'
+            canvas.bind('<Button-3>', _ctx_menu)
+
+            # ── Status footer (image dims + zoom%) ────────────────────
+            status = ctk.CTkFrame(win, fg_color='transparent', height=18)
+            status.pack(fill='x', side='bottom', padx=14, pady=(0, 4))
+            status_lbl = ctk.CTkLabel(status, text='',
+                font=(FONT_FAMILY, 10), text_color=TEXT_S, anchor='w')
+            status_lbl.pack(side='left')
+            help_lbl = ctk.CTkLabel(status,
+                text='Esc close  •  Ctrl+Z undo  •  Ctrl+S save PDF  •  Ctrl+C copy  •  Ctrl+E extract',
+                font=(FONT_FAMILY, 10), text_color=TEXT_S, anchor='e')
+            help_lbl.pack(side='right')
+
+            # Hook status updates onto the existing _render via wrap.
+            _prev_render = _render
+            def _render(pil):
+                _prev_render(pil)
+                try:
+                    w_, h_ = pil.size
+                    z = int(round(state.get('zoom', 1.0) * 100))
+                    mode_label = {'magic': 'Magic Color', 'gray': 'Grayscale',
+                                  'bw': 'B&W', 'original': 'Original'}.get(
+                                      state['mode'], state['mode'])
+                    enhanced = ' • Enhanced' if state.get('_enhance_undo') else ''
+                    rot = state.get('extra_rotation', 0)
+                    rot_str = f' • Rotated {rot}°' if rot else ''
+                    status_lbl.configure(
+                        text=f'{w_}×{h_} px  •  Zoom {z}%  •  {mode_label}{rot_str}{enhanced}')
+                except Exception: pass
+
+            # ── Keyboard shortcuts ────────────────────────────────────
+            def _on_esc(_e=None):
+                if state.get('crop_active'):
+                    _cancel_crop()
+                else:
+                    win.destroy()
+                return 'break'
+            def _on_enter(_e=None):
+                # Enter / Return = the tickmark: confirm the crop if a
+                # frame is active, otherwise no-op so the user doesn't
+                # accidentally trigger something on a regular press.
+                if state.get('crop_active'):
+                    _apply_crop()
+                return 'break'
+            win.bind('<Escape>', _on_esc)
+            win.bind('<Return>', _on_enter)
+            win.bind('<KP_Enter>', _on_enter)
+            win.bind('<Control-s>', lambda _e: (_save_pdf(), 'break'))
+            win.bind('<Control-S>', lambda _e: (_save_pdf(), 'break'))
+            win.bind('<Control-c>', lambda _e: (_copy_img(), 'break'))
+            win.bind('<Control-e>', lambda _e: (_extract(), 'break'))
+            win.bind('<Control-z>', _undo)
+            win.bind('<Control-Z>', _undo)
+
+            canvas.bind('<Configure>', lambda _e: _render(state['pil']))
+            def _initial():
+                _render(cleaned)
+                # Open already in crop mode so the user lands on the
+                # 8-handle frame and confirms / adjusts straight away.
+                # The 8 edge handles + 4 corners are visible on the image
+                # bounds (inset 2%). User drags any handle to refine,
+                # then clicks "✓ Confirm" to apply the crop or "✕ Skip"
+                # to keep the full image. Delay ~120 ms so the canvas
+                # has been mapped and winfo_width/height return real
+                # values before we calculate the frame position.
+                win.after(120, _enter_crop)
+            win.after(50, _initial)
+            # Pull focus so keyboard shortcuts route to this window.
+            try: win.focus_force()
+            except Exception: pass
+        except Exception:
+            logger.exception('Scan preview failed')
+
+    def _open_scan_corner_editor(self, state, _render_preview):
+        """Manual 4-corner perspective editor. Opens a sub-window
+        showing the ORIGINAL captured image at fit-to-window scale,
+        with 4 draggable handles at the auto-detected corner
+        positions (falls back to image corners if no document edge
+        was found). On Apply, re-runs _scan_pipeline_with_corners
+        using the user's chosen corners + current mode."""
+        try:
+            from PIL import ImageTk as _ImTk, Image as _Im
+            from theme import SURFACE, TEXT_P, ACCENT, FONT_FAMILY
+            from win_geometry import center_on_work_area
+            import tkinter as _tk
+            import cv2 as _cv
+            import numpy as _np
+
+            original = state['original']
+            w, h = original.size
+            ed = ctk.CTkToplevel(self.root)
+            ed.title('Edit corners')
+            ed.configure(fg_color=SURFACE)
+            _W, _H = 1000, 750
+            x, y, W, H = center_on_work_area(_W, _H)
+            ed.geometry(f'{W}x{H}+{x}+{y}')
+            ed.attributes('-topmost', True)
+            try: ed.after(2000, lambda: ed.attributes('-topmost', False))
+            except Exception: pass
+
+            cv = _tk.Canvas(ed, bg='#0e0e0e', highlightthickness=0)
+            cv.pack(fill='both', expand=True, padx=14, pady=(12, 8))
+
+            cur = state.get('manual_corners')
+            if cur is None:
+                try:
+                    bgr = _cv.cvtColor(_np.array(original.convert('RGB')),
+                                       _cv.COLOR_RGB2BGR)
+                    detected = App._scan_detect_page(bgr)
+                    if detected is not None:
+                        cur = detected.tolist()
+                except Exception: pass
+            if cur is None:
+                cur = [[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]]
+            corners = [list(c) for c in cur]
+
+            HANDLE_R = 10
+            drag_idx = [None]
+            img_ref = [None]
+
+            def _draw():
+                cv.update_idletasks()
+                avail_w = max(200, cv.winfo_width())
+                avail_h = max(200, cv.winfo_height())
+                fit = min(avail_w / w, avail_h / h, 1.0)
+                disp_w = max(1, int(w * fit))
+                disp_h = max(1, int(h * fit))
+                cx0 = (avail_w - disp_w) // 2
+                cy0 = (avail_h - disp_h) // 2
+                disp = original.resize((disp_w, disp_h),
+                                       resample=getattr(_Im, 'LANCZOS', 1))
+                tk_img = _ImTk.PhotoImage(disp)
+                img_ref[0] = tk_img
+                cv.delete('all')
+                cv.create_image(cx0, cy0, anchor='nw', image=tk_img)
+                pts = []
+                for ix, iy in corners:
+                    px = cx0 + ix * fit
+                    py = cy0 + iy * fit
+                    pts.extend([px, py])
+                cv.create_polygon(*pts, outline='#00ff88', fill='', width=2)
+                for i, (ix, iy) in enumerate(corners):
+                    px = cx0 + ix * fit
+                    py = cy0 + iy * fit
+                    cv.create_oval(px - HANDLE_R, py - HANDLE_R,
+                                   px + HANDLE_R, py + HANDLE_R,
+                                   fill='#00ff88', outline='white', width=2)
+
+            def _hit(x, y):
+                avail_w = max(200, cv.winfo_width())
+                avail_h = max(200, cv.winfo_height())
+                fit = min(avail_w / w, avail_h / h, 1.0)
+                disp_w = max(1, int(w * fit)); disp_h = max(1, int(h * fit))
+                cx0 = (avail_w - disp_w) // 2; cy0 = (avail_h - disp_h) // 2
+                for i, (ix, iy) in enumerate(corners):
+                    px = cx0 + ix * fit; py = cy0 + iy * fit
+                    if (x - px)**2 + (y - py)**2 <= (HANDLE_R + 4)**2:
+                        return i
+                return None
+
+            def _on_press(e): drag_idx[0] = _hit(e.x, e.y)
+            def _on_drag(e):
+                i = drag_idx[0]
+                if i is None: return
+                avail_w = max(200, cv.winfo_width())
+                avail_h = max(200, cv.winfo_height())
+                fit = min(avail_w / w, avail_h / h, 1.0)
+                disp_w = max(1, int(w * fit)); disp_h = max(1, int(h * fit))
+                cx0 = (avail_w - disp_w) // 2; cy0 = (avail_h - disp_h) // 2
+                ix = max(0, min(w - 1, (e.x - cx0) / fit))
+                iy = max(0, min(h - 1, (e.y - cy0) / fit))
+                corners[i] = [ix, iy]
+                _draw()
+            def _on_release(_e): drag_idx[0] = None
+            cv.bind('<ButtonPress-1>', _on_press)
+            cv.bind('<B1-Motion>', _on_drag)
+            cv.bind('<ButtonRelease-1>', _on_release)
+            cv.bind('<Configure>', lambda _e: _draw())
+
+            bar = ctk.CTkFrame(ed, fg_color='transparent')
+            bar.pack(fill='x', padx=14, pady=(0, 14))
+
+            def _apply():
+                # Push the current full state onto the SCAN-PREVIEW
+                # window's undo stack — this corner-editor sub-window
+                # is closed by _done, but the user might want to undo
+                # the corner change from the main window. The stack
+                # lives on `state` which is shared by closure.
+                try:
+                    state['_undo_stack'].append({
+                        'label': 'Edit corners',
+                        'pil': state['pil'],
+                        'mode': state['mode'],
+                        'extra_rotation': state['extra_rotation'],
+                        'manual_corners': state['manual_corners'],
+                        'adjustments': dict(state['adjustments']),
+                        '_enhance_undo': state.get('_enhance_undo'),
+                    })
+                    state['_slider_session_dirty'] = False
+                except Exception: pass
+                state['manual_corners'] = corners
+                state['extra_rotation'] = 0
+                def _bg():
+                    try:
+                        out = App._scan_pipeline_with_corners(
+                            state['original'], corners, mode=state['mode'])
+                    except Exception:
+                        out = state['original']
+                    def _done():
+                        state['pil'] = out
+                        # Tell the scan-preview render cache to drop
+                        # its stale resize; we just swapped state['pil'].
+                        state['_disp_cache_key'] = None
+                        _render_preview(out)
+                        ed.destroy()
+                    self.root.after(0, _done)
+                threading.Thread(target=_bg, daemon=True, name='scan-corners').start()
+
+            ctk.CTkButton(bar, text='Apply', width=120, height=32,
+                fg_color=ACCENT, hover_color='#6d28d9', text_color='#fff',
+                font=(FONT_FAMILY, 12, 'bold'), corner_radius=8,
+                command=_apply).pack(side='left', padx=4)
+            ctk.CTkButton(bar, text='Cancel', width=80, height=32,
+                fg_color='#2a2a2a', hover_color='#3a3a3a', text_color=TEXT_P,
+                font=(FONT_FAMILY, 11), corner_radius=8,
+                command=ed.destroy).pack(side='right', padx=4)
+            ed.after(50, _draw)
+        except Exception:
+            logger.exception('Corner editor failed')
+
+    @staticmethod
+    def _preprocess_for_ocr(img, variant: str = 'highcontrast'):
+        """OCR preprocessing pipeline. Brings printed-page photos
+        (blurred, off-angle, low-contrast) to a state Tesseract can
+        read as well as a clean digital screenshot.
+
+        Produces TWO different variants so the caller can run both
+        through Tesseract and pick the higher-confidence result. Photos
+        respond very differently to thresholding vs. soft-preserving
+        pipelines — sometimes Otsu binarisation crushes thin strokes
+        and the "soft" pass wins; other times the soft pass leaves
+        too much noise and the binarised pass wins.
+
+        Variants:
+          - 'highcontrast' — 3x upscale + non-local-means denoise +
+            deskew + Otsu binarisation + unsharp mask. Best for
+            clean prints with stable ink density.
+          - 'soft' — 3x upscale + bilateral filter (edge-preserving
+            denoise) + deskew + light CLAHE contrast enhancement +
+            mild sharpen, NO binarisation. Best for faded text /
+            low-contrast / coloured backgrounds.
+
+        Pure offline, opencv-python-headless only. ~200-500ms per
+        variant for a typical captured selection."""
+        import numpy as _np
+        import cv2 as _cv
+        from PIL import Image as _Im
+        arr = _np.array(img.convert('RGB'))
+        bgr = _cv.cvtColor(arr, _cv.COLOR_RGB2BGR)
+        gray = _cv.cvtColor(bgr, _cv.COLOR_BGR2GRAY)
+        # 3x upscale: Tesseract works best with ≥300 DPI; phone photos
+        # often clock in at 100-150, so 3x lands us in the sweet spot.
+        # INTER_CUBIC preserves edges better than LANCZOS for text.
+        h, w = gray.shape
+        gray = _cv.resize(gray, (w * 3, h * 3),
+                          interpolation=_cv.INTER_CUBIC)
+        # Deskew (shared by both variants) — text-line direction
+        # auto-detected via minAreaRect on dark pixels.
+        try:
+            inv = _cv.bitwise_not(gray)
+            coords = _np.column_stack(_np.where(inv > 0))
+            if len(coords) > 100:
+                angle = _cv.minAreaRect(coords)[-1]
+                if angle < -45:
+                    angle = -(90 + angle)
+                else:
+                    angle = -angle
+                if abs(angle) > 0.5:
+                    (h2, w2) = gray.shape
+                    M = _cv.getRotationMatrix2D((w2 // 2, h2 // 2), angle, 1.0)
+                    gray = _cv.warpAffine(
+                        gray, M, (w2, h2),
+                        flags=_cv.INTER_CUBIC,
+                        borderMode=_cv.BORDER_REPLICATE)
+        except Exception:
+            pass
+        if variant == 'soft':
+            # SOFT variant — preserves grayscale, no binarisation.
+            # Bilateral filter is edge-preserving so it kills paper
+            # grain without smearing thin Arabic strokes (huge win on
+            # ligatures vs non-local-means at higher strengths).
+            soft = _cv.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
+            # CLAHE = adaptive histogram equalisation. Pulls out faded
+            # ink without blowing highlights on glossy paper.
+            clahe = _cv.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            soft = clahe.apply(soft)
+            # Light unsharp mask
+            blur = _cv.GaussianBlur(soft, (0, 0), sigmaX=1.2)
+            soft = _cv.addWeighted(soft, 1.4, blur, -0.4, 0)
+            return _Im.fromarray(soft)
+        # HIGHCONTRAST variant — the binarised pipeline.
+        denoise = _cv.fastNlMeansDenoising(gray, None, 10, 7, 21)
+        blurred = _cv.GaussianBlur(denoise, (3, 3), 0)
+        _, thresh = _cv.threshold(
+            blurred, 0, 255,
+            _cv.THRESH_BINARY + _cv.THRESH_OTSU)
+        sharp = _cv.GaussianBlur(thresh, (0, 0), sigmaX=1.0)
+        sharp = _cv.addWeighted(thresh, 1.5, sharp, -0.5, 0)
+        return _Im.fromarray(sharp)
+
+    @staticmethod
+    def _tesseract_extract_arabic(img) -> str:
+        """Run Tesseract OCR with ara+eng language packs on the image.
+        Returns the extracted text (already in proper logical reading
+        order — what you'd type, not what you visually see right-to-left).
+
+        Tesseract binary is the system install at
+        C:\\Program Files\\Tesseract-OCR\\tesseract.exe; language packs
+        live next to the project at E:\\Hotkeys\\tessdata\\ (ara.traineddata,
+        eng.traineddata, both 'best' quality). TESSDATA_PREFIX env var
+        points pytesseract at our packs.
+
+        Image goes through _preprocess_for_ocr first — grayscale, 2x
+        upscale, denoise, deskew, Otsu threshold, sharpen — which is
+        the standard treatment for photographed paper (blurred, angled,
+        low-contrast) and brings it up to digital-screenshot quality."""
+        import os as _os
+        import pytesseract as _pt
+        # Resolve tesseract binary: prefer system install, fall back to
+        # bundled binary if we ever ship one in dist/.
+        _candidates = [
+            r'C:\Program Files\Tesseract-OCR\tesseract.exe',
+            r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
+        ]
+        # Bundled binary (future dist) sits next to the script/exe.
+        try:
+            from pathlib import Path as _P
+            _here = _P(__file__).resolve().parent
+            _candidates.insert(0, str(_here / 'tesseract' / 'tesseract.exe'))
+            _candidates.insert(0, str(_here / 'bin' / 'tesseract.exe'))
+        except Exception:
+            pass
+        _bin = next((p for p in _candidates if _os.path.isfile(p)), None)
+        if _bin is None:
+            raise RuntimeError('Tesseract binary not found. Install '
+                               'Tesseract-OCR or bundle it under '
+                               '<app>/bin/tesseract.exe.')
+        _pt.pytesseract.tesseract_cmd = _bin
+        # Point at our project tessdata directory so users don't need
+        # to install ara.traineddata into system Tesseract's tessdata.
+        try:
+            from pathlib import Path as _P
+            _here = _P(__file__).resolve().parent
+            _tessdata = _here / 'tessdata'
+            if _tessdata.is_dir():
+                _os.environ['TESSDATA_PREFIX'] = str(_tessdata)
+        except Exception:
+            pass
+        # Multi-pass OCR: run both preprocessing variants and pick the
+        # higher-confidence result. Different paper photos respond very
+        # differently — sometimes Otsu binarisation crushes thin strokes
+        # (soft pass wins), other times the soft pass leaves too much
+        # noise (highcontrast wins). Letting Tesseract score itself
+        # picks the winner without us needing to know which case we're in.
+        #
+        # ara+eng covers the common mixed-content cases. OEM 1 = LSTM
+        # only (best for natural language). PSM 6 = "assume a single
+        # uniform block of text" which fits a screenshot selection.
+        _config = '--oem 1 --psm 6'
+        candidates = []
+        for variant in ('highcontrast', 'soft'):
+            try:
+                prepped = App._preprocess_for_ocr(img, variant=variant)
+            except Exception:
+                continue
+            try:
+                # image_to_data returns per-word confidence (0-100).
+                # We sum confidences weighted by word length so a few
+                # long, confident words outweigh many short noisy ones.
+                from pytesseract import Output as _Out
+                data = _pt.image_to_data(
+                    prepped, lang='ara+eng', config=_config,
+                    output_type=_Out.DICT)
+                score = 0.0
+                text_parts: list[str] = []
+                for i, txt in enumerate(data.get('text', [])):
+                    txt = (txt or '').strip()
+                    if not txt:
+                        continue
+                    try:
+                        conf = float(data['conf'][i])
+                    except Exception:
+                        conf = 0.0
+                    if conf < 0:
+                        continue
+                    score += conf * max(1, len(txt))
+                # Render text in tesseract's natural reading order via
+                # a second image_to_string pass (preserves line breaks
+                # better than re-joining the dict).
+                rendered = _pt.image_to_string(
+                    prepped, lang='ara+eng', config=_config)
+                candidates.append((score, rendered.strip(), variant))
+            except Exception:
+                continue
+        if not candidates:
+            # Fall back to raw image if both preprocessing passes died.
+            text = _pt.image_to_string(img, lang='ara+eng', config=_config)
+            return (text or '').strip()
+        candidates.sort(key=lambda c: c[0], reverse=True)
+        best_score, best_text, best_variant = candidates[0]
+        logger.info(
+            f'Tesseract OCR: picked {best_variant!r} variant '
+            f'(score={best_score:.0f}, len={len(best_text)})')
+        return best_text
+
+    def _screenshot_translate_offline_ar(self, img) -> None:
+        """Context-menu "Translate to English (Offline Arabic OCR)". Uses
+        bundled Tesseract with ara+eng language packs for the OCR step,
+        then Google line-by-line for translation. Significantly better
+        than hosted vision-LLMs for dense printed Arabic because the
+        Tesseract LSTM was trained specifically on Arabic ligatures +
+        RTL reading order. Total round-trip is offline-OCR (~500ms) +
+        Google translate (~1-2s), no vision API call."""
+        threading.Thread(
+            target=self._screenshot_ocr_worker,
+            args=(img, True),
+            kwargs={'engine': 'google', 'ocr': 'tesseract-ara'},
+            daemon=True, name='screenshot-translate-offline-ar',
+        ).start()
+
+    def _screenshot_ocr_worker(self, img, translate: bool,
+                               engine: str = 'llm',
+                               ocr: str = 'vision') -> None:
         """Background worker: OCR image -> (optionally) translate -> show popup.
         Runs off the Tk thread because the Groq vision API and provider.refine
-        are both network-bound."""
-        title = 'Translate to English' if translate else 'Extract text'
+        are both network-bound.
+
+        `engine` selects the translation backend when translate=True:
+          - 'llm'    → existing LLM provider with our prompt (default)
+          - 'google' → deep-translator GoogleTranslator scrape; falls back
+                       to 'llm' if the scrape fails.
+        `ocr` selects the OCR backend:
+          - 'vision'        → hosted Groq vision model (Scout)
+          - 'tesseract-ara' → bundled Tesseract with ara+eng language packs
+                              (offline, better for dense printed Arabic)
+        """
+        if translate:
+            if ocr == 'tesseract-ara':
+                title = 'Translate (Offline Arabic)'
+            elif engine == 'google':
+                title = 'Translate (Google)'
+            else:
+                title = 'Translate to English'
+        else:
+            title = 'Extract text'
         kind = 'translate' if translate else 'extract'
 
         # ── Dedupe rapid identical clicks ────────────────────────────────────
@@ -2575,7 +5166,7 @@ class App:
         try:
             import hashlib as _hl
             thumb = img.resize((64, 64)) if hasattr(img, 'resize') else img
-            key = _hl.sha1(thumb.tobytes()).hexdigest() + f':{int(translate)}'
+            key = _hl.sha1(thumb.tobytes()).hexdigest() + f':{int(translate)}:{engine}:{ocr}'
         except Exception:
             key = None
         if key is not None:
@@ -2609,8 +5200,11 @@ class App:
         except Exception:
             pass
         try:
-            extract = self._vision_extractor
-            text = (extract(img) or '').strip()
+            if ocr == 'tesseract-ara':
+                text = self._tesseract_extract_arabic(img)
+            else:
+                extract = self._vision_extractor
+                text = (extract(img) or '').strip()
         except Exception as exc:
             msg = str(exc).lower()
             # Friendlier copy for the two failure modes users actually hit:
@@ -2680,20 +5274,111 @@ class App:
                 logger.info('Screenshot translate: source looks like code '
                             f'(symbol_ratio={symbol_ratio:.2f}), skipping translate')
 
-        if translate and not looks_like_code:
+        if translate and not looks_like_code and engine == 'google':
+            # Google Translate path (deep-translator scrape). Translates
+            # the source LINE-BY-LINE to preserve formatting (bullet
+            # markers, blank-line spacing, headings). Google's API
+            # collapses newlines into spaces if we send the whole blob,
+            # which destroys the structure of any OCR'd document. Sending
+            # one line at a time keeps the layout 1:1 with the OCR.
+            #
+            # Pure whitespace / bullet-only lines are passed through
+            # without an API call so they don't waste round-trips.
             try:
-                # Use the active LLM provider to translate. The prompt is
-                # written to handle the already-English case cleanly: most
-                # OCR'd captures will be non-English, but a user may
-                # absent-mindedly translate an English signpost, and we
-                # don't want the model to paraphrase or "improve" it.
+                from deep_translator import GoogleTranslator
+                _BULLET_RE = ('-', '•', '·', '*', '○', '●', '▪', '▫', '◦')
+                def _is_skippable(s: str) -> bool:
+                    t = s.strip()
+                    return (not t) or t in _BULLET_RE
+                _gt = GoogleTranslator(source='auto', target='en')
+                _MAX = 4500
+                out_lines = []
+                buf_lines: list[str] = []
+                buf_len = 0
+                def _flush_buf():
+                    if not buf_lines:
+                        return
+                    # Translate this chunk of consecutive translatable
+                    # lines as a single request, preserving newlines by
+                    # using a sentinel placeholder Google won't translate
+                    # but we'll restore. Standard trick: numbered
+                    # placeholders sandwiched in punctuation neutral to
+                    # most languages.
+                    SEP = '\n@@LINE@@\n'
+                    joined = SEP.join(buf_lines)
+                    try:
+                        tr = _gt.translate(joined) or ''
+                    except Exception:
+                        tr = joined  # bail to original; outer try handles
+                    parts = tr.split('@@LINE@@')
+                    if len(parts) != len(buf_lines):
+                        # Sentinel got mangled — fall back to line-by-line.
+                        parts = []
+                        for ln in buf_lines:
+                            try:
+                                parts.append(_gt.translate(ln) or ln)
+                            except Exception:
+                                parts.append(ln)
+                    out_lines.extend(p.strip('\n') for p in parts)
+                    buf_lines.clear()
+                for line in text.split('\n'):
+                    if _is_skippable(line):
+                        _flush_buf()
+                        out_lines.append(line)
+                        continue
+                    add_len = len(line) + len('\n@@LINE@@\n')
+                    if buf_len + add_len > _MAX and buf_lines:
+                        _flush_buf()
+                        buf_len = 0
+                    buf_lines.append(line)
+                    buf_len += add_len
+                _flush_buf()
+                translated = '\n'.join(out_lines)
+                if translated and translated.strip():
+                    text = translated
+                    logger.info(f'Google translate ok ({len(text)} chars, '
+                                f'{len(text.splitlines())} lines)')
+                    engine = 'done'   # mark complete so the LLM branch skips
+                else:
+                    logger.info('Google translate returned empty, falling back to LLM')
+                    engine = 'llm'   # fall through into the LLM branch below
+            except Exception as exc:
+                logger.warning(f'Google translate failed ({exc}), falling back to LLM')
+                engine = 'llm'   # fall through
+        if translate and not looks_like_code and engine == 'llm':
+            try:
+                # Use the active LLM provider to translate. Prompt is
+                # tuned to match Google Translate's neural output style:
+                # idiomatic (not word-by-word), formatting-preserving,
+                # proper-nouns-untouched, register-matched. The English
+                # passthrough rule prevents the model from "improving"
+                # an English signpost the user absent-mindedly captured.
                 prompt = (
-                    'You are a translator. The user will give you some text. '
-                    'If the text is in English, output it exactly as-is, '
-                    'unchanged, character-for-character. If the text is in any '
-                    'other language, translate it to English literally. '
-                    'Output ONLY the result. No commentary, no quotes, no '
-                    '"Translation:" prefix, no explanation.'
+                    'Translate the text to natural, fluent English — '
+                    'the way a native speaker would say it, not '
+                    'word-by-word.\n\n'
+                    'Rules:\n'
+                    '- Preserve formatting exactly: line breaks, '
+                    'paragraphs, bullets, indentation, punctuation, '
+                    'ALL CAPS, italics markers.\n'
+                    '- Keep proper nouns, brand names, and product '
+                    'names in source form, except for well-established '
+                    'English exonyms (München → Munich; Volkswagen '
+                    'stays).\n'
+                    '- Keep numbers, dates, currency, and units in '
+                    'their original numeric form.\n'
+                    '- Match the register and tone of the source '
+                    '(formal stays formal, casual stays casual, '
+                    'technical stays technical).\n'
+                    '- For idioms, use the closest natural English '
+                    'equivalent.\n'
+                    '- For mixed-language text, translate only the '
+                    'non-English parts.\n'
+                    '- If the input is ALREADY in English, output it '
+                    'verbatim — do not rephrase, paraphrase, or '
+                    '"improve" it.\n\n'
+                    'Output ONLY the translated text. No "Translation:" '
+                    'prefix, no quotes, no commentary.'
                 )
                 translated = self.provider.refine(text, prompt)
                 translated = (translated or '').strip()
@@ -2808,6 +5493,47 @@ class App:
             )
             txt.pack(fill='both', expand=True, padx=14, pady=(0, 8))
             txt.insert('1.0', text)
+            # Standard Cut / Copy / Paste / Select All right-click menu.
+            # Bound on both the CTk wrapper and the inner tk.Text — clicks
+            # land on different widgets depending on padding.
+            inner_txt = txt._textbox
+            def _on_rclick(_e):
+                import tkinter as _tk
+                m = _tk.Menu(win, tearoff=0)
+                try:
+                    has_sel = bool(inner_txt.tag_ranges('sel'))
+                except Exception:
+                    has_sel = False
+                try:
+                    clip_has = bool(win.clipboard_get())
+                except Exception:
+                    clip_has = False
+                def _do(fn):
+                    try: fn()
+                    except Exception: pass
+                m.add_command(label='Cut',
+                              command=lambda: _do(lambda: inner_txt.event_generate('<<Cut>>')),
+                              state='normal' if has_sel else 'disabled')
+                m.add_command(label='Copy',
+                              command=lambda: _do(lambda: inner_txt.event_generate('<<Copy>>')),
+                              state='normal' if has_sel else 'disabled')
+                m.add_command(label='Paste',
+                              command=lambda: _do(lambda: inner_txt.event_generate('<<Paste>>')),
+                              state='normal' if clip_has else 'disabled')
+                m.add_separator()
+                m.add_command(label='Select all',
+                              command=lambda: _do(lambda: (
+                                  inner_txt.tag_add('sel', '1.0', 'end-1c'),
+                                  inner_txt.mark_set('insert', '1.0'),
+                                  inner_txt.see('insert'),
+                              )))
+                try:
+                    m.tk_popup(_e.x_root, _e.y_root)
+                finally:
+                    m.grab_release()
+                return 'break'
+            txt.bind('<Button-3>', _on_rclick, add='+')
+            inner_txt.bind('<Button-3>', _on_rclick, add='+')
 
             btns = ctk.CTkFrame(win, fg_color='transparent')
             btns.pack(fill='x', padx=14, pady=(0, 14))
@@ -2892,24 +5618,24 @@ class App:
         # even if the grab is still in flight (main thread not yet blocked).
         from screenshot import _overlay_active
         if _overlay_active[0]:
-            self._q.put(('screenshot:cancel', None))
+            self._q.put_nowait(('screenshot:cancel', None))
             return
         # Macro takes priority, stop recording/playback first.
         if self._macro_state in ('recording', 'playing'):
-            self._q.put(('macro:stop', None))
+            self._q.put_nowait(('macro:stop', None))
             return
         # GIF recording, Esc aborts capture.
         if self._gif_state == 'recording':
-            self._q.put(('gif:toggle', None))   # stop → encode → save dialog
+            self._q.put_nowait(('gif:toggle', None))   # stop → encode → save dialog
             return
         if self._whisper_recording:
-            self._q.put(('whisper:cancel', None))
+            self._q.put_nowait(('whisper:cancel', None))
             return
         # Nothing active, close any floating AskPills.
         # (Pills no longer register their own global escape hook because
         # keyboard.unhook_all() inside _register_hotkeys would nuke them.)
         if self._ask_pills:
-            self._q.put(('ask:close_all', None))
+            self._q.put_nowait(('ask:close_all', None))
 
     # ── Per-prompt hotkey handler ─────────────────────────────────────────────
 
@@ -3120,24 +5846,24 @@ class App:
         if isinstance(self.provider, LocalProvider):
             return   # splash provider step handled by model_ready
         if not self.provider.ready:
-            self._q.put(('prewarm:done', None))   # no API key, mark done immediately
+            self._q.put_nowait(('prewarm:done', None))   # no API key, mark done immediately
             return
         try:
             self.provider.refine('Hello', 'Reply with one word: OK')
             logger.info('Connection pre-warmed.')
         except Exception as e:
             logger.info(f'Pre-warm skipped: {e!s:.60}')
-        self._q.put(('prewarm:done', None))
+        self._q.put_nowait(('prewarm:done', None))
 
     # ── Model loading (local Qwen) ────────────────────────────────────────────
 
     def _load_model(self) -> None:
         try:
             self.provider.load()
-            self._q.put(('model_ready', None))
+            self._q.put_nowait(('model_ready', None))
         except Exception as e:
             logger.error(f'Model load failed: {e}')
-            self._q.put(('model_error', str(e)))
+            self._q.put_nowait(('model_error', str(e)))
 
     # ── Event poll loop ───────────────────────────────────────────────────────
 
@@ -3170,6 +5896,78 @@ class App:
         on _WHITEBOARD_GATED_EVENTS for the design rationale."""
         return event in self._WHITEBOARD_GATED_EVENTS
 
+    # Events that represent a USER ACTION (hotkey press, tray click, etc.).
+    # These get gated by the accident-protection layers below; result/
+    # worker callbacks like 'refine:done' are explicitly NOT in this set
+    # because they fire from background threads completing real work.
+    _USER_INITIATED_EVENTS = frozenset({
+        'refine', 'ask', 'chain', 'chain_named',
+        'web', 'notes', 'whiteboard', 'library', 'transcribe',
+        'audio_editor', 'download_url', 'history', 'settings',
+        'whisper:start', 'macro:hotkey', 'macro:play_saved',
+        'recorder:toggle', 'gif:toggle', 'prompt_hotkey',
+    })
+
+    @staticmethod
+    def _is_screen_locked() -> bool:
+        """True when the Windows lock screen is showing or the workstation
+        is on the secure desktop (UAC, Ctrl+Alt+Del). Hotkeys must NOT
+        fire in this state — a stuck modifier or accidental press while
+        the user is away should never spend API credits."""
+        if sys.platform != 'win32':
+            return False
+        try:
+            u32 = ctypes.windll.user32
+            # DESKTOP_SWITCHDESKTOP = 0x0100; OpenInputDesktop returns
+            # NULL when the input desktop isn't ours (locked / Winlogon).
+            h = u32.OpenInputDesktop(0, False, 0x0100)
+            if not h:
+                return True
+            u32.CloseDesktop(h)
+            return False
+        except Exception:
+            return False
+
+    def _check_accident_guards(self, event: str) -> bool:
+        """Return True if this user-initiated event should be silently
+        dropped (and a brief warning pill shown). Catches two scenarios:
+
+          1. Screen locked / on secure desktop — user is away; an
+             accidental key press (cat on keyboard, water spill, item
+             dropped) should never spend API credits or destroy text.
+          2. Hotkey flood — 4+ user-initiated events within 2 seconds.
+             Real humans don't trigger this many hotkeys that fast;
+             water + a row of contiguous F-keys can. Pauses everything
+             for 10 seconds so the user notices and clears the keyboard.
+
+        Result/worker events bypass both checks because they originate
+        from our own background threads, not the user."""
+        if event not in self._USER_INITIATED_EVENTS:
+            return False
+        # 1. Lock screen / secure desktop
+        if self._is_screen_locked():
+            logger.warning(f'Dropped {event!r}: screen is locked.')
+            return True
+        # 2. Flood detector
+        now = time.time()
+        if now < getattr(self, '_panic_until_ts', 0):
+            return True  # mid-pause, silent drop
+        self._activation_times.append(now)
+        if (len(self._activation_times) >= 4
+                and now - self._activation_times[-4] < 2.0):
+            self._panic_until_ts = now + 10.0
+            try:
+                self.refine_overlay.show_error(
+                    '⚠ Unusual hotkey activity, paused 10s')
+            except Exception:
+                pass
+            logger.warning(
+                f'Flood guard tripped: {len(self._activation_times)} '
+                f'user-initiated events in '
+                f'{now - self._activation_times[0]:.1f}s; pausing 10s.')
+            return True
+        return False
+
     def _poll(self) -> None:
         # Reschedule FIRST so a handler that calls wait_window() (which creates
         # a nested Tk event loop) doesn't prevent the next poll from running.
@@ -3182,6 +5980,13 @@ class App:
                 event, data = self._q.get_nowait()
                 if wb_fg and self._is_event_gated(event):
                     continue  # Whiteboard owns focus, let Whiteboard handle it
+                try:
+                    skip = self._check_accident_guards(event)
+                except Exception:
+                    logger.exception(f'guard check raised for {event!r}')
+                    skip = False
+                if skip:
+                    continue
                 handler = self._dispatch.get(event)
                 if handler:
                     try:
@@ -3227,7 +6032,7 @@ class App:
         def infer() -> None:
             # 30-second hard timeout, fires refine:timeout on the main thread
             timer = threading.Timer(
-                30.0, lambda: self._q.put(('refine:timeout', gen))
+                30.0, lambda: self._q.put_nowait(('refine:timeout', gen))
             )
             timer.start()
             try:
@@ -3236,9 +6041,9 @@ class App:
                 if gen != self._refine_gen:
                     return   # timeout already fired and reset gen
                 if not result or not result.strip():
-                    self._q.put(('refine:error', 'Empty response from AI'))
+                    self._q.put_nowait(('refine:error', 'Empty response from AI'))
                 else:
-                    self._q.put(('refine:done', result))
+                    self._q.put_nowait(('refine:done', result))
             except Exception as e:
                 timer.cancel()
                 logger.error(f'Inference error: {e}')
@@ -3247,9 +6052,9 @@ class App:
                     msg = friendly_error_message(
                         e, feature='Refine',
                         active_provider=self.config.get('active_provider', ''))
-                    self._q.put(('refine:error', msg))
+                    self._q.put_nowait(('refine:error', msg))
             finally:
-                self._q.put(('refine:unlock', gen))
+                self._q.put_nowait(('refine:unlock', gen))
 
         threading.Thread(target=infer, daemon=True).start()
 
@@ -3632,6 +6437,27 @@ class App:
         except Exception:
             pass
 
+        # ── Scan-preview Toplevels (titled "Hotkeys — Scan & edit" or
+        # "Edit corners") — close any that are open. Reset everything is
+        # a "clean slate" gesture; a stranded editor still showing an
+        # old screenshot violates that expectation, and the editor holds
+        # no persistent state we'd lose.
+        try:
+            for w in self.root.winfo_children():
+                try:
+                    if w.winfo_class() != 'Toplevel':
+                        continue
+                    title = w.title() if hasattr(w, 'title') else ''
+                    if title in ('Hotkeys — Scan & edit', 'Edit corners',
+                                 'Edited image — what next?'):
+                        try: w.grab_release()
+                        except Exception: pass
+                        try: w.destroy()
+                        except Exception: pass
+                        logger.info(f'Restore: closed scan window {title!r}')
+                except Exception: pass
+        except Exception: pass
+
         # ── Live overlays + ask pills, hide so the UI is back to baseline ────
         try:
             for ov in (self.refine_overlay, self.whisper_overlay,
@@ -3858,7 +6684,7 @@ class App:
 
     def _on_vad_safety_stop(self) -> None:
         """Called from audio thread when silence limit exceeded."""
-        self._q.put(('whisper:stop', None))
+        self._q.put_nowait(('whisper:stop', None))
 
     def _on_audio_chunk(self, chunk) -> None:
         if self._whisper_recording:
@@ -3869,7 +6695,7 @@ class App:
 
     def _on_transcriber_status(self, status: str) -> None:
         """Called from transcriber thread, post to main queue."""
-        self._q.put(('whisper:status', status))
+        self._q.put_nowait(('whisper:status', status))
 
     def _on_transcriber_status_event(self, status: str) -> None:
         """Handle transcriber status on main thread."""
@@ -3890,11 +6716,11 @@ class App:
         elif status == 'error':
             self._whisper_ready = True  # allow retry
             self._splash.mark_error('whisper')
-            self._q.put(('whisper:error', 'Transcription failed'))
+            self._q.put_nowait(('whisper:error', 'Transcription failed'))
 
     def _on_transcription_result(self, text: str, language: str, duration_s: float) -> None:
         """Called from transcriber thread, post to main queue."""
-        self._q.put(('whisper:result', (text, language, duration_s)))
+        self._q.put_nowait(('whisper:result', (text, language, duration_s)))
 
     def _on_whisper_result(self, payload) -> None:
         # Result arrived → cancel the transcribe watchdog.
@@ -4101,7 +6927,7 @@ class App:
             return False
         cmd, label = entry
         try:
-            self._q.put((cmd, None))
+            self._q.put_nowait((cmd, None))
         except Exception as exc:
             logger.warning(f'voice-command {cmd!r} queue failed: {exc}')
             return False
@@ -4253,7 +7079,7 @@ class App:
         self._macro_t0 = time.time()   # stamp for watchdog grace window
         self._set_macro_state('recording')
         self._macro.start_recording(
-            on_cap_reached=lambda: self._q.put(('macro:cap', None))
+            on_cap_reached=lambda: self._q.put_nowait(('macro:cap', None))
         )
         self._macro_register_stop_keys()
         self.macro_overlay.show_macro_recording()
@@ -4375,7 +7201,7 @@ class App:
             try:
                 handle = kbhook.add_hotkey(
                     hk,
-                    lambda m=meta: self._q.put(('macro:play_saved', m)),
+                    lambda m=meta: self._q.put_nowait(('macro:play_saved', m)),
                 )
                 self._macro_saved_hks.append(handle)
                 logger.info(f'Macro hotkey registered: {hk!r} -> "{name}"')
@@ -4416,7 +7242,7 @@ class App:
         # Esc is handled by the permanent _hk_escape (which checks macro state),
         # so we only add Delete here to avoid a double-Esc handler.
         self._macro_stop_hks = [
-            kbhook.add_hotkey('delete', lambda: self._q.put(('macro:stop', None))),
+            kbhook.add_hotkey('delete', lambda: self._q.put_nowait(('macro:stop', None))),
         ]
 
     def _macro_unregister_stop_keys(self) -> None:
@@ -4431,6 +7257,15 @@ class App:
 
     def _on_recorder_toggle(self) -> None:
         """Shift+F2 or Library tab button, starts or stops screen recording."""
+        # Debounce: an accidental double-tap right after starting would
+        # transition idle → recording → (immediate) stop, producing a
+        # 0-byte file and a confusing save dialog. 500ms after the last
+        # transition is the cooldown window.
+        now = time.time()
+        last = getattr(self, '_recorder_last_toggle_ts', 0)
+        if now - last < 0.5:
+            return
+        self._recorder_last_toggle_ts = now
         if self._recorder_state == 'idle':
             self._recorder_start()
         elif self._recorder_state == 'recording':
@@ -4444,8 +7279,8 @@ class App:
             mic=False,
             mic_device=None,
             fps=30,
-            on_size_update=lambda b: self._q.put(('recorder:size', b)),
-            on_cap_reached=lambda: self._q.put(('recorder:cap', None)),
+            on_size_update=lambda b: self._q.put_nowait(('recorder:size', b)),
+            on_cap_reached=lambda: self._q.put_nowait(('recorder:cap', None)),
         )
         try:
             self._screen_recorder.start()
@@ -4597,9 +7432,9 @@ class App:
                 max_duration_s=cfg['max_duration_s'],
             )
             self._gif_recorder.start(
-                on_done=lambda path, dur: self._q.put(('gif:done', (path, dur))),
-                on_error=lambda msg: self._q.put(('gif:error', msg)),
-                on_cap_reached=lambda: self._q.put(('gif:cap', None)),
+                on_done=lambda path, dur: self._q.put_nowait(('gif:done', (path, dur))),
+                on_error=lambda msg: self._q.put_nowait(('gif:error', msg)),
+                on_cap_reached=lambda: self._q.put_nowait(('gif:cap', None)),
             )
         except Exception as exc:
             logger.error(f'GIF recorder failed to start: {exc}')
@@ -4759,7 +7594,38 @@ class App:
                   'toggle_pause_hotkeys'}
         # 'whisper' is a toggle that already handles start/stop based on
         # state, route it through _hk_whisper instead of a queued event.
-        _DIRECT_CALL = {'whisper': lambda: self._hk_whisper()}
+        _DIRECT_CALL = {
+            'whisper': lambda: self._hk_whisper(),
+            # End-to-end test: simulates AskPill's Follow up callback
+            # firing with a synthetic (Q, A). Verifies the whole chain
+            # without needing a real selection + LLM round-trip.
+            '__test_followup': lambda: self._on_ask_followup(
+                'Why is the sky blue?',
+                'Because of Rayleigh scattering — blue wavelengths '
+                'scatter more in the atmosphere than red ones.'),
+            # End-to-end test: opens a fresh chat note and submits "hi"
+            # through the real chat pipeline. Used to verify the LLM
+            # cleanup catches hallucinated transcript continuations
+            # without needing the human to type into the UI.
+            '__test_chat_hi': lambda: self._test_chat_send_hi(),
+            # Full multi-turn sweep: drives a fresh chat note through
+            # five questions including follow-ups, logs each reply's
+            # length + first line, then compares one reply with the
+            # AskPill refine path to check tone consistency.
+            '__test_chat_sweep': lambda: self._test_chat_sweep(),
+            # Edits a chat note's title via the Tk title StringVar and
+            # verifies that, after the debounce window, the title
+            # is persisted to disk AND the saved note read back
+            # carries the new title (which is what _refresh_list uses
+            # to paint the left panel).
+            '__test_chat_title_reflect':
+                lambda: self._test_chat_title_reflect(),
+            # Editable transcript test: simulate the user editing the
+            # transcript, then sending a follow-up, then verifying
+            # the edits + the new reply both persist to disk.
+            '__test_chat_editable_transcript':
+                lambda: self._test_chat_editable_transcript(),
+        }
         try:
             with _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM) as srv:
                 srv.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
@@ -4767,18 +7633,39 @@ class App:
                 srv.listen(5)
                 while True:
                     try:
-                        conn, _ = srv.accept()
-                        with conn:
-                            cmd = conn.recv(64).decode().strip()
-                            logger.info(f'IPC: received {cmd!r}')
-                            if cmd in _VALID:
-                                self._q.put((cmd, None))
-                                logger.info(f'IPC: queued {cmd!r}')
-                            elif cmd in _DIRECT_CALL:
-                                self.root.after(0, _DIRECT_CALL[cmd])
-                                logger.info(f'IPC: dispatched {cmd!r}')
-                    except Exception:
-                        pass
+                        conn, _addr = srv.accept()
+                    except Exception as e:
+                        logger.warning(f'IPC accept failed: {e}')
+                        continue
+                    try:
+                        # 2 s recv budget: a client that never sends used
+                        # to wedge the single-threaded accept loop and
+                        # silently lock out every other IPC caller
+                        # forever. Bounded timeout means the worst case
+                        # is one rejected command, not a permanent stall.
+                        conn.settimeout(2.0)
+                        try:
+                            raw = conn.recv(256)
+                        except Exception:
+                            raw = b''
+                        # Strip newlines / trailing whitespace so a
+                        # 'cmd\n' from a shell-friendly client still
+                        # matches. Cap to a sane length defensively.
+                        cmd = raw.decode('utf-8', errors='replace').strip()[:64]
+                        if not cmd:
+                            continue
+                        logger.info(f'IPC: received {cmd!r}')
+                        if cmd in _VALID:
+                            self._q.put_nowait((cmd, None))
+                            logger.info(f'IPC: queued {cmd!r}')
+                        elif cmd in _DIRECT_CALL:
+                            self.root.after(0, _DIRECT_CALL[cmd])
+                            logger.info(f'IPC: dispatched {cmd!r}')
+                        else:
+                            logger.warning(f'IPC: rejected unknown cmd {cmd!r}')
+                    finally:
+                        try: conn.close()
+                        except Exception: pass
         except Exception as e:
             logger.warning(f'IPC listener failed: {e}')
 
@@ -4859,7 +7746,7 @@ class App:
         def prov_item(key: str, label: str) -> pystray.MenuItem:
             return pystray.MenuItem(
                 label,
-                lambda: self._q.put(('switch_provider', key)),
+                lambda: self._q.put_nowait(('switch_provider', key)),
                 checked=lambda item, k=key: self.config.get('active_provider') == k,
                 radio=True,
             )
@@ -4900,7 +7787,7 @@ class App:
             pystray.MenuItem(
                 f'{"🛑  Stop recording" if recording else "🎙  Speak to type"}'
                 f'           {whisper_hk}',
-                lambda: self._q.put(('whisper:start', None) if not recording
+                lambda: self._q.put_nowait(('whisper:start', None) if not recording
                                     else ('whisper:stop', None)),
             ),
             pystray.MenuItem(
@@ -4909,35 +7796,35 @@ class App:
             ),
             pystray.MenuItem(
                 f'💬  Explain or answer something   {ask_hk}',
-                lambda: self._q.put(('ask', '')),
+                lambda: self._q.put_nowait(('ask', '')),
             ),
             pystray.MenuItem(
                 f'📝  Jot a quick note              {notes_hk}',
-                lambda: self._q.put(('notes', None)),
+                lambda: self._q.put_nowait(('notes', None)),
             ),
             pystray.MenuItem(
                 f'📚  Open Library                  {lib_hk}',
-                lambda: self._q.put(('library', None)),
+                lambda: self._q.put_nowait(('library', None)),
             ),
             pystray.MenuItem(
                 f'🎬  Turn audio or video into text {transcribe_hk}',
-                lambda: self._q.put(('transcribe', None)),
+                lambda: self._q.put_nowait(('transcribe', None)),
             ),
             pystray.MenuItem(
                 f'🎨  Sketch on a whiteboard        {whiteboard_hk}',
-                lambda: self._q.put(('whiteboard', None)),
+                lambda: self._q.put_nowait(('whiteboard', None)),
             ),
             pystray.MenuItem(
                 f'🎵  Open audio editor             {audio_edit_hk}',
-                lambda: self._q.put(('audio_editor', None)),
+                lambda: self._q.put_nowait(('audio_editor', None)),
             ),
             pystray.MenuItem(
                 f'🌐  Jump to a favourite site      {web_hk}',
-                lambda: self._q.put(('web', None)),
+                lambda: self._q.put_nowait(('web', None)),
             ),
             pystray.MenuItem(
                 f'🔗  Run a multi-step workflow     {chain_hk}',
-                lambda: self._q.put(('chain', None)),
+                lambda: self._q.put_nowait(('chain', None)),
             ),
         ]
 
@@ -4949,15 +7836,15 @@ class App:
             ),
             pystray.MenuItem(
                 f'⏺  Record my screen              {recorder_hk}',
-                lambda: self._q.put(('recorder:toggle', None)),
+                lambda: self._q.put_nowait(('recorder:toggle', None)),
             ),
             pystray.MenuItem(
                 f'🎞  Capture a GIF                 {gif_hk}',
-                lambda: self._q.put(('gif:toggle', None)),
+                lambda: self._q.put_nowait(('gif:toggle', None)),
             ),
             pystray.MenuItem(
                 f'⚡  Record a clicks/keys macro    {macro_hk}',
-                lambda: self._q.put(('macro:hotkey', None)),
+                lambda: self._q.put_nowait(('macro:hotkey', None)),
             ),
         ]
 
@@ -4983,9 +7870,9 @@ class App:
                 ),
             )),
             pystray.MenuItem('🕒  History',
-                             lambda: self._q.put(('history', None))),
+                             lambda: self._q.put_nowait(('history', None))),
             pystray.MenuItem('⚙  Settings…',
-                             lambda: self._q.put(('settings', None))),
+                             lambda: self._q.put_nowait(('settings', None))),
         ]
 
         # ── RESET / RELOAD ──────────────────────────────────────────────────
@@ -5001,14 +7888,14 @@ class App:
                        else '⏸  Pause hotkeys')
         pause_items = [
             pystray.MenuItem(pause_label,
-                             lambda: self._q.put(('toggle_pause_hotkeys', None))),
+                             lambda: self._q.put_nowait(('toggle_pause_hotkeys', None))),
         ]
 
         reset_items = [
             pystray.MenuItem('🛑  Stop everything & reload hotkeys',
-                             lambda: self._q.put(('reload_hotkeys', None))),
+                             lambda: self._q.put_nowait(('reload_hotkeys', None))),
             pystray.MenuItem('↺  Reset everything…',
-                             lambda: self._q.put(('restore_all_defaults', None))),
+                             lambda: self._q.put_nowait(('restore_all_defaults', None))),
         ]
 
         return pystray.Menu(
@@ -5078,33 +7965,80 @@ class App:
     def _watch_singleton_socket(self) -> None:
         """Background thread: waits for a new instance to signal QUIT.
 
-        The TCP connection itself is proof a new instance is running, we
-        do not do a secondary PID check, because in dist builds the process
-        name / cmdline heuristic is unreliable during the brief startup window.
+        Validates the payload is exactly b'QUIT' before triggering
+        shutdown. Previously any TCP connection (port scanner,
+        misdirected client, even a stray nc) would kill the app
+        because we just `recv()`'d 16 bytes and ignored the contents.
+        Also keeps the loop alive on transient socket errors so a
+        single RST doesn't permanently kill the watcher.
         """
         if not _singleton_sock:
             return
         while True:
             try:
-                conn, _ = _singleton_sock.accept()
+                conn, _addr = _singleton_sock.accept()
+            except OSError:
+                return   # socket closed during normal _quit()
+            except Exception as e:
+                logger.warning(f'Singleton watcher accept failed: {e}')
+                continue
+            try:
                 try:
-                    conn.recv(16)
+                    conn.settimeout(2.0)
+                    # Read until 4 bytes of 'QUIT' arrive, until socket
+                    # closes, or until the 2s timeout. A slow loopback
+                    # could fragment the 4-byte token across packets;
+                    # the old single recv(16) would misclassify the
+                    # second half as a stray connection and stay alive
+                    # when a real QUIT was sent.
+                    payload = b''
+                    while len(payload) < 16:
+                        chunk = conn.recv(16 - len(payload))
+                        if not chunk:
+                            break
+                        payload += chunk
+                        if payload.startswith(b'QUIT'):
+                            payload = b'QUIT'
+                            break
+                except Exception as e:
+                    logger.warning(f'Singleton watcher recv failed: {e}')
+                    payload = b''
                 finally:
-                    conn.close()
+                    try: conn.close()
+                    except Exception: pass
+            except Exception:
+                payload = b''
+            if payload == b'QUIT':
                 logger.info('New instance launched, shutting down gracefully.')
                 self.root.after(0, self._quit)
                 return
-            except Exception:
-                return   # socket closed during normal _quit()
+            logger.warning(
+                f'Singleton: rejected stray connection (payload={payload!r}); '
+                f'staying alive.')
 
     def _quit(self) -> None:
         logger.info('Shutting down.')
 
-        # Schedule a hard kill in case any cleanup step hangs
+        # Block briefly to let any in-flight atomic JSON save threads
+        # finish. Without this, the 5s force-killer below could fire
+        # os._exit() while save_notes/save_history/save_config is
+        # mid-fsync, leaving a .tmp orphan and possibly losing the
+        # final write. wait_for_writes returns fast (~ms) when nothing
+        # is pending; capped at 3s so we never hang shutdown.
+        try:
+            from storage import wait_for_writes
+            wait_for_writes(timeout=3.0)
+        except Exception:
+            pass
+
+        # Schedule a hard kill in case any cleanup step hangs. Killer
+        # is 10s (was 5s) so the existing 0.6s tray sleep + audio
+        # subprocess teardown + atomic writes have headroom even on a
+        # slow AV-scanning host.
         def _force_exit():
             logger.warning('Forced exit after timeout.')
             os._exit(0)
-        _killer = threading.Timer(5.0, _force_exit)
+        _killer = threading.Timer(10.0, _force_exit)
         _killer.daemon = True
         _killer.start()
 
@@ -5134,6 +8068,24 @@ class App:
         except Exception:
             pass
         keyboard.unhook_all()
+        # Modifier-stuck recovery: if the user is mid-chord when the
+        # process tears down (Alt+Shift+W on Windows commonly leaves a
+        # held VK_MENU in the low-level state because the hook dies
+        # before the KEYUP arrives), send unconditional KEYUPs for
+        # every modifier. Safe to call even when no modifier is held —
+        # the OS deduplicates a fresh KEYUP on an already-released key.
+        if sys.platform == 'win32':
+            try:
+                _u32 = ctypes.windll.user32
+                # VK codes: SHIFT=0x10, CTRL=0x11, ALT/MENU=0x12, LWIN=0x5B, RWIN=0x5C
+                for _vk in (0x10, 0xA0, 0xA1,    # Shift / LShift / RShift
+                            0x11, 0xA2, 0xA3,    # Ctrl  / LCtrl  / RCtrl
+                            0x12, 0xA4, 0xA5,    # Alt   / LAlt   / RAlt
+                            0x5B, 0x5C):         # LWin  / RWin
+                    # KEYEVENTF_KEYUP = 0x0002
+                    _u32.keybd_event(_vk, 0, 0x0002, 0)
+            except Exception:
+                pass
         try:
             self._audio.stop()
         except Exception:
@@ -5151,6 +8103,49 @@ class App:
             _ae.get_launcher().shutdown()
         except Exception:
             pass
+        # Editor subprocesses (miniPaint image editor, whiteboard).
+        # Both are now assigned to our cleanup Job Object so Windows
+        # will reap them automatically when this process exits — the
+        # explicit walk below is the GRACEFUL-path version that ensures
+        # they die NOW (before our process actually exits) so the user
+        # doesn't briefly see Hotkeys disappear from the tray while the
+        # editor windows are still on screen.
+        try:
+            import psutil as _ps
+            kill_targets = set(getattr(self, '_image_editor_pids', []))
+            if getattr(self, '_wb_proc_pid', None):
+                kill_targets.add(self._wb_proc_pid)
+            # Also walk for orphans (e.g. spawned by a previous instance
+            # before single-instance restart, or whose tracking lost).
+            for p in _ps.process_iter(['pid', 'name', 'cmdline']):
+                try:
+                    cmd = p.info.get('cmdline') or []
+                    if any('image_editor.py' in c or '--image-editor' in c
+                           or 'whiteboard.py' in c or '--whiteboard' in c
+                           for c in cmd):
+                        kill_targets.add(p.info['pid'])
+                except Exception: pass
+            # Kill each target with its entire child tree (WebView2 spawns
+            # 5-6 grandchildren per editor window — browser + GPU +
+            # crashpad + utilities + renderer).
+            for pid in kill_targets:
+                try:
+                    proc = _ps.Process(pid)
+                    for child in proc.children(recursive=True):
+                        try: child.kill()
+                        except Exception: pass
+                    proc.kill()
+                except Exception: pass
+        except Exception: pass
+        # Closing the cleanup Job Object handle as the final act is a
+        # belt-belt-and-suspenders measure: even if every kill above
+        # somehow missed, Windows will terminate everything still in
+        # the job the instant we exit (KILL_ON_JOB_CLOSE).
+        try:
+            if getattr(self, '_cleanup_job', None):
+                self._cleanup_job_k32.CloseHandle(self._cleanup_job)
+                self._cleanup_job = None
+        except Exception: pass
         # Belt-and-suspenders tray icon removal. pystray.stop() usually
         # fires Shell_NotifyIcon(NIM_DELETE) but if it doesn't, the
         # icon stays in the tray as a ghost until you hover over it.
@@ -5345,15 +8340,31 @@ def _ensure_single_instance(_depth: int = 0) -> None:
     _sweep_ghost_tray_icons()
     time.sleep(0.8)
 
-    # 4. Bind socket as graceful-quit channel for the NEXT launch
+    # 4. Bind socket as graceful-quit channel for the NEXT launch.
+    # Loud failure: if the port is genuinely held by some unrelated
+    # process (a dev server, a debug bridge, anything that grabbed
+    # 47294), we want to know — silently falling through here means
+    # the next Hotkeys launch zombie-spawns alongside this one with
+    # two trays racing on JSON writes. Log enough detail that the
+    # user can identify the offending process.
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(('127.0.0.1', _SINGLETON_PORT))
         s.listen(5)
         _singleton_sock = s
-    except Exception:
-        pass
+    except OSError as e:
+        # WSAEADDRINUSE (10048) or POSIX EADDRINUSE (98)
+        if getattr(e, 'errno', 0) in (10048, 98):
+            logger.error(
+                f'Singleton port {_SINGLETON_PORT} is already in use by '
+                f'another process. Another Hotkeys instance launched in '
+                f'parallel may not be detected; close any other instances '
+                f'and restart. ({e})')
+        else:
+            logger.error(f'Singleton socket bind failed: {e}')
+    except Exception as e:
+        logger.error(f'Singleton socket bind failed: {e}')
 
     if sys.platform == 'win32':
         kernel32.ReleaseMutex(mutex)

@@ -752,11 +752,6 @@ class AudioEditorLauncher:
         # main window. Prevents a second Shift+F10 during this window
         # from launching a duplicate Tenacity process.
         self._spawning: bool = False
-        # Tk root reference, supplied by main.py via toggle(root). Used
-        # for the "drop a file here" hint overlay that pops up over the
-        # empty waveform area when the editor first launches.
-        self._tk_root = None
-        self._hint_overlay = None
 
     # ── Public ────────────────────────────────────────────────────────────
 
@@ -785,9 +780,6 @@ class AudioEditorLauncher:
             pass
         self._proc = None
         self._hwnd = 0
-        # Take down any leftover overlays.
-        try: self._close_drop_hint()
-        except Exception: pass
 
     def toggle(self) -> None:
         """Shift+F10 entry point.
@@ -922,13 +914,6 @@ class AudioEditorLauncher:
         _rebrand_all_owned_windows(pid)
         _apply_brand_icon(hwnd)
         self._spawning = False
-        # First-launch hint overlay: tell the user they can drop a file
-        # directly on the waveform. Tenacity already accepts file
-        # drops natively, the overlay just teaches discoverability.
-        try:
-            self._show_drop_hint()
-        except Exception as e:
-            logger.debug(f'drop hint failed: {e}')
         logger.info(f'audio editor window hwnd={hwnd}, brand rewrites applied')
 
         while not self._stop_title_thread.is_set():
@@ -956,227 +941,12 @@ class AudioEditorLauncher:
             time.sleep(_TITLE_POLL_S)
 
         # Process / window gone, clear state so next toggle respawns.
-        # Also tear down the drop-file hint overlay if the user closed
-        # the editor before the auto-dismiss timer fired, otherwise the
-        # orphaned card lingers on the Audio editor tab.
-        self._close_drop_hint()
         self._hwnd = 0
-
-    def _show_drop_hint(self) -> None:
-        """Pop a small, friendly overlay over Tenacity's main window
-        telling the user they can drop any audio or video file onto
-        the waveform area to load it. Auto-dismisses on click or after
-        8 seconds. No-op if we don't have a Tk root available (e.g.
-        running outside the main app) or the editor window can't be
-        located after several retries.
-
-        Retries are necessary: when Tenacity's main window first appears
-        it may not be sized yet (still in the middle of layout), so
-        GetWindowRect returns a zero rect. Without retry we silently
-        give up and the hint never shows even though everything is
-        wired correctly.
-        """
-        if (sys.platform != 'win32'
-                or not self._tk_root
-                or not self._hwnd
-                or self._hint_overlay is not None):
-            return
-
-        # Wait up to ~2s for Tenacity's window to be sized + on-screen.
-        # The title-keeper thread already polled GetWindowRect so the
-        # short retry here only covers the gap between "window found"
-        # and "window laid out".
-        rect = wintypes.RECT()
-        cx = cy = None
-        for _ in range(20):   # 20 × 0.1s = 2s
-            try:
-                _user32.GetWindowRect(self._hwnd, ctypes.byref(rect))
-                if rect.right > rect.left and rect.bottom > rect.top:
-                    # Also require the window to be ON the screen
-                    # (Tenacity sometimes briefly positions itself at
-                    # x=-32000 during startup). x=-32000 is the "hidden"
-                    # signal — wait until it moves to real coords.
-                    if rect.left > -10000:
-                        cx = (rect.left + rect.right) // 2
-                        cy = (rect.top + rect.bottom) // 2
-                        break
-            except Exception:
-                pass
-            time.sleep(0.1)
-        if cx is None or cy is None:
-            logger.debug('drop hint: editor window never positioned, giving up')
-            return
-
-        def _build():
-            try:
-                import tkinter as _tk
-                import customtkinter as _ctk
-                # Lazy import the theme constants — top-of-file import
-                # would create a circular dependency in dev contexts.
-                from theme import (SURFACE, ACCENT, ACCENTL, TEXT_P,
-                                   TEXT_S, FONT_FAMILY)
-
-                tl = _tk.Toplevel(self._tk_root)
-                tl.overrideredirect(True)
-                # No -topmost: the overlay must NOT float above other
-                # apps system-wide. It's a hint that belongs with the
-                # editor; if the user switches to YouTube or any other
-                # app, the overlay should disappear behind it (normal
-                # z-order behaviour). We still lift() it above the
-                # editor at creation time via Win32 SetWindowPos with
-                # SWP_NOACTIVATE so the user sees it without stealing
-                # focus from the editor.
-                try:
-                    tl.attributes('-alpha', 0.95)
-                except Exception:
-                    pass
-
-                frame = _ctk.CTkFrame(
-                    tl, fg_color=SURFACE, corner_radius=14,
-                    border_color=ACCENT, border_width=2)
-                frame.pack(padx=2, pady=2)
-
-                _ctk.CTkLabel(
-                    frame,
-                    text='🎵  Drop an audio or video file',
-                    font=(FONT_FAMILY, 16, 'bold'),
-                    text_color=TEXT_P,
-                ).pack(padx=28, pady=(22, 8))
-                _ctk.CTkLabel(
-                    frame,
-                    text='click to dismiss',
-                    font=(FONT_FAMILY, 10, 'italic'),
-                    text_color=TEXT_S,
-                ).pack(padx=28, pady=(0, 18))
-
-                tl.update_idletasks()
-                w, h = tl.winfo_width(), tl.winfo_height()
-                tl.geometry(f'+{cx - w // 2}+{cy - h // 2}')
-
-                # Lift above the editor without stealing focus. HWND_TOP
-                # = 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE = 0x13.
-                # The overlay rises in non-topmost z-order so it paints
-                # above the editor right now, but ANY app the user
-                # clicks afterwards goes above it (which is what we
-                # want — overlay is editor-companion, not system-wide).
-                # Target the OS top-level HWND. tl is overrideredirect,
-                # so tl.winfo_id() returns the inner child HWND which
-                # silently no-ops on SetWindowPos. See
-                # win_helpers.top_level_hwnd().
-                try:
-                    from win_helpers import top_level_hwnd
-                    _user32.SetWindowPos(
-                        top_level_hwnd(tl), 0, 0, 0, 0, 0,
-                        0x0001 | 0x0002 | 0x0010)
-                except Exception:
-                    pass
-
-                def _close(_e=None):
-                    try:
-                        tl.destroy()
-                    except Exception:
-                        pass
-                    self._hint_overlay = None
-
-                # Click anywhere on the overlay closes it.
-                tl.bind('<Button-1>', _close)
-                for w_child in (frame,) + tuple(frame.winfo_children()):
-                    try:
-                        w_child.bind('<Button-1>', _close)
-                    except Exception:
-                        pass
-
-                # Auto-close after 12 seconds in case user ignores it.
-                # Longer than the old 8s — gives Tenacity full time to
-                # finish loading + showing its own logo + chrome so the
-                # hint definitely covers it during the user's first look.
-                tl.after(12000, _close)
-                self._hint_overlay = tl
-                logger.info(f'drop-hint overlay shown at ({cx},{cy})')
-            except Exception as e:
-                logger.warning(f'drop-hint overlay failed: {e}')
-
-        # Schedule build on Tk's main thread so widget creation is safe.
-        try:
-            self._tk_root.after(0, _build)
-            logger.info('drop-hint scheduled on Tk main thread')
-        except Exception as e:
-            logger.warning(f'drop-hint scheduling failed: {e}')
-
-    def _close_drop_hint(self) -> None:
-        """Tear down the drop-file hint overlay if it's still alive.
-        Safe to call from any thread, destruction is dispatched onto
-        the Tk main thread via after()."""
-        overlay = self._hint_overlay
-        if overlay is None:
-            return
-        self._hint_overlay = None
-
-        def _destroy():
-            try:
-                overlay.destroy()
-            except Exception:
-                pass
-
-        if self._tk_root is not None:
-            try:
-                self._tk_root.after(0, _destroy)
-                return
-            except Exception:
-                pass
-        # Fallback: best-effort, will warn from a non-Tk thread but
-        # the overlay is dead either way.
-        _destroy()
-
-    def _force_foreground(self, hwnd: int) -> None:
-        """Best-effort foreground promotion. Mirrors the whiteboard
-        SW_RESTORE-guarded approach so maximized windows are not
-        shrunk on the way up."""
-        if sys.platform != 'win32' or not hwnd:
-            return
-        try:
-            if _is_iconic(hwnd):
-                _user32.ShowWindow(hwnd, SW_RESTORE)
-            # Attach to the target thread's input queue, briefly, so
-            # SetForegroundWindow is allowed by Win32 focus rules.
-            fg_thread = _user32.GetWindowThreadProcessId(
-                _user32.GetForegroundWindow(), None)
-            my_thread = _kernel32.GetCurrentThreadId()
-            tgt_thread = _user32.GetWindowThreadProcessId(hwnd, None)
-            try:
-                _user32.AttachThreadInput(my_thread, fg_thread, True)
-                _user32.AttachThreadInput(my_thread, tgt_thread, True)
-            except Exception:
-                pass
-            try:
-                _user32.BringWindowToTop(hwnd)
-                _user32.SetForegroundWindow(hwnd)
-            finally:
-                try:
-                    _user32.AttachThreadInput(my_thread, fg_thread, False)
-                    _user32.AttachThreadInput(my_thread, tgt_thread, False)
-                except Exception:
-                    pass
-        except Exception as e:
-            logger.debug(f'audio editor force-foreground failed: {e}')
-
-
-# ─── Module-level singleton, mirrors how main.py talks to other launchers
-_singleton: Optional[AudioEditorLauncher] = None
-
-
-def get_launcher() -> AudioEditorLauncher:
-    global _singleton
-    if _singleton is None:
-        _singleton = AudioEditorLauncher()
-    return _singleton
-
 
 def toggle(tk_root=None) -> None:
     """Top-level convenience. main.py calls this from Shift+F10.
-    *tk_root*, if supplied, lets the launcher pop a Tk overlay over
-    the editor (e.g. the "drop a file here" hint)."""
-    launcher = get_launcher()
-    if tk_root is not None:
-        launcher._tk_root = tk_root
-    launcher.toggle()
+
+    *tk_root* is accepted for backward compatibility with the old
+    drop-hint overlay (now removed) and is otherwise unused; we just
+    forward the call through to the singleton launcher."""
+    get_launcher().toggle()

@@ -299,24 +299,44 @@ In `hotkeys.spec`:
 
 End-to-end verified: `Shift+F8` opens the Excalidraw whiteboard. Main process stable through the whole IPC test sweep (14/14 features). The three fixes that finally made it work, in order of importance:
 
-## Whiteboard subprocess launch — the THREE-pronged fix
+## Whiteboard subprocess launch — direct Popen with detach flags
 
-`subprocess.Popen()` directly spawning `Hotkeys.exe --whiteboard` killed the parent process EVERY time, even with `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB | DEVNULL stdio | close_fds=True`. No fault event was generated; the parent process simply vanished. We never fully diagnosed WHY direct spawn killed the parent (suspected Edge WebView2 COM activation under same AUMID), but three changes combined to fix it:
+**Updated 2026-06-11:** The PowerShell intermediary that was previously
+documented here is now a known anti-pattern. Use direct `subprocess.Popen`
+with the right detach flags. See `PROJECT.md` → "Subprocess spawn rule"
+for the full reasoning.
 
-### 1. PowerShell intermediary
-Instead of `subprocess.Popen([exe, '--whiteboard'])`, do:
+### 1. Direct Popen with the THREE flags (was: PowerShell intermediary)
+
+The original direct-Popen attempts that killed the parent were missing
+`CREATE_BREAKAWAY_FROM_JOB`. The earlier code only used
+`DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` — without BREAKAWAY,
+the child stays inside Hotkeys' Job Object and gets tangled up with
+the parent's WebView2 COM activation. Add BREAKAWAY and the problem
+vanishes.
 
 ```python
-ps_script = f"Start-Process -FilePath '{exe}' -ArgumentList \"--whiteboard\" -WindowStyle Hidden -WorkingDirectory '{cwd}'"
-subprocess.Popen(
-    ['powershell', '-NoProfile', '-WindowStyle', 'Hidden', '-Command', ps_script],
-    creationflags=subprocess.CREATE_NO_WINDOW,
+DETACHED  = 0x00000008
+NEW_GROUP = 0x00000200
+BREAKAWAY = 0x01000000
+proc = subprocess.Popen(
+    [exe, '--whiteboard'],
+    cwd=cwd,
+    creationflags=DETACHED | NEW_GROUP | BREAKAWAY,
     close_fds=True,
     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
 )
 ```
 
-PowerShell launches the actual whiteboard process and exits within ~1s. The whiteboard process becomes orphaned (re-parented to System) — zero linkage back to Hotkeys main process.
+### Why we ditched the PowerShell path
+
+PowerShell `Start-Process` was hitting **AVG's LOLBin scanner** —
+measured **22 seconds** of latency per launch (vs 100 ms for direct
+Popen). Whiteboard cold-launch felt broken because of this. Direct
+Popen of an already-trusted Python binary is fast.
+
+If a future direct-Popen attempt brings down the parent again,
+re-test with all three detach flags before reaching for PowerShell.
 
 ### 2. --whiteboard short-circuit at the TOP of main.py
 The whiteboard subprocess re-runs `main.py` from the top. Without an early exit, it imports every heavy module (engine, library, transcribe, faster_whisper, ctranslate2, etc), wasting ~10s and ~500MB RAM in the subprocess. Worse, that import wave somehow tangled with the parent's already-loaded state. Solution: check `--whiteboard` in `sys.argv` BEFORE any other top-level import in main.py and short-circuit to `from whiteboard import main as _wb_main; _wb_main(); sys.exit(0)`.

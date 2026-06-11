@@ -210,6 +210,35 @@ class OverlayWindow:
         if self._win:
             self._win.after(13000, self._close)
 
+    # ── Whiteboard launch pill (Shift+F8) ────────────────────────────────────
+
+    def show_whiteboard_launching(self, elapsed: float,
+                                  est_max: float = 45.0) -> None:
+        """In-progress pill while the whiteboard subprocess + WebView2
+        cold-init is running. Percentage is an estimate based on the
+        typical 45s startup window; capped at 95% so it doesn't claim
+        complete before the window actually shows."""
+        self._tick = False
+        pct = max(0, min(95, int(elapsed / est_max * 100)))
+        body = f'🖌  Launching whiteboard…  {pct}%  {elapsed:.1f}s'
+        if self._win:
+            self._set_text(body)
+            self._set_bar(ACCENT)
+        else:
+            self._build(body, _TEXT_CLR, ACCENT)
+
+    def show_whiteboard_ready(self, elapsed: float) -> None:
+        """Final pill once the whiteboard window is up. Auto-dismisses."""
+        self._tick = False
+        body = f'✓  Whiteboard ready  {elapsed:.1f}s'
+        if self._win:
+            self._set_text(body)
+            self._set_bar(OK)
+        else:
+            self._build(body, _TEXT_CLR, OK)
+        if self._win:
+            self._win.after(1800, self._close)
+
     def show_error(self, msg: str) -> None:
         self._tick = False
         short = (msg[:48] + '…') if len(msg) > 48 else msg
