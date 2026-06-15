@@ -358,7 +358,8 @@ class PromptStickyNote:
                 text = _extractor(_img)
                 self.win.after(0, lambda: self._ocr_done(text))
             except Exception as exc:
-                self.win.after(0, lambda: self._ocr_error(str(exc)))
+                msg = str(exc)
+                self.win.after(0, lambda m=msg: self._ocr_error(m))
 
         threading.Thread(target=_worker, daemon=True).start()
 

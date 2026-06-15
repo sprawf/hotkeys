@@ -178,6 +178,11 @@ if sys.platform == 'win32':
             return self._w, self._h
 
         def close(self):
+            # Guard against double-close so __exit__ + __del__ both fire
+            # without double-releasing GDI handles.
+            if getattr(self, '_closed', False):
+                return
+            self._closed = True
             try:
                 win32gui.DeleteObject(self._bmp.GetHandle())
                 self._saveDC.DeleteDC()
@@ -186,6 +191,22 @@ if sys.platform == 'win32':
                 win32gui.ReleaseDC(src, self._hdcSrc)
             except Exception:
                 pass
+
+        # Context-manager protocol so callers can guarantee GDI release
+        # via `with ScreenCapture(...) as cap:` instead of relying on
+        # __del__ at unpredictable GC time. Existing call sites that
+        # don't use `with` still get __del__ as a fallback (and are
+        # no worse than before).
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            self.close()
+            return False
+
+        def __del__(self):
+            try: self.close()
+            except Exception: pass
 
 else:
     class ScreenCapture:
@@ -977,7 +998,11 @@ class RecorderSetupDialog:
     def _pick_region(self) -> None:
         """Hide dialog, show full-screen region selector, restore dialog."""
         self.win.withdraw()
-        self.win.update()
+        # update_idletasks() flushes pending geometry/redraw work without
+        # re-entering the event loop. The old `update()` would dispatch
+        # nested <Map>/<FocusIn> handlers mid-call, occasionally racing
+        # with the region overlay's own grab.
+        self.win.update_idletasks()
 
         ov = RegionSelectorOverlay(self.win)
         self.win.wait_window(ov._win)

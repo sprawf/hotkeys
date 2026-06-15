@@ -154,7 +154,8 @@ from history_ui  import HistoryWindow
 from core.audio       import AudioCapture
 from core.vad         import SileroVAD
 from core.transcriber import Transcriber
-from core.typer       import copy_to_clipboard, paste_from_clipboard, copy_selection, undo_last
+from core.typer       import (copy_to_clipboard, paste_from_clipboard, copy_selection,
+                              undo_last, focused_text_snapshot)
 from core.sounds      import play_start, play_stop
 from screenshot       import (take_screenshot, start_prtsc_listener,
                               start_prtsc_keylogger)
@@ -854,6 +855,22 @@ class App:
         # we may still race a fast user; in that case _do_open_whiteboard
         # short-circuits via the _wb_prewarm_pid check below.
         self.root.after(500, self._prewarm_whiteboard)
+        # Mini-notepad prewarm: a hidden Toplevel so the no-editable-target
+        # fallback (Refine / Chain / Whisper into a non-pasteable surface)
+        # opens in <100 ms instead of paying a cold ~300 ms Tk init.
+        self._mini_notepad = None
+        self.root.after(800, self._prewarm_mini_notepad)
+        # Wire audio_editor spawns into the cleanup Job Object the same
+        # way whiteboard already is. Without this, killing main app
+        # ungracefully orphans Tenacity — the exact bug the Job was
+        # added to prevent. Whiteboard does this inline at its spawn
+        # site (main.py:2752); audio_editor lives in its own module so
+        # we hand it a callback instead.
+        try:
+            import audio_editor as _ae
+            _ae.set_cleanup_assigner(self._assign_to_cleanup_job)
+        except Exception as e:
+            logger.warning(f'audio_editor cleanup wiring failed: {e}')
         logger.info(f'Hotkeys v{VERSION} started.')
 
     # ── Hotkeys ───────────────────────────────────────────────────────────────
@@ -970,9 +987,30 @@ class App:
                 trigger_key = parts[-1] if parts else 'enter'
                 required_mods = parts[:-1]   # e.g. ['ctrl'] for ctrl+enter
 
+                # keyboard.is_pressed walks the library's internal state
+                # under a lock and is too slow for the LL hook callback's
+                # ~300 ms budget — Windows uninstalls our hook if we miss
+                # it. Use raw GetAsyncKeyState (one syscall, no lock)
+                # against the mod's VK directly. _MOD_VKS maps the
+                # textual modifier name to its Win32 VK code.
+                _MOD_VKS = {
+                    'ctrl': 0x11, 'control': 0x11,
+                    'shift': 0x10,
+                    'alt': 0x12, 'menu': 0x12,
+                    'win': 0x5B, 'windows': 0x5B, 'super': 0x5B,
+                }
+                _required_vks = tuple(
+                    _MOD_VKS.get(m) for m in required_mods if _MOD_VKS.get(m))
+                _gaks = ctypes.windll.user32.GetAsyncKeyState if sys.platform == 'win32' else None
+
                 def _mods_held() -> bool:
+                    if _gaks is None:
+                        return True   # non-Windows: trust the hotkey
                     try:
-                        return all(keyboard.is_pressed(m) for m in required_mods)
+                        for vk in _required_vks:
+                            if not (_gaks(vk) & 0x8000):
+                                return False
+                        return True
                     except Exception:
                         return False
 
@@ -1027,6 +1065,12 @@ class App:
                     continue
                 def _make_ph_handler(idx=_idx):
                     def _handler():
+                        # Same cursor-latching rationale as _hk_refine —
+                        # the eventual Refining pill should anchor where
+                        # the user was looking when they hit the per-
+                        # prompt hotkey, not after the LLM round-trip.
+                        from overlay import latch_hotkey_cursor
+                        latch_hotkey_cursor()
                         self._q.put_nowait(('prompt_hotkey', idx))
                     return _handler
                 try:
@@ -1689,6 +1733,11 @@ class App:
 
     def _hk_refine(self) -> None:
         logger.info('Refine hotkey fired.')
+        # Snapshot cursor NOW so any pill that appears after the
+        # 0.5 s shift-release wait + 1-3 s LLM round-trip anchors to
+        # where the user was looking when they pressed the hotkey.
+        from overlay import latch_hotkey_cursor
+        latch_hotkey_cursor()
         threading.Thread(target=self._capture_and_queue, daemon=True).start()
 
     @staticmethod
@@ -1739,11 +1788,19 @@ class App:
             except Exception:
                 # Source app still holds OpenClipboard — wait a tick.
                 continue
-            if current and current.strip() and current != prev:
-                captured = current
-                break
-            # On non-Windows or fallback path, keep polling content too.
-            if sys.platform != 'win32' and current and current != prev:
+            # Accept the read if EITHER:
+            #   (a) the OS clipboard sequence counter bumped — Ctrl+C
+            #       reached the target and the clipboard was rewritten,
+            #       so `current` is the freshly-selected text even if
+            #       it happens to equal `prev` (very common when the
+            #       user already manually copied that same string a
+            #       moment earlier); OR
+            #   (b) content differs from prev — fallback for the
+            #       non-Windows path that has no seq counter.
+            # The old check (`current != prev` only) returned 'no text
+            # selected' whenever the user pressed Shift+F4 over their
+            # own previously-copied text — even though the copy worked.
+            if current and current.strip() and (seq_changed or current != prev):
                 captured = current
                 break
         if captured:
@@ -1795,6 +1852,9 @@ class App:
 
     def _hk_ask(self) -> None:
         """Shift+F4, capture selected text and show answer pill."""
+        # Snapshot cursor NOW (see _hk_refine for the full reasoning).
+        from overlay import latch_hotkey_cursor
+        latch_hotkey_cursor()
         # Re-press guard: a 2nd press while the first is still in flight
         # would spawn a 2nd clipboard capture (race against the prev
         # restore) AND fire a 2nd LLM/vision call (real $). Cleared by
@@ -1816,7 +1876,35 @@ class App:
         a stale screenshot lurking in the user's clipboard (e.g. from a
         browser tab-strip copy hours ago) would override a freshly-selected
         question like "Why is the sky blue?". Fresh user intent always wins.
+
+        Always-queue guarantee: on EVERY exit path (including unhandled
+        exceptions) this function enqueues an 'ask' message so _do_ask
+        runs on the main thread and clears _ask_in_progress. Without this
+        guarantee, a single error inside this worker leaves the flag set
+        forever and Shift+F4 is silently dead until the user restarts.
         """
+        # Track whether ANY queue message has been put. The finally block
+        # below queues an error fallback if nothing did, so _do_ask is
+        # guaranteed to run and clear _ask_in_progress.
+        _queued = [False]
+        _orig_put = self._q.put_nowait
+        def _tracked_put(msg):
+            _queued[0] = True
+            _orig_put(msg)
+        # Local rebind only inside this function — keep the original
+        # for the rest of the app.
+        put = _tracked_put
+        try:
+            self._capture_and_queue_ask_impl(put)
+        except Exception as exc:
+            logger.exception(f'Ask: unhandled error in capture worker: {exc}')
+        finally:
+            if not _queued[0]:
+                logger.warning('Ask: worker exited without queuing — fallback to NO_TEXT so _ask_in_progress clears')
+                try: _orig_put(('ask', _ASK_NO_TEXT))
+                except Exception: pass
+
+    def _capture_and_queue_ask_impl(self, put) -> None:
         # ── Priority 0: screenshot overlay with active selection ─────────────
         # Check BEFORE the Shift-release wait so the overlay closes immediately.
         from screenshot import _overlay_active, _pending_overlay
@@ -1833,9 +1921,9 @@ class App:
                         logger.info(
                             f'Ask: overlay OCR gave ({len(captured)} chars): {captured[:80]!r}')
                         if _ocr_is_no_text(captured):
-                            self._q.put_nowait(('ask', _ASK_NO_TEXT))
+                            put(('ask', _ASK_NO_TEXT))
                         else:
-                            self._q.put_nowait(('ask', captured))
+                            put(('ask', captured))
                         return
                     except Exception as exc:
                         logger.warning(f'Ask: overlay OCR failed ({exc}), falling back')
@@ -1858,7 +1946,7 @@ class App:
         captured = self._capture_selection_via_clipboard()
         if captured:
             logger.info(f'Ask: selected-text captured ({len(captured)} chars): {captured[:80]!r}')
-            self._q.put_nowait(('ask', captured))
+            put(('ask', captured))
             return
 
         # No selection captured. prev never changed, so nothing to restore.
@@ -1874,9 +1962,9 @@ class App:
                     captured  = extractor(img).strip()
                     logger.info(f'Ask: OCR gave ({len(captured)} chars): {captured[:80]!r}')
                     if _ocr_is_no_text(captured):
-                        self._q.put_nowait(('ask', _ASK_NO_TEXT))
+                        put(('ask', _ASK_NO_TEXT))
                     else:
-                        self._q.put_nowait(('ask', captured))
+                        put(('ask', captured))
                     return
                 except Exception as exc:
                     logger.warning(f'Ask: clipboard OCR failed ({exc}); no question available')
@@ -1887,7 +1975,7 @@ class App:
 
         # Nothing usable found.
         logger.info('Ask: nothing to ask about (no selection, no clipboard image)')
-        self._q.put_nowait(('ask', _ASK_NO_TEXT))
+        put(('ask', _ASK_NO_TEXT))
 
     def _close_all_ask_pills(self) -> None:
         """Close every tracked AskPill. Safe to call from main thread."""
@@ -2387,6 +2475,70 @@ class App:
         except Exception as e:
             logger.warning(f'Quick Notes pre-warm failed: {e}')
 
+    def _prewarm_mini_notepad(self) -> None:
+        """Create a hidden MiniNotepad once at idle so the first time it
+        is needed (Refine / Chain / Whisper into a non-pasteable target)
+        deiconify is near-instant. Cold Toplevel cost is ~250-350 ms;
+        deiconify after prewarm is ~30-80 ms."""
+        try:
+            from mini_notepad import prewarm
+            self._mini_notepad = prewarm(self.root)
+            logger.info('MiniNotepad pre-warmed (hidden).')
+        except Exception as e:
+            logger.warning(f'MiniNotepad pre-warm failed: {e}')
+
+    # Post-paste verification window: how long we wait after sending
+    # Ctrl+V before re-reading the focused element's text. Needs to
+    # cover the slowest expected paste round-trip (AV clipboard scans
+    # add up to ~200 ms on this machine; Chromium's lazy a11y add more
+    # on first hit). 350 ms is safe without feeling laggy.
+    _PASTE_VERIFY_MS = 350
+
+    def _paste_then_verify(self, text: str) -> None:
+        """Send Ctrl+V immediately, then 350 ms later check whether the
+        focused element's text content actually changed. If it didn't,
+        open MiniNotepad with `text` so the user doesn't silently lose
+        the result. This is the post-hoc "paste failed" fallback — the
+        normal path is identical to the pre-change behavior.
+
+        Snapshot logic: ValuePattern.CurrentValue or
+        TextPattern.DocumentRange.GetText, whichever the focused
+        element exposes. If neither is available (None), we treat the
+        before-and-after match as "paste landed on a surface that
+        doesn't expose text" — same conservative rule: fall back to
+        MiniNotepad. The user can always re-paste manually from the
+        still-warm clipboard if the fallback was wrong.
+        """
+        before = focused_text_snapshot()
+        paste_from_clipboard()
+        self.root.after(self._PASTE_VERIFY_MS,
+                        lambda: self._verify_paste_landed(text, before))
+
+    def _verify_paste_landed(self, text: str, before) -> None:
+        try:
+            after = focused_text_snapshot()
+        except Exception:
+            after = before   # treat any read failure as "unknown, don't fallback"
+        if before == after:
+            logger.info(
+                f'Paste did not visibly land (focused text unchanged'
+                f', len before={len(before) if before else 0}'
+                f', after={len(after) if after else 0}); opening MiniNotepad')
+            self._show_mini_notepad(text)
+
+    def _show_mini_notepad(self, text: str) -> None:
+        """Show the prewarmed MiniNotepad with `text` loaded. Recreates
+        it if the prior instance was destroyed (e.g. user closed via X)."""
+        try:
+            inst = getattr(self, '_mini_notepad', None)
+            if inst is None or not inst.winfo_exists():
+                from mini_notepad import MiniNotepad
+                inst = MiniNotepad(self.root)
+                self._mini_notepad = inst
+            inst.show_text(text)
+        except Exception as e:
+            logger.warning(f'MiniNotepad show failed: {e}')
+
     def _prewarm_whiteboard(self) -> None:
         """Spawn whiteboard.py hidden at app idle so the first Shift+F8 is
         an instant ShowWindow on the existing WebView2 window instead of a
@@ -2673,6 +2825,8 @@ class App:
 
     def _hk_download_url(self) -> None:
         """Ctrl+Alt+D, capture URL from selection or clipboard, queue download."""
+        from overlay import latch_hotkey_cursor
+        latch_hotkey_cursor()
         threading.Thread(target=self._capture_and_queue_download, daemon=True).start()
 
     def _capture_and_queue_download(self) -> None:
@@ -2882,6 +3036,15 @@ class App:
         try:
             import ctypes
             u, k = ctypes.windll.user32, ctypes.windll.kernel32
+            # restype/argtypes so HWND results don't truncate to 32-bit;
+            # without this the GetWindowThreadProcessId call below could
+            # see a corrupted HWND and lose the foreground thread id.
+            u.GetForegroundWindow.restype       = ctypes.c_void_p
+            u.GetWindowThreadProcessId.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
+            u.BringWindowToTop.argtypes         = (ctypes.c_void_p,)
+            u.IsIconic.argtypes                 = (ctypes.c_void_p,)
+            u.ShowWindow.argtypes               = (ctypes.c_void_p, ctypes.c_int)
+            u.SetForegroundWindow.argtypes      = (ctypes.c_void_p,)
             fg = u.GetForegroundWindow()
             fg_t = u.GetWindowThreadProcessId(fg, None) if fg else 0
             cur = k.GetCurrentThreadId()
@@ -2904,6 +3067,8 @@ class App:
 
     def _hk_chain(self) -> None:
         """Shift+F6 (or per-chain hotkey), capture text and run active chain."""
+        from overlay import latch_hotkey_cursor
+        latch_hotkey_cursor()
         # Re-press guard: a 2nd press while the first chain is running
         # would spawn another runner thread (parallel LLM calls + racing
         # paste_from_clipboard at the end). Cleared by _run_chain on
@@ -2997,11 +3162,12 @@ class App:
                 if not result or not result.strip():
                     raise RuntimeError(f'Step {i + 1} ({lbl}) returned empty response')
                 current_text = result.strip()
-            # All steps done, paste result
+            # All steps done, paste result (with post-paste verification —
+            # MiniNotepad fallback fires only if the text didn't visibly land).
             name = chain.get('name', 'Chain')
             self.root.after(0, lambda: self.chain_overlay.show_chain_done(name))
             pyperclip.copy(current_text)
-            self.root.after(40, paste_from_clipboard)
+            self.root.after(40, lambda t=current_text: self._paste_then_verify(t))
             self.root.after(150, self._reregister_after_action)
             logger.info(f'Chain "{name}" complete, {len(steps)} steps')
         except Exception as ex:
@@ -3098,12 +3264,16 @@ class App:
                 logger.warning(f'Could not register chain hotkey {hk!r}: {e}')
 
     def _hk_undo_refine(self) -> None:
+        from overlay import latch_hotkey_cursor
+        latch_hotkey_cursor()
         self._q.put_nowait(('undo_refine', None))
 
     def _hk_library(self) -> None:
         self._q.put_nowait(('library', None))
 
     def _hk_whisper(self) -> None:
+        from overlay import latch_hotkey_cursor
+        latch_hotkey_cursor()
         if not self._whisper_recording:
             self._q.put_nowait(('whisper:start', None))
         else:
@@ -6062,10 +6232,11 @@ class App:
         elapsed = time.time() - self._refine_t0
         self.refine_overlay.show_done(elapsed)
         pyperclip.copy(result)
-        # Use direct Win32 SendInput (same path as whisper), avoids routing
-        # through the keyboard library, which can leave its key-state machine
-        # stale (stuck modifier keys) and break subsequent hotkeys.
-        self.root.after(40, paste_from_clipboard)
+        # Send Ctrl+V immediately (identical to the original behavior)
+        # and 350 ms later check whether the focused element's text
+        # actually changed. If it didn't, the paste went nowhere — open
+        # MiniNotepad with the result so the user doesn't lose it.
+        self.root.after(40, lambda: self._paste_then_verify(result))
         # Re-register hotkeys after the paste lands, resets any library state
         # corruption that injected Ctrl+V events may have caused.
         self.root.after(150, self._reregister_after_action)
@@ -6882,8 +7053,9 @@ class App:
                         logger.warning(f'undo-stray-enter failed: {e}')
                 self.root.after(80, _undo_stray_enter)
             # Slight extra delay so the foreground swap has time to land
-            # before SendInput fires Ctrl+V.
-            self.root.after(160, paste_from_clipboard)
+            # before SendInput fires Ctrl+V. Verifies post-paste — if the
+            # transcript didn't actually land, MiniNotepad opens.
+            self.root.after(160, lambda t=text: self._paste_then_verify(t))
         # Re-register after paste for the same reason as refine, injected
         # Ctrl+V can leave the keyboard library's state stale.
         self.root.after(150, self._reregister_after_action)
@@ -7626,6 +7798,32 @@ class App:
             '__test_chat_editable_transcript':
                 lambda: self._test_chat_editable_transcript(),
         }
+        def _handle_conn(conn):
+            # Per-connection handler. Spun up on its own thread so a
+            # slow/silent client can't block any other IPC caller. The
+            # accept loop now spends ~0 ms on each connection.
+            try:
+                conn.settimeout(2.0)
+                try:
+                    raw = conn.recv(256)
+                except Exception:
+                    raw = b''
+                cmd = raw.decode('utf-8', errors='replace').strip()[:64]
+                if not cmd:
+                    return
+                logger.info(f'IPC: received {cmd!r}')
+                if cmd in _VALID:
+                    self._q.put_nowait((cmd, None))
+                    logger.info(f'IPC: queued {cmd!r}')
+                elif cmd in _DIRECT_CALL:
+                    self.root.after(0, _DIRECT_CALL[cmd])
+                    logger.info(f'IPC: dispatched {cmd!r}')
+                else:
+                    logger.warning(f'IPC: rejected unknown cmd {cmd!r}')
+            finally:
+                try: conn.close()
+                except Exception: pass
+
         try:
             with _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM) as srv:
                 srv.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
@@ -7637,35 +7835,13 @@ class App:
                     except Exception as e:
                         logger.warning(f'IPC accept failed: {e}')
                         continue
-                    try:
-                        # 2 s recv budget: a client that never sends used
-                        # to wedge the single-threaded accept loop and
-                        # silently lock out every other IPC caller
-                        # forever. Bounded timeout means the worst case
-                        # is one rejected command, not a permanent stall.
-                        conn.settimeout(2.0)
-                        try:
-                            raw = conn.recv(256)
-                        except Exception:
-                            raw = b''
-                        # Strip newlines / trailing whitespace so a
-                        # 'cmd\n' from a shell-friendly client still
-                        # matches. Cap to a sane length defensively.
-                        cmd = raw.decode('utf-8', errors='replace').strip()[:64]
-                        if not cmd:
-                            continue
-                        logger.info(f'IPC: received {cmd!r}')
-                        if cmd in _VALID:
-                            self._q.put_nowait((cmd, None))
-                            logger.info(f'IPC: queued {cmd!r}')
-                        elif cmd in _DIRECT_CALL:
-                            self.root.after(0, _DIRECT_CALL[cmd])
-                            logger.info(f'IPC: dispatched {cmd!r}')
-                        else:
-                            logger.warning(f'IPC: rejected unknown cmd {cmd!r}')
-                    finally:
-                        try: conn.close()
-                        except Exception: pass
+                    # Hand off to a worker thread so the accept loop
+                    # never waits on a slow client. Daemon so app shutdown
+                    # doesn't have to enumerate and join them.
+                    threading.Thread(
+                        target=_handle_conn, args=(conn,),
+                        daemon=True, name='ipc-conn',
+                    ).start()
         except Exception as e:
             logger.warning(f'IPC listener failed: {e}')
 

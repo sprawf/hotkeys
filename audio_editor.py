@@ -221,6 +221,26 @@ if sys.platform == 'win32':
         wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
     _user32.SetClassLongPtrW.restype = ctypes.c_void_p
 
+    # Same protection for the HWND/HMENU-returning Win32 calls in the
+    # rebrand walker. Without explicit restypes ctypes defaults to c_int
+    # which silently truncates handle values on 64-bit Windows. The
+    # GetParent comparison at line 582 is especially dangerous — a
+    # truncated parent would compare unequal to a truncated `hwnd` even
+    # when they're the same window.
+    _user32.GetParent.restype           = ctypes.c_void_p
+    _user32.GetParent.argtypes          = (ctypes.c_void_p,)
+    _user32.GetMenu.restype             = ctypes.c_void_p
+    _user32.GetMenu.argtypes            = (ctypes.c_void_p,)
+    _user32.GetSubMenu.restype          = ctypes.c_void_p
+    _user32.GetSubMenu.argtypes         = (ctypes.c_void_p, ctypes.c_int)
+    _user32.GetMenuItemCount.argtypes   = (ctypes.c_void_p,)
+    _user32.DrawMenuBar.argtypes        = (ctypes.c_void_p,)
+    _user32.EnumChildWindows.argtypes   = (ctypes.c_void_p, _EnumWindowsProc, wintypes.LPARAM)
+    _user32.GetClassNameW.argtypes      = (ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int)
+    _user32.IsWindowVisible.argtypes    = (ctypes.c_void_p,)
+    _user32.ShowWindow.argtypes         = (ctypes.c_void_p, ctypes.c_int)
+    _user32.SetWindowTextW.argtypes     = (ctypes.c_void_p, ctypes.c_wchar_p)
+
 
 # Cached HICON for the Hotkeys brand mark, loaded lazily on first use.
 # Applied to every Tenacity-owned window so the upstream logo never
@@ -876,6 +896,13 @@ class AudioEditorLauncher:
                 close_fds=True,
             )
             logger.info(f'Launched audio editor pid={self._proc.pid}')
+            # Attach to the cleanup Job Object so this child dies if
+            # the main process is force-killed. Best-effort.
+            if _CLEANUP_ASSIGNER is not None:
+                try:
+                    _CLEANUP_ASSIGNER(self._proc.pid)
+                except Exception as e:
+                    logger.warning(f'audio editor cleanup-job assign failed: {e}')
         except Exception as e:
             _show_fatal(DISPLAY_TITLE, f'Failed to launch audio editor:\n{e}')
             logger.error(f'audio editor launch failed: {e}')
@@ -942,6 +969,34 @@ class AudioEditorLauncher:
 
         # Process / window gone, clear state so next toggle respawns.
         self._hwnd = 0
+
+_LAUNCHER: Optional['AudioEditorLauncher'] = None
+# Optional callback (set by main.py at boot) that adds a spawned child
+# pid to the app's Win32 cleanup Job Object so a force-kill of the main
+# process reaps the Tenacity child too. Without this set, the editor
+# orphans when the main app crashes — the exact bug the Job Object was
+# added to prevent for whiteboard. Default no-op keeps standalone runs
+# of this module working.
+_CLEANUP_ASSIGNER = None
+
+
+def set_cleanup_assigner(fn) -> None:
+    """main.py calls this once after creating the cleanup Job Object so
+    every Audio Editor spawn from this point gets reaped on app exit."""
+    global _CLEANUP_ASSIGNER
+    _CLEANUP_ASSIGNER = fn
+
+
+def get_launcher() -> 'AudioEditorLauncher':
+    """Module-level singleton accessor. The launcher owns one Tenacity
+    child process for the app's lifetime; spinning up a second one per
+    Shift+F10 press would orphan the previous window and double the
+    RAM footprint. Lazy so importing this module doesn't construct it."""
+    global _LAUNCHER
+    if _LAUNCHER is None:
+        _LAUNCHER = AudioEditorLauncher()
+    return _LAUNCHER
+
 
 def toggle(tk_root=None) -> None:
     """Top-level convenience. main.py calls this from Shift+F10.

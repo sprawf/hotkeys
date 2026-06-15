@@ -1,5 +1,6 @@
 """Settings window, General / Providers / Whisper tabs, sidebar layout."""
 import subprocess
+import sys
 import threading
 import tkinter as tk
 from typing import Callable
@@ -212,7 +213,16 @@ class SettingsWindow:
         def _open_folder(path: str) -> None:
             p = Path(path)
             p.mkdir(parents=True, exist_ok=True)
-            subprocess.Popen(['explorer', os.path.normpath(str(p))])
+            # Subprocess spawn rule (PROJECT.md #12): CREATE_NO_WINDOW +
+            # close_fds even for explorer (otherwise the spawning console,
+            # in source mode, briefly flashes).
+            flags = (subprocess.CREATE_NO_WINDOW
+                     if sys.platform == 'win32' else 0)
+            subprocess.Popen(
+                ['explorer', os.path.normpath(str(p))],
+                creationflags=flags,
+                close_fds=True,
+            )
 
         def _path_row(label_text: str, path: str, note: str) -> None:
             pf = ctk.CTkFrame(frame, fg_color=SURF2, corner_radius=RADIUS_SM)

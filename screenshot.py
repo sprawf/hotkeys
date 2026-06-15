@@ -43,6 +43,18 @@ _user32.CallNextHookEx.argtypes = [
 ]
 _user32.CallNextHookEx.restype = _LRESULT
 
+# HWND-returning calls in _get_foreground_window_info() need explicit
+# restypes so they don't truncate to 32-bit. The PrtSc telemetry path
+# passes the result into other Win32 calls — a truncated HWND there
+# yields garbage process names and titles for the rare hi-bit window.
+_user32.GetForegroundWindow.restype       = ctypes.c_void_p
+_user32.GetWindowTextLengthW.argtypes     = (ctypes.c_void_p,)
+_user32.GetWindowTextW.argtypes           = (ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int)
+_user32.GetWindowThreadProcessId.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.wintypes.DWORD))
+ctypes.windll.kernel32.OpenProcess.restype  = ctypes.c_void_p
+ctypes.windll.kernel32.OpenProcess.argtypes = (ctypes.wintypes.DWORD, ctypes.wintypes.BOOL, ctypes.wintypes.DWORD)
+ctypes.windll.kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+
 _HOOKPROC = ctypes.WINFUNCTYPE(
     _LRESULT, ctypes.c_int, ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM,
 )
@@ -400,7 +412,17 @@ class ScreenshotOverlay:
             dim_img = ImageEnhance.Brightness(self._shot).enhance(_DIM_FACTOR)
 
         if self._root_ref is None:
-            # Fallback: create our own Tk root (legacy threaded path)
+            # Fallback: create our own Tk root (legacy threaded path).
+            # In modern use this branch should never run — the main app
+            # always passes its root via _root_ref. If we see this in
+            # production, the second tk.Tk() would create a second Tcl
+            # interpreter in one process (undefined behavior: grab and
+            # event-loop conflicts). Log loudly so it's visible.
+            import logging as _lg
+            _lg.getLogger(__name__).warning(
+                'screenshot: legacy tk.Tk() fallback engaged — '
+                '_root_ref was None. Caller should pass an existing root.'
+            )
             self._root = tk.Tk()
             self._root.withdraw()
         else:
@@ -1561,7 +1583,7 @@ class ScreenshotOverlay:
         img = self._render()
         if not img:
             return
-        import tempfile, os
+        import tempfile, os, threading
         tmp = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
         tmp.close()
         try:
@@ -1569,8 +1591,19 @@ class ScreenshotOverlay:
             # 'print' verb opens the OS print dialog for the image
             ctypes.windll.shell32.ShellExecuteW(
                 None, 'print', tmp.name, None, None, 0)
+            # ShellExecute is async — the print dialog can stay open for
+            # minutes. Schedule deletion 5 min out so the temp doesn't
+            # accumulate in %TEMP% per print. If user is still printing
+            # at the 5 min mark, Windows handles the in-use case (silent
+            # PermissionError caught below).
+            def _gc(path=tmp.name):
+                try: os.unlink(path)
+                except Exception: pass
+            threading.Timer(300, _gc).start()
         except Exception as e:
             print(f'Screenshot print error: {e}')
+            try: os.unlink(tmp.name)
+            except Exception: pass
         # Don't close overlay, let user continue after printing
 
     def _copy(self) -> None:

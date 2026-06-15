@@ -836,6 +836,105 @@ was violated. Hunt for the slow callback.
 
 ---
 
+## ⚠ Undefined-name rule (NameError prevention)
+
+Python doesn't complain when you reference a name that doesn't exist —
+it only crashes when the line runs. For tray apps, that means the bug
+sits dormant until the user presses the hotkey, then their action
+silently fails with no UI feedback. We've shipped this five times in
+one session:
+
+| Site | Bug | Symptom |
+|---|---|---|
+| `audio_editor.py` | `get_launcher()` called but never defined | Shift+F10 silently failed every press |
+| `library.py` | `exc` in lambda after `except Exception as exc:` block | OCR error path crashed with NameError instead of showing the real cause |
+| `quicknotes.py` (×2) | Same `exc`-in-lambda pattern | Proofread + chat-proofread failures crashed |
+| `sticky_note.py` | Same `exc`-in-lambda pattern | Per-prompt OCR error handler crashed |
+| `transcribe/engine.py` | `assets_dir()` called without an in-scope import | Diarization fallback branch would crash if the bundled assets dir is missing |
+
+### Why this class of bug is special
+
+- **No import-time signal.** The Python interpreter happily compiles a
+  module that calls a function that doesn't exist. Linters catch it
+  statically; runtime doesn't.
+- **The lambda/`exc` trap is silent.** `except Exception as exc:`
+  binds `exc` only inside the except block — Python deletes it the
+  moment that block exits. Any closure that uses `exc` later (most
+  commonly a `self.after(0, lambda: fn(exc))` or
+  `threading.Thread(target=lambda: ...)`) crashes with NameError when
+  it actually runs, often hours after the error happened.
+- **Tray-app UX hides it.** Most error paths in this app are wired
+  into background-thread workers + `self.after()` callbacks. When a
+  NameError fires there, the user sees nothing — no popup, no log
+  trail unless we explicitly logged before the lambda fired.
+
+### The canonical fixes
+
+**Missing function/import:** add the import (or define the function)
+in the scope where it's used. If it's a module-level singleton like
+`get_launcher`, add an accessor:
+```python
+_LAUNCHER = None
+def get_launcher() -> AudioEditorLauncher:
+    global _LAUNCHER
+    if _LAUNCHER is None:
+        _LAUNCHER = AudioEditorLauncher()
+    return _LAUNCHER
+```
+
+**`exc` (or any captured exception variable) used inside a deferred
+callback:** stringify or bind into the closure at the catch site so
+the closure captures the value, not the name:
+```python
+# WRONG — crashes when the lambda runs, exc has been deleted by then
+except Exception as exc:
+    self.after(0, lambda: self._set_status(f'Failed: {exc}'))
+
+# RIGHT — stringify in the except block
+except Exception as exc:
+    msg = f'Failed: {exc}'
+    self.after(0, lambda m=msg: self._set_status(m))
+```
+
+The default-arg `m=msg` is what keeps the value alive across the
+boundary. Same fix applies to any local variable referenced in a
+deferred callback, not just exception names — but exception names are
+the only Python 3 case that crashes silently due to scope-deletion.
+
+### The static guard (already wired)
+
+Three layers catch this class of bug before users hit it:
+
+1. **`pyflakes` in the venv** — `E:\Hotkeys\venv\Scripts\python.exe -m
+   pyflakes <files>` reports every undefined name.
+2. **`test_undefined_names.py`** — standalone test. Run via
+   `python E:\Hotkeys\test_undefined_names.py`. Two checks:
+   pyflakes over 50 monitored files, then an import smoke test
+   for the 16 side-effect-free modules.
+3. **LAYER 0 of `.regression_sweep.py`** — runs pyflakes against every
+   source file in the repo (60 after excludes) as the first check
+   before anything else. Fails if any undefined name is found.
+
+### Self-check before declaring a feature done
+
+- [ ] If you added a function call, did you import or define it in the
+      same scope?
+- [ ] If you captured an exception via `except ... as exc:`, are you
+      ever referencing `exc` inside a `lambda` / `def` / `threading.Thread`
+      / `self.after(...)` that runs LATER? If yes, stringify or
+      default-bind it at the catch site.
+- [ ] Run `python E:\Hotkeys\test_undefined_names.py` — must say
+      `ALL STATIC CHECKS PASSED`.
+- [ ] Or run the full sweep: `python E:\Hotkeys\.regression_sweep.py` —
+      LAYER 0 must pass.
+
+If a "silent feature failure" is reported (the user pressed the hotkey
+and nothing happened, no overlay, no log entry beyond `feature toggle
+failed: ...`), this rule was violated. Grep the log for `NameError`
+or `is not defined` and the offending site is right there.
+
+---
+
 ## Key architecture rules (see FIXES.md for full history)
 
 1. **One `tk.Tk()` per process** — all windows are `Toplevel` children of `self.root`
@@ -852,3 +951,4 @@ was violated. Hunt for the slow callback.
 12. **No PowerShell intermediary for subprocess spawn — direct Popen with detach flags** — see "Subprocess spawn rule" above
 13. **Heavy native subprocesses (WebView2, Tenacity, etc.) must prewarm at boot + hide-on-close** — see "Prewarm-at-boot rule" above
 14. **Every Win32 hook callback must return in <1 ms — enqueue-only, never `put` (blocking), never `root.after`, never `logging.info`** — see "OS-callback budget rule" above
+15. **No undefined names — `pyflakes` clean before declaring done; capture `exc` into a default arg before deferring** — see "Undefined-name rule" above. Run `test_undefined_names.py` or LAYER 0 of `.regression_sweep.py`.

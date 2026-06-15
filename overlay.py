@@ -24,26 +24,65 @@ _FONT_TIMER = (FONT_MONO, 11)
 _SLOT_OFFSET = 50   # px between stacked pills
 
 
+# Module-level "cursor at the moment the last hotkey fired". Hotkey
+# handlers should call latch_hotkey_cursor() AS THEIR FIRST LINE so the
+# pill that eventually appears (potentially seconds later, after a
+# 0.5 s shift-release wait + 0.5-2.5 s clipboard polling + LLM round-
+# trip) reflects where the user was looking when they pressed the
+# hotkey — NOT wherever their mouse has drifted in the meantime.
+_hotkey_cursor_xy: tuple[int, int] | None = None
+_hotkey_cursor_ts: float = 0.0
+
+
+def latch_hotkey_cursor() -> None:
+    """Snapshot the current mouse-cursor position to be used by the next
+    pill_anchor_xy() call. Cheap (a Win32 GetCursorPos via ctypes); safe
+    to call from any thread. Hotkey callbacks should call this on entry
+    so the eventual pill anchors to the spot the user was looking at,
+    not to wherever their mouse ended up after the capture + LLM round-
+    trip."""
+    global _hotkey_cursor_xy, _hotkey_cursor_ts
+    try:
+        import ctypes, time as _time
+        # POINT.x, POINT.y are LONG (4 bytes) on x86-64 Windows.
+        class _POINT(ctypes.Structure):
+            _fields_ = [('x', ctypes.c_long), ('y', ctypes.c_long)]
+        pt = _POINT()
+        ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+        _hotkey_cursor_xy = (int(pt.x), int(pt.y))
+        _hotkey_cursor_ts = _time.time()
+    except Exception:
+        # Fall through silently — pill_anchor_xy will use the live
+        # winfo_pointerxy fallback.
+        pass
+
+
 def pill_anchor_xy(root: tk.Tk) -> tuple[int, int]:
     """Return (x, y) screen coords for a status pill — at the mouse
-    cursor + small offset. Simple, predictable, always visible.
+    cursor + small offset.
 
-    Earlier this routine tried to anchor to the foreground window's
-    corner so a hotkey-from-Notepad pill wouldn't land inside the
-    Library if the mouse happened to be parked there. But the
-    corner-anchored pill kept landing under other windows when the
-    Library overlapped the foreground app, and trying to fix that
-    with z-order / topmost games created more edge cases. The user's
-    actual preference: "show exactly where the cursor is, and on
-    top." So we do that, and the topmost handling lives on the pill
-    Toplevels themselves (see explain_pill.py and overlay._build).
-    """
+    Prefers the position captured by latch_hotkey_cursor() at the moment
+    the user pressed the hotkey, so the pill lands where they were
+    looking even if they've moved the mouse during the LLM round-trip.
+    Falls back to the live cursor (Tk's winfo_pointerxy) when no fresh
+    latch exists (e.g., for pills triggered by mouse-click UI rather
+    than a hotkey)."""
     try:
-        import logging as _logging
+        import logging as _logging, time as _time
+        # 8 seconds is roughly the worst-case round-trip for a
+        # cloud-LLM Refine on a slow connection. Beyond that, the
+        # latched position is likely stale (user has truly moved on),
+        # so revert to the live cursor.
+        if (_hotkey_cursor_xy is not None
+                and _time.time() - _hotkey_cursor_ts < 8.0):
+            mx, my = _hotkey_cursor_xy[0] + 20, _hotkey_cursor_xy[1] + 20
+            _logging.getLogger('overlay').info(
+                f'[PILL] hotkey-latched cursor ({mx},{my})')
+            return (mx, my)
         mx = root.winfo_pointerx() + 20
         my = root.winfo_pointery() + 20
         _logging.getLogger('overlay').info(
-            f'[PILL] cursor-anchor ({mx},{my})')
+            f'[PILL] live cursor ({mx},{my})')
         return (mx, my)
     except Exception:
         return (200, 200)

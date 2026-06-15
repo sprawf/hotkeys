@@ -654,10 +654,23 @@ class _OpenAICompatProvider(Provider):
 
         return _ssl_retry(_call)
 
-    @staticmethod
-    def _no_verify_kw() -> dict:
-        """Extra kwargs to disable SSL verification (antivirus workaround)."""
-        return {'http_client': _httpx.Client(verify=False)} if _httpx else {}
+    # Module-cached client. Without this, every refine() call constructed
+    # a fresh httpx.Client(verify=False) — connection pool + sockets +
+    # thread executor — that the provider SDK held but never closed.
+    # Per-call leak that grew with usage. Cached singleton matches what
+    # the SDKs do internally for the default client.
+    _SHARED_NO_VERIFY_CLIENT = None
+
+    @classmethod
+    def _no_verify_kw(cls) -> dict:
+        """Extra kwargs to disable SSL verification (antivirus workaround).
+        Reuses one process-wide httpx.Client; safe because httpx.Client is
+        documented thread-safe and idempotent across providers."""
+        if _httpx is None:
+            return {}
+        if cls._SHARED_NO_VERIFY_CLIENT is None:
+            cls._SHARED_NO_VERIFY_CLIENT = _httpx.Client(verify=False)
+        return {'http_client': cls._SHARED_NO_VERIFY_CLIENT}
 
 
 class OpenAIProvider(_OpenAICompatProvider):
@@ -738,10 +751,19 @@ class AnthropicProvider(Provider):
         except ImportError:
             raise RuntimeError('anthropic package not installed, run: pip install anthropic')
 
+        # Module-cached client for the same reason as _OpenAICompatProvider:
+        # avoid leaking a fresh httpx.Client per call.
+        if not hasattr(self.__class__, '_SHARED_NO_VERIFY_CLIENT_ANTHROPIC'):
+            self.__class__._SHARED_NO_VERIFY_CLIENT_ANTHROPIC = None
+
         def _call(verify: bool = True) -> str:
             kw: dict = {'api_key': self.api_key}
             if not verify and _httpx:
-                kw['http_client'] = _httpx.Client(verify=False)
+                if self.__class__._SHARED_NO_VERIFY_CLIENT_ANTHROPIC is None:
+                    self.__class__._SHARED_NO_VERIFY_CLIENT_ANTHROPIC = (
+                        _httpx.Client(verify=False))
+                kw['http_client'] = (
+                    self.__class__._SHARED_NO_VERIFY_CLIENT_ANTHROPIC)
             # Bound the call to 30 s + 0 retries, matching Groq/Cerebras.
             # Without this Anthropic's SDK default (~600 s, 2 retries)
             # could leave the user staring at "Thinking…" for tens of

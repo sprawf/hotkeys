@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import subprocess
+import sys
 import threading
 import tkinter as tk
 from pathlib import Path
@@ -420,7 +421,8 @@ class EditDialog(ctk.CTkToplevel):
                 text = _extractor(_img)
                 self.after(0, lambda: self._ocr_done(text))
             except Exception as exc:
-                self.after(0, lambda: self._ocr_error(str(exc)))
+                msg = str(exc)
+                self.after(0, lambda m=msg: self._ocr_error(m))
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -540,6 +542,13 @@ class HotkeyCapture(ctk.CTkToplevel):
         self.grab_set()
         self.result: str | None = None
         self._done = False
+        # Lock guards _done + result. Without it the listener thread
+        # could write `result = <captured hotkey>` after Cancel/Clear
+        # set `result = ''` on the main thread, returning the wrong
+        # value to the parent. Tiny race window in practice but the
+        # observed value was non-deterministic.
+        import threading as _th
+        self._commit_lock = _th.Lock()
 
         # ── Header, matches SettingsWindow / ThemedDialog pattern ────────────
         hdr = ctk.CTkFrame(self, fg_color=SURFACE, corner_radius=0)
@@ -633,26 +642,34 @@ class HotkeyCapture(ctk.CTkToplevel):
         """Block until a full hotkey combo is released, then commit."""
         try:
             hk = keyboard.read_hotkey(suppress=False)
-            if not self._done:
+            # Under lock so a concurrent Cancel/Clear on the main
+            # thread (which also writes _done + result) can't interleave
+            # and leave us with mixed values. _commit_lock is short-held
+            # and only acquired here + in _clear/_cancel — no deadlock.
+            with self._commit_lock:
+                if self._done:
+                    return
                 self._done  = True
                 self.result = hk
-                try:
-                    self.after(0, self.destroy)
-                except Exception:
-                    pass
+            try:
+                self.after(0, self.destroy)
+            except Exception:
+                pass
         except Exception:
             pass
 
     # ── Button handlers ───────────────────────────────────────────────────────
 
     def _clear(self) -> None:
-        self._done  = True
-        self.result = ''       # empty string → caller removes the hotkey
+        with self._commit_lock:
+            self._done  = True
+            self.result = ''       # empty string → caller removes the hotkey
         self.destroy()
 
     def _cancel(self) -> None:
-        self._done  = True
-        self.result = None     # None → caller makes no change
+        with self._commit_lock:
+            self._done  = True
+            self.result = None     # None → caller makes no change
         self.destroy()
 
     # ── Geometry ──────────────────────────────────────────────────────────────
@@ -3317,12 +3334,20 @@ class LibraryWindow:
                 file_path = str(self._macro_library._folder / f'{mid}.json')
                 def _do():
                     try:
-                        # /select highlights the specific file; works on most systems
-                        subprocess.Popen(['explorer', f'/select,{file_path}'])
+                        # /select highlights the specific file; works on most systems.
+                        # CREATE_NO_WINDOW + close_fds match PROJECT.md's
+                        # subprocess spawn rule (rule #12).
+                        flags = (subprocess.CREATE_NO_WINDOW
+                                 if sys.platform == 'win32' else 0)
+                        subprocess.Popen(
+                            ['explorer', f'/select,{file_path}'],
+                            creationflags=flags,
+                            close_fds=True,
+                        )
                     except Exception:
                         # Fallback: just open the containing folder
                         os.startfile(str(self._macro_library._folder))
-                threading.Thread(target=_do, daemon=False).start()
+                threading.Thread(target=_do, daemon=True).start()
             menu.add_command(label='📂  Open file location', command=_open_location)
             menu.add_separator()
             menu.add_command(label='✕  Delete',
@@ -5278,7 +5303,15 @@ class LibraryWindow:
             self.win.update_idletasks()
             hwnd = self.win.winfo_id()
             user32 = ctypes.windll.user32
-            top = user32.GetAncestor(hwnd, 2)   # GA_ROOT = 2
+            # restype = c_void_p so HWND results don't truncate to 32-bit
+            # on 64-bit Windows. SetWindowPos argtypes match LPARAM signs.
+            user32.GetAncestor.restype    = ctypes.c_void_p
+            user32.GetAncestor.argtypes   = (ctypes.c_void_p, ctypes.c_uint)
+            user32.GetWindowRect.argtypes = (ctypes.c_void_p, ctypes.POINTER(wintypes.RECT))
+            user32.SetWindowPos.argtypes  = (ctypes.c_void_p, ctypes.c_void_p,
+                                             ctypes.c_int, ctypes.c_int,
+                                             ctypes.c_int, ctypes.c_int, ctypes.c_uint)
+            top = user32.GetAncestor(ctypes.c_void_p(hwnd), 2)   # GA_ROOT = 2
             if not top: return
             rect = wintypes.RECT()
             if not user32.GetWindowRect(top, ctypes.byref(rect)):

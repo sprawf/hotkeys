@@ -463,7 +463,9 @@ class GifSetupDialog:
 
     def _pick_region(self) -> None:
         self.win.withdraw()
-        self.win.update()
+        # update_idletasks() instead of update(): no nested event-loop
+        # dispatch, see screen_recorder.py for the same reasoning.
+        self.win.update_idletasks()
 
         ov = RegionSelectorOverlay(self.win)
         self.win.wait_window(ov._win)

@@ -110,6 +110,14 @@ class AudioCapture:
         self._recording      = False
         self._buffer         = []
         self._interim_last_n = 0
+        # Single-worker executor for interim transcribe callbacks. The old
+        # code spawned a fresh Thread per chunk; on a long recording that's
+        # dozens of short-lived threads. With max_workers=1, a slow interim
+        # transcribe coalesces (the next chunk waits in the queue) instead
+        # of stacking up parallel work.
+        from concurrent.futures import ThreadPoolExecutor
+        self._interim_pool = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix='audio-interim')
         self._db             = -60.0
         # Resampling state, set when the chosen device rejects 16 kHz and
         # we have to open the stream at its native rate (e.g. DroidCam at
@@ -302,10 +310,15 @@ class AudioCapture:
             threading.Thread(target=self.stop_recording, daemon=True).start()
         elif should_interim and buf_snapshot:
             audio_snap = np.concatenate(buf_snapshot)
-            threading.Thread(
-                target=lambda a=audio_snap: self._on_interim(a),
-                daemon=True,
-            ).start()
+            # Single-worker pool: if the previous interim is still in
+            # flight, this submission queues behind it rather than
+            # starting another parallel transcribe.
+            try:
+                self._interim_pool.submit(self._on_interim, audio_snap)
+            except RuntimeError:
+                # Pool was shut down (recorder destructor ran while a
+                # final chunk was inflight). Drop silently.
+                pass
 
     def start_recording(self):
         with self._lock:

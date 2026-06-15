@@ -820,7 +820,8 @@ def _run_diarization_subprocess(audio_path: str, *,
         # Fall back to the main exe's bundled assets/diarization (the worker
         # spec re-bundles the same files, but if that copy is missing we can
         # share the main exe's copy).
-        model_dir = assets_dir() / 'diarization'
+        from storage import assets_dir
+        model_dir = _P(assets_dir()) / 'diarization'
 
     work_dir = _P(tempfile.mkdtemp(prefix='hotkeys_diarize_'))
     try:
@@ -865,7 +866,17 @@ def _run_diarization_subprocess(audio_path: str, *,
                     'before writing output.json'
                 )
             if _time.time() - t0 > timeout_s:
+                # terminate() sends a soft signal that ONNX-bound workers
+                # often ignore. Escalate to kill() if it doesn't exit
+                # in 3s, then await the exit so we don't orphan.
                 try: proc.terminate()
+                except Exception: pass
+                try: proc.wait(timeout=3)
+                except _sp.TimeoutExpired:
+                    try: proc.kill()
+                    except Exception: pass
+                    try: proc.wait(timeout=3)
+                    except Exception: pass
                 except Exception: pass
                 raise RuntimeError(
                     f'diarize worker did not respond within {timeout_s}s; '

@@ -149,7 +149,12 @@ def get_clipboard_image() -> tuple:
         loaded_any = False
         for path in file_list:
             try:
-                return Image.open(path).convert('RGB'), None
+                # `with` to close the file handle as soon as we have the
+                # converted copy. `.convert('RGB')` returns a new Image
+                # backed by its own buffer, so it's safe outside the
+                # context manager.
+                with Image.open(path) as src:
+                    return src.convert('RGB'), None
             except Exception:
                 loaded_any = True   # path existed but wasn't a readable image
         if loaded_any:

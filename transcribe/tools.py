@@ -127,7 +127,17 @@ def _run_ffmpeg(args: list[str],
                     pulse = min(0.95, pulse + 0.02)
                     on_progress(pulse)
     finally:
-        proc.wait()
+        # ffmpeg can hang indefinitely on a frozen mux / unreachable protocol
+        # input; without a timeout the worker thread blocks forever and the
+        # whole transcribe pipeline stalls. 30s after stderr close is far
+        # past any normal exit; if it's still alive then, kill it.
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            try: proc.kill()
+            except Exception: pass
+            try: proc.wait(timeout=5)
+            except Exception: pass
     if proc.returncode != 0:
         tail_text = '\n'.join(stderr_tail)[-1200:].strip()
         # Try to surface the most actionable line. ffmpeg's last error

@@ -17,6 +17,8 @@ except Exception:
 
 if sys.platform == 'win32':
     import ctypes
+    import threading
+    import time
     from ctypes import wintypes
 
     user32 = ctypes.windll.user32
@@ -142,6 +144,231 @@ if sys.platform == 'win32':
             ]
             _send_inputs(inputs)
 
+    # ── Editable-target detection + notepad fallback ─────────────────────────
+
+    class _GUITHREADINFO(ctypes.Structure):
+        _fields_ = [
+            ('cbSize',        wintypes.DWORD),
+            ('flags',         wintypes.DWORD),
+            ('hwndActive',    wintypes.HWND),
+            ('hwndFocus',     wintypes.HWND),
+            ('hwndCapture',   wintypes.HWND),
+            ('hwndMenuOwner', wintypes.HWND),
+            ('hwndMoveSize',  wintypes.HWND),
+            ('hwndCaret',     wintypes.HWND),
+            ('rcCaret',       wintypes.RECT),
+        ]
+
+    def _win32_caret_present() -> bool:
+        """True iff the foreground window's GUI thread has a Win32 caret.
+        Reliable for classic apps (Notepad, Word, Explorer rename box) but
+        always False for Chromium/Electron apps, which draw their own caret."""
+        try:
+            hwnd = user32.GetForegroundWindow()
+            if not hwnd:
+                return False
+            tid = user32.GetWindowThreadProcessId(hwnd, None)
+            gti = _GUITHREADINFO()
+            gti.cbSize = ctypes.sizeof(_GUITHREADINFO)
+            if not user32.GetGUIThreadInfo(tid, ctypes.byref(gti)):
+                return False
+            return bool(gti.hwndCaret)
+        except Exception:
+            return False
+
+    # UIA control types
+    _UIA_EDIT, _UIA_COMBOBOX, _UIA_GROUP, _UIA_DOCUMENT = 50004, 50003, 50026, 50030
+    # Focused control types that can never receive pasted text. Deliberately
+    # NOT exhaustive: anything unlisted is treated as unknown -> paste.
+    _UIA_NEVER_EDITABLE = {
+        50000,  # Button
+        50001,  # Calendar
+        50002,  # CheckBox
+        50005,  # Hyperlink
+        50006,  # Image
+        50007,  # ListItem
+        50008,  # List
+        50011,  # MenuItem
+        50012,  # ProgressBar
+        50013,  # RadioButton
+        50015,  # Slider
+        50018,  # TabItem
+        50020,  # Text (static)
+        50023,  # Tree
+        50024,  # TreeItem
+        50032,  # Window
+        50033,  # Pane
+        50030,  # Document (browser read mode / PDF; Word has a Win32 caret
+                #           so it is caught by the fast path before this)
+    }
+    _uia_tls = threading.local()
+    _uia_seen_pids: set = set()   # processes whose a11y tree we already woke
+
+    def _uia_focused_editable():
+        """Three-state UIA verdict on the focused element.
+
+        True  = definitely editable (paste will land)
+        False = confidently NOT editable (notepad fallback is right)
+        None  = unknown -> caller must fail open to paste
+
+        Needed because Chromium/Electron apps (Claude, Chrome, Discord,
+        VS Code...) never create a Win32 caret; UIA is the only API that
+        sees their text inputs. Observed mappings: <input>/<textarea>/
+        role=textbox -> Edit; bare contenteditable (Claude's prompt) ->
+        Group with TextPattern; read-mode page body -> Document.
+        """
+        try:
+            import comtypes
+            import comtypes.client
+            # CoInitialize once per thread (lives behind a TLS flag).
+            # Subsequent calls return S_FALSE but still bump COM's
+            # ref count, so guarding avoids needless churn.
+            if not getattr(_uia_tls, 'co_initialized', False):
+                try: comtypes.CoInitialize()
+                except Exception: pass
+                _uia_tls.co_initialized = True
+            uia = getattr(_uia_tls, 'uia', None)
+            if uia is None:
+                comtypes.client.GetModule('UIAutomationCore.dll')
+                from comtypes.gen.UIAutomationClient import (
+                    CUIAutomation, IUIAutomation)
+                uia = comtypes.client.CreateObject(
+                    CUIAutomation, interface=IUIAutomation)
+                # Cache request: fetch every property we need in ONE
+                # cross-process round trip instead of one per property.
+                req = uia.CreateCacheRequest()
+                for pid in (30003,   # ControlType
+                            30040,   # IsTextPatternAvailable
+                            30043,   # IsValuePatternAvailable
+                            30046,   # Value.IsReadOnly
+                            30095,   # LegacyIAccessible.Role
+                            30096,   # LegacyIAccessible.State
+                            30101):  # AriaRole
+                    req.AddProperty(pid)
+                _uia_tls.uia = uia
+                _uia_tls.req = req
+            el = uia.GetFocusedElementBuildCache(_uia_tls.req)
+            if el is None:
+                return None
+            ct = int(el.GetCachedPropertyValue(30003) or 0)    # ControlType
+            if ct in (_UIA_EDIT, _UIA_COMBOBOX):
+                return True
+            # Writable ValuePattern = editable regardless of control type
+            if (bool(el.GetCachedPropertyValue(30043))         # ValuePattern avail
+                    and not el.GetCachedPropertyValue(30046)):   # not read-only
+                return True
+            aria = str(el.GetCachedPropertyValue(30101) or '').lower()
+            if aria in ('textbox', 'searchbox', 'combobox'):
+                return True
+            legacy_role  = int(el.GetCachedPropertyValue(30095) or 0)
+            legacy_state = int(el.GetCachedPropertyValue(30096) or 0)
+            if legacy_role == 42 and not (legacy_state & 0x40):  # TEXT, not RO
+                return True
+            if ct == _UIA_GROUP:
+                # Chromium exposes bare contenteditable as Group+TextPattern
+                if bool(el.GetCachedPropertyValue(30040)):     # TextPattern avail
+                    return True
+                return None
+            if ct in _UIA_NEVER_EDITABLE:
+                return False
+            return None
+        except Exception:
+            return None
+
+    def focused_text_snapshot() -> str | None:
+        """Read the focused element's current text content via UIA.
+
+        Returns a string if the element exposes a ValuePattern
+        (CurrentValue) or a TextPattern (DocumentRange.GetText), else
+        None. The caller uses this for POST-paste verification: snapshot
+        before Ctrl+V, snapshot again ~300 ms after, and if both
+        snapshots are equal the paste didn't visibly land — fall back
+        to opening MiniNotepad with the text.
+
+        Truncated at 64 kB so we don't haul a whole novel across COM
+        for what's a delta check.
+        """
+        try:
+            import comtypes
+            import comtypes.client
+            if not getattr(_uia_tls, 'co_initialized', False):
+                try: comtypes.CoInitialize()
+                except Exception: pass
+                _uia_tls.co_initialized = True
+            uia = getattr(_uia_tls, 'uia', None)
+            if uia is None:
+                comtypes.client.GetModule('UIAutomationCore.dll')
+                from comtypes.gen.UIAutomationClient import (
+                    CUIAutomation, IUIAutomation)
+                uia = comtypes.client.CreateObject(
+                    CUIAutomation, interface=IUIAutomation)
+                _uia_tls.uia = uia
+            el = uia.GetFocusedElement()
+            if el is None:
+                return None
+            # ValuePattern (10002): cheapest, covers classic Edit,
+            # browser <input>, WhatsApp's chat input, address bars.
+            try:
+                vp = el.GetCurrentPattern(10002)
+                if vp:
+                    from comtypes.gen.UIAutomationClient import (
+                        IUIAutomationValuePattern)
+                    vp = vp.QueryInterface(IUIAutomationValuePattern)
+                    v = vp.CurrentValue
+                    if v is not None:
+                        return v
+            except Exception:
+                pass
+            # TextPattern (10014): contenteditable in Chromium / Word body.
+            try:
+                tp = el.GetCurrentPattern(10014)
+                if tp:
+                    from comtypes.gen.UIAutomationClient import (
+                        IUIAutomationTextPattern)
+                    tp = tp.QueryInterface(IUIAutomationTextPattern)
+                    rng = tp.DocumentRange
+                    if rng is not None:
+                        return rng.GetText(65536)
+            except Exception:
+                pass
+            return None
+        except Exception:
+            return None
+
+    def has_editable_focus_in_foreground() -> bool:
+        """Heuristic: True iff an editable text input has keyboard focus in
+        the foreground window, i.e. a Ctrl+V paste will actually land.
+        Used by Refine / Chain to decide paste vs notepad fallback.
+
+        Fail-open by design: only a *confident* UIA "not editable" verdict
+        returns False (browser read mode, PDF viewer, image viewer...).
+        Any doubt -> True, so the historical paste behavior is never
+        stolen by the notepad fallback.
+        """
+        if _win32_caret_present():
+            return True
+        verdict = _uia_focused_editable()
+        if verdict is False:
+            # Chromium builds its accessibility tree lazily on the FIRST
+            # UIA query against a process, so a first-look "not editable"
+            # can be stale. Re-ask once after a beat, but only the first
+            # time we meet this process; afterwards its tree is warm and
+            # the verdict is trustworthy immediately.
+            try:
+                pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(
+                    user32.GetForegroundWindow(), ctypes.byref(pid))
+                fresh = pid.value not in _uia_seen_pids
+                _uia_seen_pids.add(pid.value)
+            except Exception:
+                fresh = True
+            if fresh:
+                time.sleep(0.15)
+                verdict = _uia_focused_editable()
+            if verdict is False:
+                return False
+        return True
+
 # ── macOS / Linux ─────────────────────────────────────────────────────────────
 
 else:
@@ -205,3 +432,8 @@ else:
                     keyboard.send('command+z')
                 except Exception:
                     pass
+
+    def has_editable_focus_in_foreground() -> bool:
+        # No cross-platform caret API on macOS/Linux — assume editable so
+        # the existing Ctrl+V path runs (matches prior behavior).
+        return True

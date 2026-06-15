@@ -507,10 +507,12 @@ class QuickNotesWindow(ctk.CTkToplevel):
         self._chat_send_btn   = None
         self._chat_stop_btn   = None
         self._chat_title_var  = None
+        self._chat_bar_frame  = None
 
         # OCR state
         self._ocr_pending         = False
         self._ocr_staged_img      = None
+        self._ocr_staged_target   = None
         self._ocr_status_visible  = False
         self._ocr_preview_visible = False
         self._ocr_thumb_ref       = None   # PhotoImage GC guard
@@ -1651,10 +1653,26 @@ class QuickNotesWindow(ctk.CTkToplevel):
     _STATUS_H  = 26
     _PREVIEW_H = 72
 
-    def _ocr_stage(self, img) -> None:
-        self._ocr_staged_img = img
+    def _ocr_stage(self, img, target=None) -> None:
+        self._ocr_staged_img    = img
+        self._ocr_staged_target = target
         self._ocr_show_preview(img)
-        self._ocr_show_status('↵ Enter to extract  ·  Esc to cancel', _T2, dismissable=True)
+        self._ocr_show_status('↵ Extract · Esc Cancel', _T2, dismissable=True)
+
+    def _chat_bar_offset(self) -> int:
+        """Pixel height of the chat input bar (Ask follow-up… + Send) so
+        OCR overlays can sit ABOVE it in chat mode instead of covering
+        it. Returns 0 for regular text notes."""
+        bar = getattr(self, '_chat_bar_frame', None)
+        if bar is None:
+            return 0
+        try:
+            if not bar.winfo_exists():
+                return 0
+            self.update_idletasks()
+            return bar.winfo_height() or 0
+        except Exception:
+            return 0
 
     def _ocr_show_preview(self, img) -> None:
         try:
@@ -1667,10 +1685,14 @@ class QuickNotesWindow(ctk.CTkToplevel):
             self._ocr_thumb_ref = ImageTk.PhotoImage(img)
             self._ocr_thumb_lbl.configure(image=self._ocr_thumb_ref)
             if not self._ocr_preview_visible:
-                offset = -self._STATUS_H if self._ocr_status_visible else 0
+                # Preview sits at the very bottom of the content host but
+                # above the chat input bar in chat mode (offset by bar
+                # height). Status no longer overlaps since it lives in
+                # the bottom toolbar.
+                bar = self._chat_bar_offset()
                 self._ocr_preview_frame.place(
                     x=0, rely=1.0, relwidth=1.0,
-                    height=self._PREVIEW_H, anchor='sw', y=offset,
+                    height=self._PREVIEW_H, anchor='sw', y=-bar,
                 )
                 self._ocr_preview_frame.lift()
                 self._ocr_preview_visible = True
@@ -1693,14 +1715,8 @@ class QuickNotesWindow(ctk.CTkToplevel):
             else:
                 self._ocr_dismiss_btn.pack_forget()
             if not self._ocr_status_visible:
-                self._ocr_status_frame.place(
-                    x=0, rely=1.0, relwidth=1.0,
-                    height=self._STATUS_H, anchor='sw',
-                )
-                self._ocr_status_frame.lift()
+                self._ocr_status_frame.pack(fill='both', expand=True)
                 self._ocr_status_visible = True
-                if self._ocr_preview_visible:
-                    self._ocr_preview_frame.place_configure(y=-self._STATUS_H)
         except Exception as exc:
             logger.error('quicknotes: _ocr_show_status: %s', exc)
 
@@ -1708,7 +1724,7 @@ class QuickNotesWindow(ctk.CTkToplevel):
         self._ocr_staged_img = None
         self._ocr_hide_preview()
         try:
-            self._ocr_status_frame.place_forget()
+            self._ocr_status_frame.pack_forget()
             self._ocr_status_visible = False
         except Exception:
             pass
@@ -1858,7 +1874,8 @@ class QuickNotesWindow(ctk.CTkToplevel):
                     ', no explanations, no commentary.',
                 )
             except Exception as exc:
-                self.after(0, lambda: self._set_status(f'⚠ Proofread failed: {exc}', _ERR))
+                msg = f'⚠ Proofread failed: {exc}'
+                self.after(0, lambda m=msg: self._set_status(m, _ERR))
                 return
 
             def _apply():
@@ -1965,22 +1982,61 @@ class QuickNotesWindow(ctk.CTkToplevel):
         if issue in ('No text found', 'No text detected'):
             self._ocr_show_status(f'⚠ {issue}', _WARN_C, dismissable=True)
             return
-        # Clear placeholder if present, then insert
-        if self._ph:
-            self._tb.delete('1.0', 'end')
-            self._tb.configure(text_color=_T1)
-            self._ph = False
+        # Route the extracted text to whichever input is active. Chat-
+        # kind notes have a single-line CTkEntry (self._chat_input) for
+        # follow-up messages; regular text notes have the editor textbox
+        # (self._tb). The OCR staging UI is shared between the two
+        # modes, but the destination differs.
+        # In chat-kind notes the editor textbox isn't visible — the
+        # right pane is the chat transcript + a CTkEntry input. Route
+        # the extracted text into that input instead. _is_chat_note()
+        # consults the persisted note kind; _chat_input is the entry
+        # widget (None when not in chat mode).
+        target = self._ocr_staged_target
+        self._ocr_staged_target = None
+        # Validate target still exists.
         try:
-            pos = self._tb._textbox.index('insert')
+            if target is not None and not target.winfo_exists():
+                target = None
         except Exception:
-            pos = 'end'
-        self._tb.insert(pos, text)
-        self._update_wcount()
-        if issue:
-            self._ocr_show_status(f'⚠ {issue}', _WARN_C, dismissable=True)
-        else:
-            self._ocr_show_status('✓ Extracted', _OK_C, dismissable=False)
-            self.after(1400, self._ocr_hide_status)
+            target = None
+        is_chat = False
+        try: is_chat = self._is_chat_mode()
+        except Exception: pass
+        if target is None and is_chat:
+            target = getattr(self, '_chat_input', None)
+        if target is not None:
+            try: pos = target.index('insert')
+            except Exception: pos = 'end'
+            try:
+                target.insert(pos, text)
+                target.focus_set()
+                # If transcript was the target, persist the edit so the
+                # chat note saves to disk.
+                if (self._chat_transcript is not None
+                        and target is self._chat_transcript._textbox):
+                    self._chat_text_override = target.get('1.0', 'end-1c')
+                    self._chat_text_flush()
+            except Exception:
+                logger.exception('quicknotes: _ocr_done insert failed')
+        elif self._tb is not None:
+            # Regular text-note flow.
+            if self._ph:
+                self._tb.delete('1.0', 'end')
+                self._tb.configure(text_color=_T1)
+                self._ph = False
+            try:
+                pos = self._tb._textbox.index('insert')
+            except Exception:
+                pos = 'end'
+            self._tb.insert(pos, text)
+            try: self._update_wcount()
+            except Exception: pass
+        # Text was inserted: show ✓ Extracted and auto-hide so the strip
+        # doesn't sit over the input bar. The "Only N chars" warning was
+        # noisy and never auto-dismissed; trust the user to see the text.
+        self._ocr_show_status('✓ Extracted', _OK_C, dismissable=False)
+        self.after(1400, self._ocr_hide_status)
 
     def _ocr_error(self, message: str) -> None:
         self._ocr_pending = False
@@ -1994,11 +2050,11 @@ class QuickNotesWindow(ctk.CTkToplevel):
             return
         m = message.lower()
         if 'api key' in m or ('invalid' in m and 'key' in m):
-            friendly = 'No API key configured'
+            friendly = 'No API key'
         elif 'connect' in m or 'network' in m or 'timeout' in m:
-            friendly = 'Network error, check connection'
+            friendly = 'Offline'
         else:
-            friendly = f'Error: {message[:80]}'
+            friendly = message[:40]
         self._ocr_show_status(f'⚠ {friendly}', _ERR, dismissable=True)
 
     # ── Swipe gestures (book-page flip) ───────────────────────────────────────
@@ -2249,7 +2305,14 @@ class QuickNotesWindow(ctk.CTkToplevel):
         self._wcount = tk.Label(rf, text='', bg=_EDIT, fg=_T3, font=(FONT_FAMILY, 10))
         self._wcount.pack(side='left')
 
-        # Status
+        # OCR status host: persistent middle slot the OCR status strip
+        # packs into when active. Sits between the toolbar buttons and
+        # the word count so it doesn't overlap the chat input bar.
+        self._ocr_status_host = tk.Frame(bar, bg=_EDIT)
+        self._ocr_status_host.pack(side='left', fill='both', expand=True,
+                                   padx=(20, 14), pady=4)
+
+        # Status (short messages from _set_status: "Proofreading…", etc.)
         self._status = tk.Label(bar, text='', bg=_EDIT, fg=_T2, font=(FONT_FAMILY, 10))
         self._status.pack(side='left', padx=(14, 0))
 
@@ -2264,6 +2327,7 @@ class QuickNotesWindow(ctk.CTkToplevel):
         self._chat_send_btn   = None
         self._chat_stop_btn   = None
         self._chat_title_var  = None
+        self._chat_bar_frame  = None
         # Dispatch on whether we're editing a chat-kind note.
         if self._is_chat_mode():
             self._panel_chat()
@@ -2300,14 +2364,19 @@ class QuickNotesWindow(ctk.CTkToplevel):
         self._ocr_status_visible  = False
         self._ocr_preview_visible = False
 
-        self._ocr_status_frame = tk.Frame(self._content_host, bg='#1a1a1a')
+        # Status strip lives inline in the bottom toolbar (persistent),
+        # NOT over the content host where it would cover the chat input.
+        # Rebuilt every panel switch only because the dismiss/auto-hide
+        # logic resets visibility state above.
+        host = getattr(self, '_ocr_status_host', None) or self._content_host
+        self._ocr_status_frame = tk.Frame(host, bg=_EDIT)
         self._ocr_status_lbl = tk.Label(
-            self._ocr_status_frame, text='', bg='#1a1a1a', fg=_T2,
-            font=(FONT_FAMILY, 10), anchor='w', padx=10,
+            self._ocr_status_frame, text='', bg=_EDIT, fg=_T2,
+            font=(FONT_FAMILY, 10), anchor='w', padx=8,
         )
         self._ocr_status_lbl.pack(side='left', fill='x', expand=True)
         self._ocr_dismiss_btn = tk.Button(
-            self._ocr_status_frame, text='✕', bg='#1a1a1a', fg=_T3,
+            self._ocr_status_frame, text='✕', bg=_EDIT, fg=_T3,
             activebackground=_HOVER, activeforeground=_T1,
             relief='flat', font=(FONT_FAMILY, 9), bd=0, cursor='hand2',
             command=self._ocr_hide_status,
@@ -2441,8 +2510,14 @@ class QuickNotesWindow(ctk.CTkToplevel):
         # to a normal note from the user's perspective.
         tb.bind('<KeyRelease>',        self._on_chat_transcript_keyrelease)
         tb.bind('<Button-3>',          self._on_chat_transcript_rclick)
-        tb.bind('<Control-v>',         self._on_chat_ctrl_v)
-        tb.bind('<Control-V>',         self._on_chat_ctrl_v)
+        tb.bind('<Control-v>',         self._on_chat_transcript_ctrl_v)
+        tb.bind('<Control-V>',         self._on_chat_transcript_ctrl_v)
+        tb.bind('<Return>',            self._on_chat_transcript_return)
+        tb.bind('<Escape>',
+            lambda e: (self._ocr_hide_status(), 'break')
+                      if self._ocr_staged_img is not None else None)
+        tb.bind('<Control-z>',         self._chat_transcript_ctrl_z)
+        tb.bind('<Control-Z>',         self._chat_transcript_ctrl_z)
         tb.bind('<ButtonPress-1>',     self._swipe_press,   add='+')
         tb.bind('<ButtonRelease-1>',   self._swipe_release, add='+')
         tb.bind('<ButtonPress-3>',     self._swipe_press,   add='+')
@@ -2451,6 +2526,9 @@ class QuickNotesWindow(ctk.CTkToplevel):
         # ── Bottom input bar ─────────────────────────────────────────────
         bar = tk.Frame(outer, bg=_EDIT)
         bar.pack(fill='x', padx=18, pady=(0, 14))
+        # Track the bar so the OCR overlays can sit above it instead of
+        # over it when staging an image in a chat note.
+        self._chat_bar_frame = bar
 
         # Multi-line entry would be nice but a single-line CTkEntry is
         # consistent with the rest of the app's input affordances. Enter
@@ -2463,7 +2541,30 @@ class QuickNotesWindow(ctk.CTkToplevel):
             height=34,
         )
         self._chat_input.pack(side='left', fill='x', expand=True)
-        self._chat_input.bind('<Return>', lambda e: self._on_chat_send())
+        # Enter: if an image is staged, run OCR (inserts text into THIS
+        # input; user then edits + presses Enter again to send). If
+        # nothing is staged, send the typed text directly. Matches the
+        # regular-notes paste-image → preview → Enter-to-extract flow
+        # the user is used to.
+        self._chat_input.bind('<Return>', self._on_chat_return)
+        # Esc cancels a staged image without sending anything.
+        self._chat_input.bind('<Escape>',
+            lambda e: (self._ocr_hide_status(), 'break'))
+        # Ctrl+V: if clipboard holds an image, stage it for OCR; else
+        # let the default <<Paste>> handler insert text as normal.
+        # Both the CTk wrapper and the inner Entry get the binding so a
+        # paste fires no matter which pixel the keystroke routes to.
+        self._chat_input.bind('<Control-v>', self._on_chat_ctrl_v)
+        self._chat_input.bind('<Control-V>', self._on_chat_ctrl_v)
+        try:
+            _inner_v = getattr(self._chat_input, '_entry', None)
+            if _inner_v is not None:
+                _inner_v.bind('<Control-v>', self._on_chat_ctrl_v)
+                _inner_v.bind('<Control-V>', self._on_chat_ctrl_v)
+                _inner_v.bind('<Return>',    self._on_chat_return)
+                _inner_v.bind('<Escape>',
+                    lambda e: (self._ocr_hide_status(), 'break'))
+        except Exception: pass
         # Standard Cut / Copy / Paste / Select All right-click menu.
         # Bind on both the CTk wrapper AND the underlying tk.Entry so
         # the menu fires regardless of which pixel the right-click lands
@@ -2525,6 +2626,19 @@ class QuickNotesWindow(ctk.CTkToplevel):
             except Exception: pass
 
         def _paste():
+            # Smart paste: if clipboard holds an image, stage it for
+            # OCR (matches Ctrl+V); otherwise paste clipboard text.
+            try:
+                from vision import get_clipboard_image
+                img, err = get_clipboard_image()
+                if err:
+                    self._ocr_show_status(f'⚠  {err}', _WARN_C, dismissable=True)
+                    return
+                if img is not None:
+                    self._ocr_stage(img, target=self._chat_input)
+                    return
+            except Exception:
+                pass
             try: entry.event_generate('<<Paste>>')
             except Exception: pass
 
@@ -2598,12 +2712,25 @@ class QuickNotesWindow(ctk.CTkToplevel):
                 self._ocr_show_status(f'⚠  {err}', _WARN_C, dismissable=True)
                 return
             if img is not None:
-                # OCR the image into the textbox at the cursor.
-                self._chat_ocr_extract(img)
+                # Stage image with preview (matches regular-note flow).
+                self._ocr_stage(img, target=w)
             else:
                 w.event_generate('<<Paste>>')
 
+        import spellcheck as _sc
         pm = self._popup()
+
+        # Spell suggestions: injected at top when cursor sits on a misspelled word.
+        spell = _sc.get_info(w, event.x, event.y)
+        if spell:
+            word, ws, we, suggestions = spell
+            for s in suggestions:
+                pm.add(s, lambda r=s, a=ws, b=we: _sc.apply_suggestion(w, a, b, r))
+            pm.separator()
+            pm.add('Ignore all',        lambda wrd=word: _sc.ignore_word(w, wrd))
+            pm.add('Add to dictionary', lambda wrd=word: _sc.add_word(w, wrd))
+            pm.separator()
+
         (pm
             .add('Cut',   lambda: w.event_generate('<<Cut>>'),   enabled=has_sel)
             .add('Copy',  lambda: w.event_generate('<<Copy>>'),  enabled=has_sel)
@@ -2636,15 +2763,15 @@ class QuickNotesWindow(ctk.CTkToplevel):
         extractor = self._vision_extractor
         if extractor is None:
             self._ocr_show_status(
-                '⚠  Vision provider not available', _WARN_C, dismissable=True)
+                '⚠ No vision provider', _WARN_C, dismissable=True)
             return
-        self._ocr_show_status('Extracting text from image…', _T2)
+        self._ocr_show_status('⏳ Extracting…', _T2)
         def _run():
             try:
                 text = (extractor(img) or '').strip()
             except Exception as exc:
                 self.after(0, lambda: self._ocr_show_status(
-                    f'⚠  OCR failed: {exc}', _ERR, dismissable=True))
+                    f'⚠ OCR failed', _ERR, dismissable=True))
                 return
             def _apply():
                 tb = self._chat_transcript
@@ -2693,8 +2820,8 @@ class QuickNotesWindow(ctk.CTkToplevel):
                     ', no explanations, no commentary.',
                 )
             except Exception as exc:
-                self.after(0, lambda:
-                    self._set_status(f'⚠ Proofread failed: {exc}', _ERR))
+                msg = f'⚠ Proofread failed: {exc}'
+                self.after(0, lambda m=msg: self._set_status(m, _ERR))
                 return
             def _apply():
                 try:
@@ -2770,6 +2897,8 @@ class QuickNotesWindow(ctk.CTkToplevel):
         except Exception:
             return
         self._chat_text_override = body
+        try: self._update_wcount()
+        except Exception: pass
         if title != (self._chat_title or '').strip():
             self._chat_title = title
             try:
@@ -2853,6 +2982,104 @@ class QuickNotesWindow(ctk.CTkToplevel):
             return
         try: self._refresh_list()
         except Exception: pass
+
+    def _chat_transcript_ctrl_z(self, _event=None) -> str:
+        """Ctrl+Z on the chat transcript: try widget undo, else fall through
+        so the window-level gesture undo handler can fire (mirrors
+        _text_ctrl_z for regular notes)."""
+        try:
+            self._chat_transcript._textbox.edit_undo()
+            return 'break'
+        except Exception:
+            return None
+
+    def _active_body_textbox(self):
+        """Return whichever body textbox is currently live: the regular
+        editor textbox (text-note mode) or the chat transcript textbox
+        (chat-note mode). Used by Task / Voice / OCR toolbar buttons so
+        they work uniformly in both modes."""
+        if self._tb is not None:
+            try:
+                if self._tb._textbox.winfo_exists():
+                    return self._tb._textbox
+            except Exception: pass
+        if self._chat_transcript is not None:
+            try:
+                if self._chat_transcript._textbox.winfo_exists():
+                    return self._chat_transcript._textbox
+            except Exception: pass
+        return None
+
+    def _on_chat_transcript_ctrl_v(self, _event=None):
+        """Ctrl+V on the chat transcript textbox: if clipboard holds an
+        image, stage it with the transcript as the target (OCR text gets
+        inserted at the transcript cursor). Else None → default text paste."""
+        try:
+            from vision import get_clipboard_image
+            img, err = get_clipboard_image()
+        except Exception:
+            return None
+        if err:
+            self._ocr_show_status(f'⚠  {err}', _WARN_C, dismissable=True)
+            return 'break'
+        if img is not None:
+            tgt = self._chat_transcript._textbox if self._chat_transcript else None
+            self._ocr_stage(img, target=tgt)
+            return 'break'
+        return None
+
+    def _on_chat_transcript_return(self, _event=None):
+        """Enter on the chat transcript widget. If a clipboard image is
+        staged (after Ctrl+V), run OCR (text routed by _ocr_done to the
+        chat input). Otherwise return None so Tk inserts a newline."""
+        if self._ocr_staged_img is not None:
+            img = self._ocr_staged_img
+            self._ocr_staged_img = None
+            self._ocr_hide_preview()
+            self._ocr_hide_status()
+            self._ocr_start(img=img)
+            return 'break'
+        return None
+
+    def _on_chat_return(self, _event=None) -> str:
+        """Enter handler for the chat input. Stages-first semantics:
+        if a clipboard image has been pasted and is sitting in the
+        preview pane, run OCR (result appears in this input — user
+        edits / confirms / presses Enter again to send). Otherwise the
+        typed text is sent as a normal chat message.
+
+        Returns 'break' so the default Tk Entry binding doesn't also
+        try to handle the keystroke (which would beep or duplicate).
+        """
+        if self._ocr_staged_img is not None:
+            img = self._ocr_staged_img
+            self._ocr_staged_img = None
+            self._ocr_hide_preview()
+            self._ocr_hide_status()
+            self._ocr_start(img=img)
+            return 'break'
+        self._on_chat_send()
+        return 'break'
+
+    def _on_chat_ctrl_v(self, _event=None) -> str | None:
+        """Ctrl+V on the chat input. If clipboard has an image, stage
+        it for OCR (same preview UX as regular notes). Else return None
+        so the default <<Paste>> binding inserts the clipboard text."""
+        if self._chat_input is None:
+            return None
+        try:
+            from vision import get_clipboard_image
+            img, err = get_clipboard_image()
+        except Exception:
+            return None
+        if err:
+            self._ocr_show_status(f'⚠  {err}', _WARN_C, dismissable=True)
+            return 'break'
+        if img is not None:
+            self._ocr_stage(img, target=self._chat_input)
+            return 'break'
+        # No image — let default text-paste happen.
+        return None
 
     def _on_chat_send(self) -> None:
         """User pressed Enter / clicked Send. Append the user message,
@@ -3319,21 +3546,27 @@ class QuickNotesWindow(ctk.CTkToplevel):
             self._set_status('Nothing heard', _WARN_C)
             self.after(2500, lambda: self._set_status(''))
             return
-        # Insert transcript inline at cursor position in body textbox
+        # Insert transcript inline at cursor position. Routes to whichever
+        # body widget is live: regular editor or chat transcript.
         try:
-            tb = self._tb._textbox
-            if self._ph:
+            in_text_mode = self._tb is not None
+            if in_text_mode and self._ph:
                 self._tb.delete('1.0', 'end')
                 self._tb.configure(text_color=_T1)
                 self._ph = False
-            idx      = tb.index('insert')
-            line_num = idx.split('.')[0]
-            line_txt = tb.get(f'{line_num}.0', f'{line_num}.end').strip()
-            prefix   = '' if not line_txt else '\n'
-            tb.insert('insert', prefix + text)
-            tb.see('insert')
+            tb = self._active_body_textbox()
+            if tb is not None:
+                idx      = tb.index('insert')
+                line_num = idx.split('.')[0]
+                line_txt = tb.get(f'{line_num}.0', f'{line_num}.end').strip()
+                prefix   = '' if not line_txt else '\n'
+                tb.insert('insert', prefix + text)
+                tb.see('insert')
+                if (not in_text_mode and self._chat_transcript is not None):
+                    self._chat_text_override = tb.get('1.0', 'end-1c')
+                    self._chat_text_flush()
         except Exception:
-            pass
+            logger.exception('quicknotes: _on_transcribed insert failed')
         self._update_wcount()
         self._set_status('✓ Transcribed', _OK_C)
         self.after(2500, lambda: self._set_status(''))
@@ -3346,7 +3579,13 @@ class QuickNotesWindow(ctk.CTkToplevel):
 
     def _update_wcount(self) -> None:
         try:
-            self._wcount.configure(text=_word_count(self._tb_text()))
+            if self._tb is not None:
+                txt = self._tb_text()
+            elif self._chat_transcript is not None:
+                txt = self._chat_transcript._textbox.get('1.0', 'end-1c')
+            else:
+                txt = ''
+            self._wcount.configure(text=_word_count(txt))
         except Exception:
             pass
 
@@ -3734,12 +3973,25 @@ class QuickNotesWindow(ctk.CTkToplevel):
         try:
             import ctypes
             u = ctypes.windll.user32
-            hwnd = self.winfo_id()
+            # restype = c_void_p so HWND / LONG_PTR results aren't truncated
+            # to 32-bit on 64-bit Windows. Otherwise a HWND with bit 31 set
+            # would compare unequal to its true value and GetWindowLongPtrW
+            # would return a corrupted style.
+            u.GetParent.restype          = ctypes.c_void_p
+            u.GetParent.argtypes         = (ctypes.c_void_p,)
+            u.GetWindowLongPtrW.restype  = ctypes.c_ssize_t
+            u.GetWindowLongPtrW.argtypes = (ctypes.c_void_p, ctypes.c_int)
+            u.SetWindowLongPtrW.restype  = ctypes.c_ssize_t
+            u.SetWindowLongPtrW.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_ssize_t)
+            u.SetWindowPos.argtypes      = (ctypes.c_void_p, ctypes.c_void_p,
+                                            ctypes.c_int, ctypes.c_int,
+                                            ctypes.c_int, ctypes.c_int, ctypes.c_uint)
+            hwnd = ctypes.c_void_p(self.winfo_id())
             for _ in range(8):
                 parent = u.GetParent(hwnd)
                 if not parent:
                     break
-                hwnd = parent
+                hwnd = ctypes.c_void_p(parent)
             GWL_EXSTYLE      = -20
             WS_EX_TOOLWINDOW = 0x00000080
             WS_EX_APPWINDOW  = 0x00040000
@@ -3977,28 +4229,35 @@ class QuickNotesWindow(ctk.CTkToplevel):
     # ── Inline task insertion ─────────────────────────────────────────────────
 
     def _insert_task(self) -> None:
-        """Insert a □ checklist line at the current cursor position."""
+        """Insert a □ checklist line at the current cursor position. Works
+        in both regular-note (self._tb) and chat-note (self._chat_transcript)
+        modes via _active_body_textbox()."""
         try:
-            if self._ph:
+            in_text_mode = self._tb is not None
+            if in_text_mode and self._ph:
                 self._tb.delete('1.0', 'end')
                 self._tb.configure(text_color=_T1)
                 self._ph = False
-            tb       = self._tb._textbox
+            tb = self._active_body_textbox()
+            if tb is None:
+                return
             idx      = tb.index('insert')
             line_num = idx.split('.')[0]
             line_end = f'{line_num}.end'
             line_txt = tb.get(f'{line_num}.0', line_end).strip()
             if line_txt:
-                # Non-empty line, insert new □ line below
                 tb.mark_set('insert', line_end)
                 tb.insert('insert', '\n□ ')
             else:
-                # Empty line, just put □ here
                 tb.insert(f'{line_num}.0', '□ ')
             tb.see('insert')
             tb.focus_set()
+            # Persist in chat mode so the inserted task survives navigation.
+            if (not in_text_mode and self._chat_transcript is not None):
+                self._chat_text_override = tb.get('1.0', 'end-1c')
+                self._chat_text_flush()
         except Exception:
-            pass
+            logger.exception('quicknotes: _insert_task failed')
 
     def _on_body_click(self, event) -> str | None:
         """Toggle □ ↔ ✓ when clicking within the first 2 chars of a task line."""
