@@ -8352,6 +8352,12 @@ class App:
 
 # ── Single-instance guard ─────────────────────────────────────────────────────
 _singleton_sock: socket.socket | None = None
+# Holds the named-mutex handle for the process LIFETIME. Releasing it at
+# function exit lets a second launch sail past the mutex check, which
+# combined with Windows' loose SO_REUSEADDR semantics allows two
+# instances to coexist. Keeping the handle module-global pins ownership
+# until interpreter shutdown.
+_startup_mutex_handle: int | None = None
 _SINGLETON_PORT = 47_294   # localhost IPC port
 
 
@@ -8466,7 +8472,7 @@ def _ensure_single_instance(_depth: int = 0) -> None:
     On Windows a named mutex serialises concurrent launches.
     On macOS/Linux the socket-based approach is used directly.
     """
-    global _singleton_sock
+    global _singleton_sock, _startup_mutex_handle
     import psutil
 
     # ── Windows: use a named mutex to serialise concurrent launches ───────────
@@ -8486,6 +8492,11 @@ def _ensure_single_instance(_depth: int = 0) -> None:
                 sys.exit(0)
             _ensure_single_instance(_depth + 1)
             return
+
+        # We own the mutex. Pin it to a module global so the handle
+        # outlives this function — releasing it here would re-open the
+        # race window that lets a second instance start cleanly.
+        _startup_mutex_handle = mutex
 
     # ── All platforms: graceful quit + hard-kill + socket bind ───────────────
 
@@ -8525,26 +8536,42 @@ def _ensure_single_instance(_depth: int = 0) -> None:
     # user can identify the offending process.
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if sys.platform == 'win32':
+            # Windows SO_REUSEADDR lets multiple processes bind the same
+            # port simultaneously (very different from Linux). Use
+            # SO_EXCLUSIVEADDRUSE to guarantee the bind fails loudly when
+            # any other process holds the port.
+            SO_EXCLUSIVEADDRUSE = -5
+            try:
+                s.setsockopt(socket.SOL_SOCKET, SO_EXCLUSIVEADDRUSE, 1)
+            except OSError:
+                pass
+        else:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(('127.0.0.1', _SINGLETON_PORT))
         s.listen(5)
         _singleton_sock = s
     except OSError as e:
-        # WSAEADDRINUSE (10048) or POSIX EADDRINUSE (98)
+        # WSAEADDRINUSE (10048) or POSIX EADDRINUSE (98) means another
+        # Hotkeys instance is alive and we slipped past the mutex (this
+        # should be rare now that the mutex is held for life, but treat
+        # it as a hard failure so we never coexist with another tray).
         if getattr(e, 'errno', 0) in (10048, 98):
             logger.error(
-                f'Singleton port {_SINGLETON_PORT} is already in use by '
-                f'another process. Another Hotkeys instance launched in '
-                f'parallel may not be detected; close any other instances '
-                f'and restart. ({e})')
+                f'Singleton port {_SINGLETON_PORT} already in use; '
+                f'another Hotkeys instance is running. Exiting. ({e})')
+            sys.exit(0)
         else:
             logger.error(f'Singleton socket bind failed: {e}')
+            sys.exit(1)
     except Exception as e:
         logger.error(f'Singleton socket bind failed: {e}')
+        sys.exit(1)
 
-    if sys.platform == 'win32':
-        kernel32.ReleaseMutex(mutex)
-        kernel32.CloseHandle(mutex)
+    # NOTE: we deliberately do NOT release or close the named mutex here.
+    # Holding it for the process lifetime is what keeps a second launch
+    # from racing past the startup check after we've finished init.
+    # The OS reclaims the handle on interpreter exit.
 
 
 # ── macOS accessibility permission ────────────────────────────────────────────
