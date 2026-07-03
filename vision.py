@@ -2,6 +2,13 @@
 import base64
 import io
 import logging
+import re
+
+# Match qwen/other reasoning-model <think>...</think> blocks so they do
+# not pollute the extracted text. Handles well-formed pairs and (safety)
+# a lone unmatched opening <think> from a truncated response.
+_THINK_BLOCK = re.compile(r'<think>.*?</think>\s*', flags=re.DOTALL | re.IGNORECASE)
+_THINK_ORPHAN = re.compile(r'<think>.*', flags=re.DOTALL | re.IGNORECASE)
 
 logger = logging.getLogger(__name__)
 
@@ -244,9 +251,15 @@ def extract_text(img, api_key: str, model: str = DEFAULT_VISION_MODEL) -> str:
         raise RuntimeError(f'Network error: {exc}') from exc
 
     try:
-        text = resp_data['choices'][0]['message']['content'].strip()
+        text = resp_data['choices'][0]['message']['content']
     except Exception as exc:
         raise RuntimeError(f'Unexpected API response: {exc}') from exc
+
+    # Strip <think>...</think> blocks from reasoning models (qwen3.6, gpt-oss).
+    # These carry model reasoning that would otherwise pollute the OCR output.
+    text = _THINK_BLOCK.sub('', text)
+    text = _THINK_ORPHAN.sub('', text)   # unmatched leftover if truncated
+    text = text.strip()
 
     logger.info(f'vision: extracted {len(text)} chars from image via {model}')
     return text
