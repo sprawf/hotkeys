@@ -5,7 +5,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_VISION_MODEL = 'meta-llama/llama-4-scout-17b-16e-instruct'
+DEFAULT_VISION_MODEL = 'qwen/qwen3.6-27b'
 LONG_TEXT_WARN       = 2000   # chars, prompt user if result is very long
 _MAX_PX              = 1280   # max image dimension sent to API
 _TIMEOUT             = 15.0   # seconds per request

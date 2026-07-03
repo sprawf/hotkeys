@@ -35,8 +35,8 @@ PROVIDER_LABELS  = {
     'custom':    'Custom  (any OpenAI-compatible endpoint)',
 }
 GROQ_MODELS      = ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant',
-                    'meta-llama/llama-4-scout-17b-16e-instruct', 'openai/gpt-oss-120b']
-CEREBRAS_MODELS  = ['llama-3.3-70b', 'llama-4-scout-17b-16e-instruct', 'gpt-oss-120b']
+                    'qwen/qwen3.6-27b', 'openai/gpt-oss-120b']
+CEREBRAS_MODELS  = ['llama-3.3-70b', 'gpt-oss-120b']
 # Cerebras retired `llama3.1-8b` (404s on every call). llama-3.3-70b is
 # their current high-quality default and matches Groq's flagship in
 # capability, so the fallback chain is even.
