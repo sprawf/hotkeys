@@ -56,6 +56,7 @@ import ctypes.wintypes as _wt
 import logging
 import queue
 import threading
+import time
 from typing import Callable
 
 logger = logging.getLogger(__name__)
@@ -189,6 +190,23 @@ _hook_ref = [None]   # mutable container shared with the listener thread
 _listener_thread = None
 _worker_thread   = None
 
+# Timestamp of the most recent _hook_proc invocation. Bumped inside the
+# hook callback on every key event Windows delivers. If this stops
+# updating while Windows itself is still receiving input (per
+# GetLastInputInfo), the OS has silently unhooked us and we must
+# reinstall. Init to time.monotonic() at import so is_hook_alive() has
+# a valid starting reference before the first key event.
+_last_hook_tick = time.monotonic()
+
+# ── LASTINPUTINFO for GetLastInputInfo() ─────────────────────────────────
+class _LASTINPUTINFO(ctypes.Structure):
+    _fields_ = [('cbSize', _wt.UINT), ('dwTime', _wt.DWORD)]
+
+_user32.GetLastInputInfo.argtypes = [ctypes.POINTER(_LASTINPUTINFO)]
+_user32.GetLastInputInfo.restype = _wt.BOOL
+_kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+_kernel32.GetTickCount.restype = _wt.DWORD
+
 # When True, the hook stops matching/suppressing/dispatching, but still
 # tracks the modifier mask so it can recognise "a registered hotkey was
 # pressed while paused" and tell the app to show a reminder toast.
@@ -206,7 +224,12 @@ _on_paused_match: Callable[[], None] | None = None
 # ── Hook procedure (runs on listener thread, must return FAST) ───────────────
 
 def _hook_proc(nCode, wParam, lParam):
-    global _modifier_mask
+    global _modifier_mask, _last_hook_tick
+    # Liveness heartbeat: any invocation, even nCode<0 pass-through,
+    # proves Windows is still delivering keyboard events to our hook.
+    # Read via time.monotonic() so it's monotonic across DST/system-clock
+    # changes and safe under the sub-1ms budget rule.
+    _last_hook_tick = time.monotonic()
     if nCode < 0:
         return _user32.CallNextHookEx(_hook_ref[0], nCode, wParam, lParam)
     matched = False  # if True, suppress the key (don't pass to foreground app)
@@ -420,3 +443,87 @@ def stop() -> None:
     except queue.Full:
         pass
     _started = False
+
+
+# ── Liveness detection + self-heal ────────────────────────────────────────
+
+def is_hook_alive(idle_grace_sec: float = 30.0) -> bool:
+    """Return True if the WH_KEYBOARD_LL hook is provably still installed.
+
+    Detection approach: compare our own last-hook-callback timestamp
+    against Windows' own last-input timestamp (GetLastInputInfo, which
+    reports the last time the OS itself saw ANY keyboard/mouse input,
+    system-wide).
+
+    - If Windows saw input very recently AND our hook saw the same
+      recent input, hook is alive.
+    - If Windows saw input recently but our hook did NOT (older by more
+      than a few seconds), Windows silently unhooked us, hook is dead.
+    - If Windows has NOT seen any input in `idle_grace_sec`, we can't
+      distinguish a dead hook from a genuinely idle user, so we
+      OPTIMISTICALLY say alive. The next real key press will either
+      arrive (proving alive) or fail to arrive (next tick this function
+      will report dead).
+
+    Called from the main.py watchdog loop; must be cheap.
+    """
+    if not _started or _hook_ref[0] is None:
+        return False
+
+    lii = _LASTINPUTINFO()
+    lii.cbSize = ctypes.sizeof(lii)
+    if not _user32.GetLastInputInfo(ctypes.byref(lii)):
+        # Can't tell — treat as alive to avoid false-positive reinstalls
+        return True
+
+    now_tick = _kernel32.GetTickCount()
+    # DWORD tick difference is intentional 32-bit modular subtraction so
+    # rollover after ~49.7 days doesn't lie about the age.
+    ms_since_windows_input = (now_tick - lii.dwTime) & 0xFFFFFFFF
+    sec_since_windows_input = ms_since_windows_input / 1000.0
+
+    if sec_since_windows_input > idle_grace_sec:
+        # User is idle. Can't distinguish dead hook from real idleness.
+        return True
+
+    sec_since_hook_callback = time.monotonic() - _last_hook_tick
+
+    # Windows saw input in the last N seconds. Our hook must have too
+    # (with a small tolerance for the timestamp race).
+    return sec_since_hook_callback < sec_since_windows_input + 2.0
+
+
+def reinstall_hook() -> bool:
+    """Force the OS-level WH_KEYBOARD_LL hook to be re-installed.
+
+    Called by the watchdog when is_hook_alive() returns False. Unhooks
+    the current (dead) hook and installs a fresh one, WITHOUT tearing
+    down the listener/worker threads or losing registered hotkeys.
+
+    Returns True on success, False on failure.
+
+    The listener thread's GetMessageW loop is unaffected — it stays
+    blocked, and any future messages from the new hook get pumped
+    through it the same way.
+    """
+    global _last_hook_tick
+    old = _hook_ref[0]
+    if old:
+        try:
+            _user32.UnhookWindowsHookEx(old)
+        except Exception:
+            pass
+        _hook_ref[0] = None
+    try:
+        new_hook = _user32.SetWindowsHookExW(
+            _WH_KEYBOARD_LL, _hook_proc_ref, None, 0)
+    except Exception as e:
+        logger.error(f'kbhook: reinstall SetWindowsHookExW raised: {e}')
+        return False
+    if not new_hook:
+        logger.error('kbhook: reinstall SetWindowsHookExW returned NULL')
+        return False
+    _hook_ref[0] = new_hook
+    _last_hook_tick = time.monotonic()   # reset heartbeat baseline
+    logger.warning('kbhook: OS hook was dead, reinstalled it.')
+    return True

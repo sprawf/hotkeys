@@ -1154,7 +1154,7 @@ class App:
         Runs every 2 s. All work is wrapped in try/except so one bad
         reconciliation never breaks the loop.
         """
-        # 1. Listener health
+        # 1. Listener thread health (legacy `keyboard` library check).
         try:
             listener = getattr(keyboard, '_listener', None)
             if listener is not None:
@@ -1162,6 +1162,18 @@ class App:
                 if t is not None and not t.is_alive():
                     logger.warning('Hotkey listener thread dead, auto re-registering.')
                     threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
+        except Exception:
+            pass
+
+        # 1b. OS-level hook liveness. The listener THREAD can be alive
+        # while Windows has silently unhooked the WH_KEYBOARD_LL hook
+        # (thread just sits in GetMessageW getting nothing). kbhook.
+        # is_hook_alive() catches this by comparing our last-callback
+        # timestamp to Windows' own last-input timestamp.
+        try:
+            if not kbhook.is_hook_alive():
+                logger.warning('OS-level WH_KEYBOARD_LL dead; reinstalling.')
+                kbhook.reinstall_hook()
         except Exception:
             pass
 
