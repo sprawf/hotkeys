@@ -34,8 +34,8 @@ PROVIDER_LABELS  = {
     'gemini':    'Google Gemini  (free tier available · bring your own key)',
     'custom':    'Custom  (any OpenAI-compatible endpoint)',
 }
-GROQ_MODELS      = ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant',
-                    'qwen/qwen3.6-27b', 'openai/gpt-oss-120b']
+GROQ_MODELS      = ['openai/gpt-oss-120b', 'qwen/qwen3.6-27b',
+                    'llama-3.1-8b-instant']
 CEREBRAS_MODELS  = ['llama-3.3-70b', 'gpt-oss-120b']
 # Cerebras retired `llama3.1-8b` (404s on every call). llama-3.3-70b is
 # their current high-quality default and matches Groq's flagship in

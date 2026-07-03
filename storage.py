@@ -466,7 +466,7 @@ DEFAULT_CONFIG: dict = {
     },
     'providers': {
         'local':    {'model_id': 'Qwen/Qwen2.5-1.5B-Instruct-GGUF'},
-        'groq':     {'api_key': '', 'model': 'llama-3.3-70b-versatile',
+        'groq':     {'api_key': '', 'model': 'openai/gpt-oss-120b',
                      'vision_model': 'qwen/qwen3.6-27b'},
         # llama3.1-8b was retired by Cerebras (404s on every call); the
         # current default matches engine.CEREBRAS_MODELS[0].

@@ -663,8 +663,11 @@ class SettingsWindow:
             try:
                 if provider == 'groq':
                     import groq as _groq
+                    # Pull from engine.GROQ_MODELS so the Test button
+                    # doesn't break when Groq rotates/decommissions models.
+                    from engine import GROQ_MODELS
                     _groq.Groq(api_key=api_key).chat.completions.create(
-                        model='llama-3.3-70b-versatile',
+                        model=GROQ_MODELS[0],
                         messages=[{'role': 'user', 'content': 'hi'}],
                         max_tokens=1,
                     )
