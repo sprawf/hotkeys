@@ -6130,24 +6130,34 @@ class App:
         if self._is_screen_locked():
             logger.warning(f'Dropped {event!r}: screen is locked.')
             return True
-        # 2. Flood detector
+        # 2. Flood detector. Only trips on multiple DIFFERENT events in
+        #    a short window. A user impatiently spamming the same hotkey
+        #    (thinking it's broken) is NOT a flood - it's a UX signal
+        #    that they think something's wrong. Real accident scenarios
+        #    (cat on keyboard, water spill, object dropped on keys) hit
+        #    a ROW of different keys, not the same one four times.
         now = time.time()
         if now < getattr(self, '_panic_until_ts', 0):
             return True  # mid-pause, silent drop
-        self._activation_times.append(now)
+        self._activation_times.append((event, now))
         if (len(self._activation_times) >= 4
-                and now - self._activation_times[-4] < 2.0):
-            self._panic_until_ts = now + 10.0
-            try:
-                self.refine_overlay.show_error(
-                    '⚠ Unusual hotkey activity, paused 10s')
-            except Exception:
-                pass
-            logger.warning(
-                f'Flood guard tripped: {len(self._activation_times)} '
-                f'user-initiated events in '
-                f'{now - self._activation_times[0]:.1f}s; pausing 10s.')
-            return True
+                and now - self._activation_times[-4][1] < 2.0):
+            recent = list(self._activation_times)[-4:]
+            unique_events = {ev for ev, _ in recent}
+            if len(unique_events) >= 3:
+                # 3+ different events in 2s = looks like an accident.
+                self._panic_until_ts = now + 10.0
+                try:
+                    self.refine_overlay.show_error(
+                        '⚠ Unusual hotkey activity, paused 10s')
+                except Exception:
+                    pass
+                logger.warning(
+                    f'Flood guard tripped: {len(unique_events)} unique '
+                    f'events in {now - recent[0][1]:.1f}s '
+                    f'({sorted(unique_events)}); pausing 10s.')
+                return True
+            # Same hotkey repeated - user is impatient, don't punish them.
         return False
 
     def _poll(self) -> None:
