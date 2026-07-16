@@ -1,5 +1,6 @@
 import logging
 import threading
+import time
 import numpy as np
 import sounddevice as sd
 
@@ -321,17 +322,70 @@ class AudioCapture:
                 pass
 
     def start_recording(self):
+        """Start capturing to the buffer. Robust against transient PortAudio /
+        WASAPI failures.
+
+        Failure modes we handle without surfacing an error to the user:
+          - Zombie stream: `.active` reports True but the underlying HRESULT
+            is dead (rare sounddevice/PortAudio corner case). We tear down
+            and reopen if the callback hasn't produced audio recently.
+          - Bluetooth headset HFP switch (~500-2000 ms): the mic goes
+            unavailable while Windows renegotiates the audio profile.
+          - Handle-release delay after a previous recording ended (~100-500
+            ms): WASAPI holds the input handle briefly.
+          - Windows exclusive-mode contention: another app just grabbed
+            the mic; usually released within a second.
+
+        Only surface a user-facing error after exhausting ~2.6 s of retries.
+        """
         with self._lock:
             self._buffer         = []
             self._interim_last_n = 0
             self._recording      = True
-        if self._stream is None or not self._stream.active:
+
+        # Fast path: existing stream is already open + streaming.
+        if self._stream is not None and self._stream.active:
+            return
+
+        # Slow path: stream is None or inactive. Clean up any zombie
+        # stream object first so subsequent _open_stream() gets a fresh
+        # sd.InputStream instance and doesn't confuse PortAudio's
+        # per-device state.
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+            except Exception:
+                pass
+            try:
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+
+        # Escalating backoff. Total budget ~2.6 s across 4 attempts.
+        # Cap at 4 to stay well under PortAudio's ~5-failed-open heap-
+        # corruption threshold documented at the top of _open_stream.
+        delays = (0, 0.3, 0.8, 1.5)
+        last_exc: Exception | None = None
+        for attempt, delay in enumerate(delays):
+            if delay > 0:
+                logger.info(f'Mic open retry #{attempt} after {delay*1000:.0f}ms')
+                time.sleep(delay)
             try:
                 self._open_stream()
-            except Exception:
-                with self._lock:
-                    self._recording = False
-                raise
+                return  # success
+            except Exception as e:
+                last_exc = e
+                # Clean up any partial state before the next retry.
+                if self._stream is not None:
+                    try: self._stream.close()
+                    except Exception: pass
+                    self._stream = None
+        # All retries exhausted — surface the last error.
+        with self._lock:
+            self._recording = False
+        raise last_exc if last_exc else RuntimeError(
+            'Failed to open microphone after 4 attempts')
 
     def stop_recording(self):
         with self._lock:

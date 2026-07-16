@@ -1512,9 +1512,15 @@ class App:
             )
         else:
             body = (
-                "Hotkeys couldn't open your microphone.\n\n"
-                'Check that a mic is plugged in and not in use by another '
-                'app, then try again.'
+                "Hotkeys couldn't open your microphone after several retries.\n\n"
+                'Most common causes on a working mic:\n'
+                '  • Bluetooth headset: give it 2-3 seconds after last '
+                'audio use, then try again.\n'
+                '  • Another app is holding the mic (Zoom, Teams, Discord, '
+                'browser tab with an active call).\n'
+                '  • Audio driver hiccup: unplug/replug USB mic, or '
+                'restart Windows audio (Services → Windows Audio).\n\n'
+                f'Technical detail (for support):\n{err[:200]}'
             )
         _mb.showerror('Microphone unavailable', body, parent=self.root)
 
@@ -7089,27 +7095,16 @@ class App:
         self._whisper_recording = True
         self._whisper_t0 = time.time()
         self._vad.reset()
-        # Retry once on transient failure: WASAPI / PortAudio doesn't fully
-        # release the input handle instantly after the previous recording
-        # ends, so a rapid second hotkey press (~<500ms after "no speech
-        # detected") can hit "device busy" even though the mic is fine.
-        # Silent 300ms retry catches this and avoids a scary popup. Only
-        # if the second attempt still fails do we surface the dialog.
-        first_err = None
-        for attempt in range(2):
-            try:
-                self._audio.start_recording()
-                first_err = None
-                break
-            except Exception as e:
-                first_err = e
-                if attempt == 0:
-                    logger.warning(f'Mic open failed on first try, retrying in 300ms: {e}')
-                    time.sleep(0.3)
-        if first_err is not None:
+        try:
+            # audio.start_recording() now has its own escalating-backoff
+            # retry (up to ~2.6s total) for transient PortAudio/WASAPI
+            # busy conditions. By the time it raises here, we've tried
+            # 4 times and the mic is genuinely inaccessible.
+            self._audio.start_recording()
+        except Exception as e:
             self._whisper_recording = False
-            logger.error(f'Microphone error (after retry): {first_err}')
-            self._show_mic_error(str(first_err))
+            logger.error(f'Microphone error (after 4 retries): {e}')
+            self._show_mic_error(str(e))
             return
         play_start()
         self.whisper_overlay.show_recording()
