@@ -129,6 +129,14 @@ def _ensure_portable_state() -> None:
         ('Warnings', 'MixMono',             '0'),
         ('Warnings', 'MixStereo',           '0'),
         ('Warnings', 'MixUnknownChannels',  '0'),
+        # Suppress the ".aup3 files are not currently associated with
+        # Tenacity" popup on startup. Different Audacity/Tenacity forks
+        # store this under different sections; setting all known
+        # candidates covers every version we might ship.
+        ('FileFormats', 'AssociateFilesOnStartup', '0'),
+        ('Windows',     'AssociateFilesOnStartup', '0'),
+        ('Warnings',    'FileAssociations',        '0'),
+        ('Warnings',    'CheckAssociateFileTypes', '0'),
     )
     try:
         cfg = _portable_settings_dir() / 'tenacity.cfg'
