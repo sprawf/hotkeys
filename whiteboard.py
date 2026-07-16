@@ -36,6 +36,20 @@ ROOT       = _bundled_root()
 DIST       = ROOT / 'whiteboard_assets' / 'dist'
 INDEX_HTML = DIST / 'index.html'
 
+# Point pywebview at the bundled WebView2 Fixed Version runtime BEFORE
+# any webview code runs. Set unconditionally: if the bundled folder
+# exists, we ALWAYS use it (guarantees deterministic behavior across
+# machines with / without system WebView2 Runtime installed and across
+# .NET Framework versions). If the folder is missing (developer running
+# from source without extracting the runtime), pywebview falls back to
+# the system-installed WebView2 as before.
+try:
+    _wv2 = ROOT / 'webview2_runtime'
+    if (_wv2 / 'msedgewebview2.exe').is_file():
+        os.environ['WEBVIEW2_BROWSER_EXECUTABLE_FOLDER'] = str(_wv2)
+except Exception:
+    pass
+
 # User data lives next to the exe when frozen (portable dist), else %APPDATA%.
 # Import storage.appdata_dir() so the whiteboard subprocess uses the
 # IDENTICAL data path the main app uses — including its read-only-install

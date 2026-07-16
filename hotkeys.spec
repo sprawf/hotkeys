@@ -134,6 +134,26 @@ else:
     print(f'!! audio_editor_assets/tenacity missing — see audio_editor.py'
           f' header for bundling steps')
 
+# ── WebView2 Fixed Version runtime (Shift+F8 whiteboard, dependency-free) ────
+# Ship Microsoft's Fixed Version WebView2 Runtime inside the dist so the
+# whiteboard opens on PCs that don't have WebView2 Runtime pre-installed
+# (common on Windows 10 pre-1903 and clean corporate images). Set as an
+# environment variable in whiteboard.py before webview.start(). Without
+# this bundle, whiteboard falls back to the system-installed WebView2
+# runtime and only works if the user has it.
+# Adds ~180 MB to the compressed zip and ~650 MB to the extracted dist.
+_wv2_dir = ROOT / 'webview2_runtime'
+if _wv2_dir.exists() and (_wv2_dir / 'msedgewebview2.exe').is_file():
+    for _p in _wv2_dir.rglob('*'):
+        if _p.is_file():
+            _rel = _p.relative_to(ROOT).parent
+            datas += [(str(_p), str(_rel))]
+    print(f'++ webview2_runtime bundled ({sum(f.stat().st_size for f in _wv2_dir.rglob("*") if f.is_file()) / (1024*1024):.0f} MB)')
+else:
+    print(f'!! webview2_runtime missing at {_wv2_dir} — dist will fall back to '
+          f'system-installed WebView2 (whiteboard breaks on PCs without it). '
+          f'Extract Microsoft.WebView2.FixedVersionRuntime.*.x64.cab there.')
+
 
 # ── Tesseract language packs (Scan-doc: auto-orient + Extract text) ─────────
 # main.py's scan-preview code points TESSDATA_PREFIX at <app>/tessdata when
