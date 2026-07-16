@@ -137,6 +137,28 @@ def _ensure_portable_state() -> None:
         ('Windows',     'AssociateFilesOnStartup', '0'),
         ('Warnings',    'FileAssociations',        '0'),
         ('Warnings',    'CheckAssociateFileTypes', '0'),
+        # Kill the "Check for updates on startup" behavior AND the popup
+        # that asks about it. Audio editor is fully offline — Tenacity
+        # should never phone home. Multiple key candidates because the
+        # setting has moved between sections across Audacity/Tenacity
+        # forks.
+        ('Update',                'DefaultUpdatesChecking', '0'),
+        ('Update',                'CheckForUpdates',        '0'),
+        ('Preferences/Update',    'DefaultUpdatesChecking', '0'),
+        ('Preferences/Application', 'DefaultUpdatesChecking', '0'),
+        ('App',                   'CheckedForUpdates',      '99999'),
+        # Analytics / crash-report / usage-info opt-in modals — all off.
+        ('Analytics/ErrorReports', 'DefaultReportingLevel', '0'),
+        ('Errors',                 'SendUsageInfo',          '0'),
+        ('Preferences/Privacy',    'SendAnonymousData',      '0'),
+        # First-launch "Welcome" / "What's New" wizard modals.
+        ('GUI',                    'ShowWhatsNew',           '0'),
+        ('GUI',                    'ShowWelcomeDialog',      '0'),
+        ('App',                    'FirstRun',               '0'),
+        ('App',                    'ShowWhatsNew',           '0'),
+        # Crash-recovery scan popup on next launch after a crash.
+        ('App',                    'ShowCrashSurvivor',      '0'),
+        ('CrashReports',           'OldCrashesToShow',       '0'),
     )
     try:
         cfg = _portable_settings_dir() / 'tenacity.cfg'
@@ -228,6 +250,21 @@ if sys.platform == 'win32':
     _user32.SetClassLongPtrW.argtypes = [
         wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
     _user32.SetClassLongPtrW.restype = ctypes.c_void_p
+
+    # Prototypes for the hidden-dialog rescue path in _force_dialog_to_front.
+    _user32.AttachThreadInput.argtypes = [
+        wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+    _user32.AttachThreadInput.restype  = wintypes.BOOL
+    _user32.BringWindowToTop.argtypes  = [wintypes.HWND]
+    _user32.BringWindowToTop.restype   = wintypes.BOOL
+    _user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    _user32.SetForegroundWindow.restype  = wintypes.BOOL
+    _user32.SetWindowPos.argtypes = [
+        wintypes.HWND, wintypes.HWND,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        wintypes.UINT]
+    _user32.SetWindowPos.restype  = wintypes.BOOL
+    _kernel32.GetCurrentThreadId.restype = wintypes.DWORD
 
     # Same protection for the HWND/HMENU-returning Win32 calls in the
     # rebrand walker. Without explicit restypes ctypes defaults to c_int
@@ -722,6 +759,55 @@ def _rebrand_all_owned_windows(pid: int) -> None:
         # Dismiss optional warning dialogs proactively.
         if title == 'Warning':
             _auto_dismiss_warning_dialog(h)
+
+    # Force-foreground safety net: if any Tenacity-owned window OTHER
+    # than the main "Audio Editor" window exists (i.e. a dialog, modal,
+    # popup, wizard, update prompt, etc.), bring it to the front. This
+    # is our last line of defense against a first-launch dialog opening
+    # BEHIND the main window and silently stealing every user click.
+    # Without this the user sees a working-looking main window but
+    # nothing responds — the classic "hidden modal" bug.
+    # Only kicks in when there are 2+ windows AND one of them isn't the
+    # branded main window, so it's a no-op in the normal single-window
+    # case.
+    if len(seen) >= 2:
+        for h, title in seen:
+            if title == DISPLAY_TITLE:
+                continue  # skip the main window
+            try:
+                _force_dialog_to_front(h)
+            except Exception:
+                pass
+
+
+def _force_dialog_to_front(hwnd: int) -> None:
+    """Yank a hidden Tenacity dialog to the foreground so the user can
+    see and dismiss it. Uses the AttachThreadInput trick because
+    SetForegroundWindow alone is blocked by Windows unless the calling
+    thread already owns the foreground window.
+    """
+    if sys.platform != 'win32' or not hwnd:
+        return
+    try:
+        fg = _user32.GetForegroundWindow()
+        if fg == hwnd:
+            return
+        # SW_SHOW / SW_RESTORE first in case it's minimized
+        _user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        _user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040)  # HWND_TOPMOST NOMOVE NOSIZE SHOWWINDOW
+        _user32.SetWindowPos(hwnd, -2, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040)  # HWND_NOTOPMOST
+        our_thread = _kernel32.GetCurrentThreadId() if hasattr(_kernel32, 'GetCurrentThreadId') else 0
+        fg_thread  = _user32.GetWindowThreadProcessId(fg, None) if fg else 0
+        if our_thread and fg_thread and our_thread != fg_thread:
+            _user32.AttachThreadInput(fg_thread, our_thread, True)
+            _user32.SetForegroundWindow(hwnd)
+            _user32.BringWindowToTop(hwnd)
+            _user32.AttachThreadInput(fg_thread, our_thread, False)
+        else:
+            _user32.SetForegroundWindow(hwnd)
+        logger.info(f'audio editor: forced hidden dialog hwnd=0x{hwnd:x} to front')
+    except Exception:
+        pass
 
 
 def _is_window(hwnd: int) -> bool:
