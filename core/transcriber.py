@@ -447,7 +447,7 @@ class Transcriber:
             t0 = time.perf_counter()
             sess.get(
                 'https://api.groq.com/openai/v1/models',
-                timeout=3.0,
+                timeout=10.0,
             )
             logger.info(
                 f'Cloud TLS pre-warmed in {(time.perf_counter()-t0)*1000:.0f}ms'
@@ -466,7 +466,7 @@ class Transcriber:
             return True
 
     def _cloud_reachable(self, host: str = 'api.groq.com',
-                         port: int = 443, timeout: float = 0.5) -> bool:
+                         port: int = 443, timeout: float = 3.0) -> bool:
         """Fast non-blocking TCP probe to detect whether the cloud
         Whisper host is reachable RIGHT NOW. Returns True on successful
         connect, False on any failure (DNS resolution failure, network
@@ -728,9 +728,14 @@ class Transcriber:
                         'skipping cloud, going to local.')
             return self._transcribe(audio, _already_denoised=denoised_here)
 
-        # Cloud timeout budget, short, because local is the safety net.
-        # 3 s covers 99 % of Groq calls; anything slower → just go local.
-        cloud_timeout = float(getattr(self._cfg.audio, 'cloud_timeout_s', 3.0))
+        # Cloud timeout budget. Was 3s (too aggressive: users on slow /
+        # rural / congested WiFi never completed the upload phase for a
+        # 2s audio clip before we aborted to local, even when the network
+        # would eventually deliver the response). Bumped to 15s so slow
+        # uploaders on ~20-50 kbps connections still get the higher-
+        # quality Groq result. Local pipeline stays as safety net for
+        # anything slower than that.
+        cloud_timeout = float(getattr(self._cfg.audio, 'cloud_timeout_s', 15.0))
         lang_hint = self._cfg.transcription.language or None
 
         t0 = time.perf_counter()
@@ -768,17 +773,37 @@ class Transcriber:
             # AV-blocked / permission-denied / other "cloud reachable but
             # refusing" cases, the local fallback runs transparently and
             # produces a correct result, so we stay silent.
+            exc_name = type(e).__name__.lower()
             if 'name resolution' in msg_l or 'getaddrinfo' in msg_l:
                 self._cloud_last_error = 'Cloud unreachable (DNS) — using local model'
             elif 'connection' in msg_l and ('refus' in msg_l or 'reset' in msg_l):
                 self._cloud_last_error = 'Cloud refused connection — using local model'
             elif 'timeout' in msg_l or 'timed out' in msg_l:
-                self._cloud_last_error = 'Cloud timed out — using local model'
+                # Timeout on slow internet is the most common cause of the
+                # silent "why is my dictation worse" complaint. Make the
+                # cause explicit so the user knows to check connection.
+                self._cloud_last_error = 'Cloud too slow (internet slow?) — used local model'
+            elif (
+                # Antivirus HTTPS interception. AVG / Avast / Kaspersky /
+                # Bitdefender / ESET all MITM outbound TLS by default and
+                # present their own cert, which our TLS stack rejects
+                # because it isn't in truststore. Signature: SSL /
+                # certificate errors, PermissionError 13, "wrong version
+                # number", "unknown ca", "self signed certificate".
+                'ssl' in msg_l or 'certificate' in msg_l
+                or 'winerror 13' in msg_l or 'permission' in exc_name
+                or 'wrong version number' in msg_l or 'unknown ca' in msg_l
+                or 'self signed' in msg_l or 'self-signed' in msg_l
+                or 'cert_' in msg_l
+            ):
+                self._cloud_last_error = (
+                    'Antivirus blocked cloud — add api.groq.com to AV exceptions')
             else:
-                # AV blocks (PermissionError 13), unknown errors, etc:
-                # log for debugging but do not pop a pill — local result
-                # speaks for itself.
-                self._cloud_last_error = None
+                # Unknown errors: still surface something so the user has
+                # a hint. Truncated exception name is enough for us to
+                # diagnose from a screenshot without needing full logs.
+                self._cloud_last_error = (
+                    f'Cloud failed ({type(e).__name__}) — used local model')
             logger.warning(
                 f'Cloud transcription failed in {dt*1000:.0f}ms, falling back '
                 f'to local Whisper. ({type(e).__name__}: {e})'

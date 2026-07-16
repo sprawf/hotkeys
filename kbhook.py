@@ -207,6 +207,17 @@ _user32.GetLastInputInfo.restype = _wt.BOOL
 _kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
 _kernel32.GetTickCount.restype = _wt.DWORD
 
+_user32.GetCursorPos.argtypes = [ctypes.POINTER(_wt.POINT)]
+_user32.GetCursorPos.restype = _wt.BOOL
+
+# Cursor position snapshot from previous is_hook_alive() call. Used to
+# distinguish "input was mouse" (cursor moved) from "input was keyboard"
+# (cursor stationary). GetLastInputInfo reports any input; our hook only
+# sees keyboard, so mouse motion would otherwise falsely mark hook dead.
+_last_cursor_x = 0
+_last_cursor_y = 0
+_last_cursor_check_tick = 0    # GetTickCount ms at prev snapshot
+
 # When True, the hook stops matching/suppressing/dispatching, but still
 # tracks the modifier mask so it can recognise "a registered hotkey was
 # pressed while paused" and tell the app to show a reminder toast.
@@ -447,7 +458,8 @@ def stop() -> None:
 
 # ── Liveness detection + self-heal ────────────────────────────────────────
 
-def is_hook_alive(idle_grace_sec: float = 30.0) -> bool:
+def is_hook_alive(idle_grace_sec: float = 30.0,
+                  min_silent_sec: float = 300.0) -> bool:
     """Return True if the WH_KEYBOARD_LL hook is provably still installed.
 
     Detection approach: compare our own last-hook-callback timestamp
@@ -466,7 +478,16 @@ def is_hook_alive(idle_grace_sec: float = 30.0) -> bool:
       will report dead).
 
     Called from the main.py watchdog loop; must be cheap.
+
+    Mouse-vs-keyboard disambiguation: GetLastInputInfo reports the last
+    time Windows saw ANY input (mouse OR keyboard), but WH_KEYBOARD_LL
+    only sees keyboard. Mouse motion alone would otherwise trip a
+    false-positive every ~2s. We snapshot the cursor position across
+    calls; if the cursor moved between the previous check and now, the
+    recent input includes mouse, so we cannot conclude the hook is dead.
     """
+    global _last_cursor_x, _last_cursor_y, _last_cursor_check_tick
+
     if not _started or _hook_ref[0] is None:
         return False
 
@@ -482,15 +503,46 @@ def is_hook_alive(idle_grace_sec: float = 30.0) -> bool:
     ms_since_windows_input = (now_tick - lii.dwTime) & 0xFFFFFFFF
     sec_since_windows_input = ms_since_windows_input / 1000.0
 
+    # Snapshot cursor now; compare against previous snapshot to see if
+    # mouse moved between checks. Do this BEFORE any early return so the
+    # baseline is fresh for the next call.
+    pt = _wt.POINT()
+    cursor_moved = False
+    if _user32.GetCursorPos(ctypes.byref(pt)):
+        if _last_cursor_check_tick != 0 and (
+            pt.x != _last_cursor_x or pt.y != _last_cursor_y
+        ):
+            cursor_moved = True
+        _last_cursor_x = pt.x
+        _last_cursor_y = pt.y
+        _last_cursor_check_tick = now_tick
+
     if sec_since_windows_input > idle_grace_sec:
         # User is idle. Can't distinguish dead hook from real idleness.
         return True
 
+    if cursor_moved:
+        # Mouse moved since last check — recent input includes mouse
+        # events our keyboard-only hook doesn't see. Can't conclude
+        # anything about hook liveness.
+        return True
+
     sec_since_hook_callback = time.monotonic() - _last_hook_tick
 
-    # Windows saw input in the last N seconds. Our hook must have too
-    # (with a small tolerance for the timestamp race).
-    return sec_since_hook_callback < sec_since_windows_input + 2.0
+    # Even with cursor stationary, mouse CLICKS (button events without
+    # motion) also update GetLastInputInfo but don't fire our keyboard
+    # hook. To avoid tripping on those, require the hook to have been
+    # silent for at least `min_silent_sec` — normal keyboard activity
+    # keeps _last_hook_tick fresh, so 5-min silence combined with recent
+    # OS input is a very reliable "hook is actually dead" signal.
+    if sec_since_hook_callback < min_silent_sec:
+        return True
+
+    # Hook silent for 5+ minutes, cursor stationary between watchdog
+    # ticks, and Windows saw input recently — that input was almost
+    # certainly keyboard (or a mouse click) that our hook should have
+    # seen but didn't. Treat as dead.
+    return False
 
 
 def reinstall_hook() -> bool:

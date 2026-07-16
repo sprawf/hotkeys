@@ -182,12 +182,26 @@ class OverlayWindow:
 
     # ── URL downloader pills (Ctrl+Alt+D) ────────────────────────────────────
 
+    def show_download_capturing(self) -> None:
+        """Immediate pill shown the instant Ctrl+Alt+D fires, before the
+        clipboard capture completes. Bridges the ~500ms silence between
+        the hotkey press and the download-starting pill."""
+        self._close()
+        self._build('🔍  Reading URL…', _TEXT_CLR, ACCENT)
+
     def show_download_starting(self) -> None:
         """Initial pill — shown the moment the URL is captured, before
         yt-dlp's first progress hook fires (which can take a few seconds
         while it resolves the format manifest)."""
         self._close()
         self._build('📥  Downloading…  0%', _TEXT_CLR, ACCENT)
+
+    def show_download_asking(self) -> None:
+        """Pill shown while the playlist-confirmation dialog is on screen,
+        so the user knows the download is waiting on their input rather
+        than stalled."""
+        self._close()
+        self._build('❓  Playlist detected — choose in dialog', _TEXT_CLR, ACCENT)
 
     def show_download_progress(self, frac: float) -> None:
         """Update the percentage in the in-flight download pill. Safe to

@@ -134,6 +134,7 @@ def download_url(
     on_progress: Callable[[float], None] | None = None,
     on_log:      Callable[[str], None]  | None = None,
     on_phase:    Callable[[str], None]  | None = None,
+    allow_playlist: bool = False,
 ) -> Path:
     """User-facing downloader: saves `url` to `dest_dir` using the yt-dlp
     format string `fmt` (see DOWNLOAD_FORMATS for the curated menu). Returns
@@ -145,11 +146,12 @@ def download_url(
     """
     return _download(url, dest_dir, fmt,
                      on_progress=on_progress, on_log=on_log,
-                     on_phase=on_phase)
+                     on_phase=on_phase, allow_playlist=allow_playlist)
 
 
 def _download(url: str, dest_dir, fmt: str, *,
-              on_progress, on_log, on_phase=None) -> Path:
+              on_progress, on_log, on_phase=None,
+              allow_playlist: bool = False) -> Path:
     """on_phase(label) is called with short status strings like 'merging',
     'transcoding', or 'done' so callers can update UI text separately
     from the progress bar."""
@@ -201,12 +203,30 @@ def _download(url: str, dest_dir, fmt: str, *,
         except Exception:
             pass
 
+    # Bridge yt-dlp's internal logger into ours so failures show the
+    # real extractor/HTTP trace in app.log without needing quiet=False
+    # (which would flood the console). Every yt-dlp log line is prefixed
+    # with 'yt-dlp:' so it's greppable.
+    class _YtdlpLogger:
+        def debug(self, msg):
+            # yt-dlp routes both real debug AND normal info through debug()
+            # (an [debug] prefix distinguishes them). We downgrade real
+            # debug lines and keep info at INFO.
+            if msg.startswith('[debug] '):
+                logger.debug(f'yt-dlp: {msg[8:]}')
+            else:
+                logger.info(f'yt-dlp: {msg}')
+        def info(self, msg):     logger.info(f'yt-dlp: {msg}')
+        def warning(self, msg):  logger.warning(f'yt-dlp: {msg}')
+        def error(self, msg):    logger.error(f'yt-dlp: {msg}')
+
     opts = {
         'format':           fmt,
         'outtmpl':          str(dest / '%(title).80s [%(id)s].%(ext)s'),
-        'noplaylist':       True,
+        'noplaylist':       not allow_playlist,
         'quiet':            True,
         'no_warnings':      True,
+        'logger':           _YtdlpLogger(),
         'progress_hooks':   [_hook],
         'postprocessor_hooks': [_pp_hook],
         'extract_flat':     False,
