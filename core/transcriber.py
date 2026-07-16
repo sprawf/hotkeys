@@ -526,8 +526,16 @@ class Transcriber:
         try:
             from _bundled_keys import GROQ, GROQ_2
             keys += [GROQ, GROQ_2]
-        except Exception:
-            pass
+        except Exception as _bk_exc:
+            # LOUD instead of silent — missing bundled keys is a critical
+            # dist bug (users get local-only fallback with no diagnostic).
+            # WARNING level so it appears in every session's log.
+            logger.warning(
+                f'BUNDLED KEYS MISSING: {_bk_exc}. Cloud STT will only '
+                f'work if user manually adds a Groq key in Settings. This '
+                f'is almost always a dist packaging bug — _bundled_keys.py '
+                f'should be in the app folder.'
+            )
         try:
             extra = (self._cfg.providers.groq.api_key if hasattr(self._cfg, 'providers') else '') or ''
             if extra and extra not in keys:

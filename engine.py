@@ -60,7 +60,15 @@ try:
         'cerebras':   _CB_KEY,
         'cerebras_2': _CB_KEY_2,
     }
-except ImportError:
+except ImportError as _bk_exc:
+    # LOUD — missing bundled keys is a critical dist bug.
+    import logging as _logging
+    _logging.getLogger(__name__).warning(
+        f'BUNDLED KEYS MISSING: {_bk_exc}. All cloud features (refine, ask, '
+        f'vision, transcribe) will require user to add their own keys in '
+        f'Settings. This is almost always a dist packaging bug — '
+        f'_bundled_keys.py should be beside the .exe.'
+    )
     _BUNDLED: dict = {'groq': '', 'groq_2': '', 'cerebras': '', 'cerebras_2': ''}
 
 _SSL_ERRS = (

@@ -103,6 +103,24 @@ datas += [(str(ROOT / 'assets'), 'assets')]
 # Prompt library
 datas += [(str(ROOT / 'prompts.json'), '.')]
 
+# ── Bundled API keys (Cerebras + Groq) — CRITICAL ────────────────────────────
+# _bundled_keys.py provides the free-tier API keys baked into every dist so
+# users get instant cloud STT / refine / vision without needing to sign up
+# for their own keys. Listing it in hiddenimports alone is NOT enough:
+# PyInstaller SILENTLY skips missing hidden imports. Explicit datas entry
+# is what actually copies the .py file into the dist. Missing file at
+# build time = FATAL (users would get local-only fallback + confused).
+_bk = ROOT / '_bundled_keys.py'
+if _bk.exists():
+    datas += [(str(_bk), '.')]
+    print(f'++ _bundled_keys.py bundled ({_bk.stat().st_size} bytes)')
+else:
+    raise SystemExit(
+        f'!! FATAL: {_bk} missing. Every dist without it silently falls '
+        f'back to local models for cloud features. Create the file with '
+        f'CEREBRAS/GROQ/CEREBRAS_2/GROQ_2 keys before building.'
+    )
+
 # ── Whiteboard offline bundle (Shift+F8 whiteboard) ──────────────────────────
 # whiteboard.py loads whiteboard_assets/dist/index.html via file://.
 # Path resolution at runtime: when frozen, looks under sys._MEIPASS — so the
