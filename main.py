@@ -1041,6 +1041,15 @@ class App:
             kbhook.add_hotkey(hk.get('download_url', 'ctrl+alt+d'),
                               self._hk_download_url)
 
+            # Voice-to-text supports TWO simultaneous hotkeys: 'whisper'
+            # (default ctrl+enter, technical users) and 'whisper_alt'
+            # (default alt+space, one-handed / less-technical users).
+            # Both go through the same PTT / toggle path below.
+            whisper_hks = [hk.get('whisper', 'ctrl+enter')]
+            alt_hk = (hk.get('whisper_alt') or '').strip()
+            if alt_hk and alt_hk.lower() != whisper_hks[0].lower():
+                whisper_hks.append(alt_hk)
+
             if ptt:
                 # Push-to-talk reads the full whisper hotkey (e.g. ctrl+enter)
                 # and only starts recording while ALL modifiers are held AND
@@ -1111,6 +1120,44 @@ class App:
                 for _mod in required_mods:
                     keyboard.on_release_key(_mod, _stop_nowait, suppress=False)
 
+                # Secondary PTT wiring for whisper_alt (e.g. alt+space).
+                # Duplicates the same press/release plumbing so a second
+                # hotkey works identically to the primary. Skips silently
+                # if only one whisper hotkey is configured.
+                if len(whisper_hks) > 1:
+                    alt_hk_l = whisper_hks[1].lower()
+                    alt_parts = [p.strip() for p in alt_hk_l.split('+') if p.strip()]
+                    alt_trigger = alt_parts[-1] if alt_parts else ''
+                    alt_mods = alt_parts[:-1]
+                    _alt_required_vks = tuple(
+                        _MOD_VKS.get(m) for m in alt_mods if _MOD_VKS.get(m))
+
+                    def _alt_mods_held() -> bool:
+                        if _gaks is None:
+                            return True
+                        try:
+                            for vk in _alt_required_vks:
+                                if not (_gaks(vk) & 0x8000):
+                                    return False
+                            return True
+                        except Exception:
+                            return False
+
+                    def _alt_on_press(_evt):
+                        if not alt_mods or _alt_mods_held():
+                            try:
+                                self._q.put_nowait(('whisper:start', None))
+                            except queue.Full:
+                                pass
+
+                    if alt_trigger:
+                        keyboard.on_press_key(alt_trigger, _alt_on_press, suppress=False)
+                        keyboard.on_release_key(alt_trigger, _on_release, suppress=False)
+                        for _mod in alt_mods:
+                            keyboard.on_release_key(_mod, _stop_nowait, suppress=False)
+                        logger.info(f'PTT mode (alt): hold {alt_hk_l!r} '
+                                    f'(trigger={alt_trigger!r}, mods={alt_mods})')
+
                 logger.info(f'PTT mode: hold {whisper_hk!r} '
                             f'(trigger={trigger_key!r}, mods={required_mods})')
             else:
@@ -1119,7 +1166,11 @@ class App:
                 # a newline, but it interfered with games and other apps that
                 # legitimately use Ctrl+Enter. The newline cost in chat apps is
                 # acceptable; the game compatibility is not.
-                kbhook.add_hotkey(hk.get('whisper', 'ctrl+enter'), self._hk_whisper)
+                for _hk in whisper_hks:
+                    try:
+                        kbhook.add_hotkey(_hk, self._hk_whisper)
+                    except Exception as _e:
+                        logger.warning(f'Failed to register whisper hotkey {_hk!r}: {_e}')
 
             kbhook.add_hotkey('escape', self._hk_escape)
 

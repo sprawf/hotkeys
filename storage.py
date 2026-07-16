@@ -444,6 +444,11 @@ DEFAULT_CONFIG: dict = {
         'refine':       'alt+shift+w',
         'library':      'alt+shift+e',
         'whisper':      'ctrl+enter',
+        # Secondary voice-to-text hotkey (always active alongside 'whisper').
+        # Alt+Space is easier to reach one-handed than Ctrl+Enter, which
+        # matters for less-technical users. Both keys work simultaneously
+        # and both honour PTT mode. Users can rebind in Settings.
+        'whisper_alt':  'alt+space',
         'undo_refine':  'alt+shift+z',
         'macro_record': 'shift+f1',
         'recorder':     'shift+f2',
