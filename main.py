@@ -190,6 +190,56 @@ VERSION = '1.0.0'
 _ASK_NO_TEXT = '\x00IMAGE_NO_TEXT'
 _DOWNLOAD_NO_URL = '\x00DOWNLOAD_NO_URL'
 
+
+def _friendly_download_error(raw: str) -> str:
+    """Translate a raw yt-dlp exception into a short, user-facing pill line.
+
+    yt-dlp errors are technical and often long; the pill only fits ~80
+    chars and users don't care about traceback fragments. Map the known
+    error shapes to plain sentences that name the ACTUAL cause and, when
+    possible, what to do about it. Fall back to the raw text truncated.
+    """
+    low = raw.lower()
+    # Bot / TLS-fingerprint block (Dailymotion, Reddit, Twitter/X, etc.)
+    if 'impersonat' in low:
+        return ('This site blocks non-browser downloads. '
+                'Restart Hotkeys so it can load curl_cffi.')
+    # YouTube age / login gate
+    if "sign in to confirm you're not a bot" in low or 'age' in low and 'restrict' in low:
+        return 'YouTube requires sign-in for this video (age / bot check).'
+    if 'private video' in low:
+        return 'This video is private.'
+    if 'video unavailable' in low or 'has been removed' in low:
+        return 'Video unavailable (removed or region-locked).'
+    if 'requested format is not available' in low or 'no video formats' in low:
+        return 'No downloadable video/audio stream found for this URL.'
+    if 'unsupported url' in low:
+        return "yt-dlp doesn't support this site."
+    if 'http error 403' in low:
+        return 'Site denied the request (HTTP 403). Try again later.'
+    if 'http error 404' in low:
+        return 'URL not found (HTTP 404).'
+    if 'http error 429' in low:
+        return 'Rate-limited by the site (HTTP 429). Wait and retry.'
+    if 'ssl' in low or 'certificate' in low or 'tls' in low:
+        return 'TLS handshake failed. Check network / antivirus.'
+    if 'name or service not known' in low or 'getaddrinfo failed' in low or 'no address' in low:
+        return 'DNS lookup failed. Check your internet connection.'
+    if 'timed out' in low or 'timeout' in low:
+        return 'Download timed out. Check your connection and retry.'
+    if 'ffmpeg' in low:
+        return 'ffmpeg failed to merge streams. Check disk space.'
+    if 'no space' in low or 'disk full' in low:
+        return 'Not enough disk space in Downloads.'
+    if 'unable to extract' in low:
+        return "yt-dlp couldn't parse this page. It may need an update."
+    # Fallback: strip the "ERROR: [extractor] id: " prefix that yt-dlp adds
+    import re as _re
+    stripped = _re.sub(r'^ERROR:\s*\[[^\]]+\]\s*[^:]+:\s*', '', raw, count=1)
+    if len(stripped) > 80:
+        stripped = stripped[:77] + '…'
+    return f'Download failed: {stripped}'
+
 # Phrases the vision model returns when an image has no readable text
 _NO_TEXT_PHRASES = (
     'there is no text',
@@ -611,7 +661,21 @@ class App:
         self.root = ctk.CTk()
         self.root.withdraw()
         self.root.title('Hotkeys')
-        self.root.protocol('WM_DELETE_WINDOW', self._quit)
+        # Do NOT quit on WM_DELETE_WINDOW. The root is a hidden host for
+        # every Tk timer / after() callback in the app; if any external
+        # event closes it (Alt+F4 while somehow focused, WM_CLOSE from
+        # another process, spurious Tcl event), the whole app would die.
+        # Instead, just re-withdraw and log so we can trace the source.
+        # The only supported exit path is tray → Quit Hotkeys.
+        def _swallow_root_close():
+            logger.warning(
+                'Root received WM_DELETE_WINDOW; re-withdrawing to keep '
+                'the app alive. Exit via tray menu only.')
+            try:
+                self.root.withdraw()
+            except Exception:
+                pass
+        self.root.protocol('WM_DELETE_WINDOW', _swallow_root_close)
         # Load TkDND extension into the Tk interpreter so any widget can
         # opt into drag-drop later via drop_target_register(DND_FILES).
         # We only require it once at startup, not per widget. If the
@@ -801,6 +865,7 @@ class App:
             'audio_editor':       lambda _: self._do_open_audio_editor(),
             # Ctrl+Alt+D, downloads URL from selection/clipboard via yt-dlp.
             'download_url':       lambda url: self._do_download_url(url),
+            'download_url_ask':   lambda payload: self._ask_download_playlist(*payload),
         }
 
         self._register_hotkeys()
@@ -1180,6 +1245,23 @@ class App:
         # 2. State reconciliation: any flag set to "busy" but with no
         #    real underlying object is stale and gets cleared silently.
         self._reconcile_stuck_states()
+
+        # 3. Heartbeat: log once per minute so post-mortems can see the
+        # exact moment logging stopped == exact moment the process was
+        # killed. Cheap: one INFO line every 30 ticks.
+        try:
+            # 1800 ticks * 2s = 1 hour
+            self._hb_tick = getattr(self, '_hb_tick', 0) + 1
+            if self._hb_tick >= 1800:
+                self._hb_tick = 0
+                import os as _os, psutil as _ps
+                try:
+                    _rss = _ps.Process(_os.getpid()).memory_info().rss / (1024 * 1024)
+                    logger.info(f'heartbeat: alive, rss={_rss:.0f}MB, pid={_os.getpid()}')
+                except Exception:
+                    logger.info(f'heartbeat: alive, pid={_os.getpid()}')
+        except Exception:
+            pass
 
         self.root.after(2000, self._hotkey_watchdog)
 
@@ -2556,7 +2638,31 @@ class App:
         an instant ShowWindow on the existing WebView2 window instead of a
         cold subprocess + Edge Chromium init (~30-45s on first boot). The
         subprocess stays alive for the session via the existing
-        hide-on-close logic."""
+        hide-on-close logic.
+
+        Skip pre-warm entirely if pythonnet / .NET Framework isn't loadable
+        on this PC (common on older Windows 10 without .NET 4.7.2+ or with
+        no Edge WebView2 Runtime). Without this check the subprocess dies
+        with a scary Python traceback popup at startup on every launch.
+        The user's first Shift+F8 will still show the friendly install-
+        instructions dialog from whiteboard.py, but only if they actually
+        try to use the whiteboard.
+        """
+        if not getattr(self, '_wb_runtime_ok', None):
+            try:
+                # Cheap probe: does pythonnet load its .NET bridge here?
+                # We import via the same path pywebview's edgechromium/
+                # winforms backends use, so a failure here predicts their
+                # failure too.
+                import clr  # noqa: F401 - probe only
+                self._wb_runtime_ok = True
+            except Exception as _clr_exc:
+                self._wb_runtime_ok = False
+                logger.warning(
+                    f'Whiteboard pre-warm SKIPPED: .NET Framework / pythonnet '
+                    f'not loadable on this PC ({_clr_exc}). Shift+F8 will '
+                    f'show install instructions if the user tries it.')
+                return
         try:
             self._wb_spawn_ts = time.time()
             self._do_open_whiteboard(prewarm=True)
@@ -2839,6 +2945,14 @@ class App:
         """Ctrl+Alt+D, capture URL from selection or clipboard, queue download."""
         from overlay import latch_hotkey_cursor
         latch_hotkey_cursor()
+        # Immediate acknowledgment pill so the user knows the hotkey was
+        # received, before the ~500ms modifier-release + clipboard-read
+        # dance finishes. Without this the flow feels dead until the
+        # download starts.
+        try:
+            self.root.after(0, self.refine_overlay.show_download_capturing)
+        except Exception:
+            pass
         threading.Thread(target=self._capture_and_queue_download, daemon=True).start()
 
     def _capture_and_queue_download(self) -> None:
@@ -2883,10 +2997,116 @@ class App:
             self._q.put_nowait(('download_url', _DOWNLOAD_NO_URL))
             return
 
+        # Detect YouTube playlist URLs. Two shapes:
+        #   • ?list=... on a /watch?v=X URL → single video that is ALSO in a list
+        #   • /playlist?list=... → pure playlist URL, no v= param
+        # If we see either, hand off to the confirmation dialog on the main
+        # thread rather than downloading blindly. yt-dlp's noplaylist=True
+        # doesn't fully protect against Radio Mixes (list=RD...), which was
+        # the bug we just hit — better to ask than guess.
+        try:
+            from urllib.parse import urlparse, parse_qs
+            p = urlparse(url)
+            if ('youtube.com' in p.netloc.lower() or 'youtu.be' in p.netloc.lower()):
+                qs = parse_qs(p.query)
+                list_id = (qs.get('list') or [None])[0]
+                has_video = bool(qs.get('v'))
+                if list_id:
+                    logger.info(f'Download URL: playlist detected list={list_id[:24]} has_v={has_video}')
+                    self._q.put_nowait(('download_url_ask',
+                                        (url, list_id, has_video)))
+                    return
+        except Exception:
+            pass
+
         logger.info(f'Download URL queued: {url[:80]}')
         self._q.put_nowait(('download_url', url))
 
-    def _do_download_url(self, url) -> None:
+    def _ask_download_playlist_pill(self):
+        try:
+            self.refine_overlay.show_download_asking()
+        except Exception:
+            pass
+
+    def _ask_download_playlist(self, url: str, list_id: str, has_video: bool) -> None:
+        """Playlist URL detected — ask which scope to download.
+
+        Runs on the main thread. Uses a small always-on-top Toplevel with
+        three explicit buttons: Just this video / Entire playlist / Cancel.
+        The choice fans back out to _do_download_url() with the URL
+        rewritten (or left alone) accordingly.
+
+        Radio Mixes (list=RD…) don't have a downloadable playlist view, so
+        we tell the user and offer only single-video or cancel.
+        """
+        import customtkinter as _ctk
+
+        self._ask_download_playlist_pill()
+        is_mix = list_id.startswith(('RD', 'UL', 'ML'))
+
+        dlg = _ctk.CTkToplevel(self.root)
+        dlg.title('Playlist detected')
+        dlg.attributes('-topmost', True)
+        try:
+            dlg.iconbitmap(default='')
+        except Exception:
+            pass
+        dlg.resizable(False, False)
+
+        header = ('This URL is a YouTube Mix (auto-generated). '
+                  'Only the single video can be downloaded.') if is_mix else \
+                 ('This URL points to a playlist. Download just the '
+                  'current video, or every video in the playlist?')
+        if not has_video:
+            header = ('This URL is a pure playlist page (no single video). '
+                      'Download every video in the playlist?')
+
+        _ctk.CTkLabel(dlg, text=header, wraplength=380, justify='left',
+                      font=('Segoe UI', 11)).pack(padx=20, pady=(18, 12))
+
+        btns = _ctk.CTkFrame(dlg, fg_color='transparent')
+        btns.pack(padx=20, pady=(0, 16))
+
+        def _do_single():
+            dlg.destroy()
+            from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+            p = urlparse(url)
+            q = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)
+                 if k not in {'list', 'index', 'start_radio', 'pp'}]
+            single = urlunparse(p._replace(query=urlencode(q)))
+            self._do_download_url(single)
+
+        def _do_all():
+            dlg.destroy()
+            # Pass the URL through unchanged and set a flag so the worker
+            # allows playlist iteration for this one call.
+            self._do_download_url(url, allow_playlist=True)
+
+        def _cancel():
+            dlg.destroy()
+            try:
+                self.refine_overlay.show_error('Download cancelled')
+            except Exception:
+                pass
+
+        if has_video:
+            _ctk.CTkButton(btns, text='Just this video', width=140,
+                           command=_do_single).pack(side='left', padx=6)
+        if not is_mix:
+            _ctk.CTkButton(btns, text='Entire playlist', width=140,
+                           command=_do_all).pack(side='left', padx=6)
+        _ctk.CTkButton(btns, text='Cancel', width=90,
+                       fg_color='#555', hover_color='#666',
+                       command=_cancel).pack(side='left', padx=6)
+
+        # Center on screen and grab focus
+        dlg.update_idletasks()
+        w, h = dlg.winfo_reqwidth(), dlg.winfo_reqheight()
+        sw, sh = dlg.winfo_screenwidth(), dlg.winfo_screenheight()
+        dlg.geometry(f'{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}')
+        dlg.after(50, dlg.focus_force)
+
+    def _do_download_url(self, url, allow_playlist: bool = False) -> None:
         """Main-thread handler: kicks off the yt-dlp download on a worker
         thread so we never block the UI. Pill progresses 0→1.0 then
         flips to 'Saved' / 'Failed' when the worker reports back."""
@@ -2923,18 +3143,19 @@ class App:
         # sees feedback immediately even on slow disks.
         try:
             self.refine_overlay.show_download_starting()
-        except Exception:
-            pass
+            logger.info('Download URL: starting pill shown')
+        except Exception as _pill_exc:
+            logger.exception(f'Download URL: starting pill FAILED to show: {_pill_exc}')
 
         threading.Thread(
             target=self._download_url_worker,
-            args=(url,),
+            args=(url, allow_playlist),
             daemon=True,
             name='url-download',
         ).start()
         threading.Thread(target=self._register_hotkeys_bg, daemon=True).start()
 
-    def _download_url_worker(self, url: str) -> None:
+    def _download_url_worker(self, url: str, allow_playlist: bool = False) -> None:
         """Background download via yt-dlp into ~/Downloads."""
         try:
             from pathlib import Path as _P
@@ -2969,18 +3190,39 @@ class App:
 
             from transcribe.youtube import download_url as _dl
             out_path = _dl(url, dest_dir, fmt,
-                           on_progress=_progress, on_log=None, on_phase=_phase)
+                           on_progress=_progress, on_log=None, on_phase=_phase,
+                           allow_playlist=allow_playlist)
 
             name = out_path.name if hasattr(out_path, 'name') else str(out_path).rsplit('\\', 1)[-1]
             self.root.after(0, self.refine_overlay.show_download_done, name)
             logger.info(f'Download URL: complete → {out_path}')
         except Exception as exc:
-            msg = str(exc)
-            if len(msg) > 80:
-                msg = msg[:77] + '…'
+            raw = str(exc)
+            # Post-success playlist / continuation errors: yt-dlp may
+            # error on subsequent playlist items AFTER the target video
+            # already merged to disk. Scan Downloads for a file whose
+            # name contains the video id we just tried, and if it exists,
+            # report SUCCESS instead of surfacing a misleading failure.
+            try:
+                import re as _re
+                mid = _re.search(r'(?:v=|youtu\.be/|/shorts/|/embed/)([A-Za-z0-9_-]{11})', url)
+                if mid:
+                    vid = mid.group(1)
+                    matches = list(dest_dir.glob(f'*[{vid}].mp4')) + \
+                              list(dest_dir.glob(f'*[{vid}].mkv')) + \
+                              list(dest_dir.glob(f'*[{vid}].webm')) + \
+                              list(dest_dir.glob(f'*[{vid}].m4a'))
+                    matches = [m for m in matches if not _re.search(r'\.f\d+\.', m.name)]
+                    if matches:
+                        out_path = matches[0]
+                        logger.info(f'Download URL: post-error rescue → file exists on disk: {out_path.name}')
+                        self.root.after(0, self.refine_overlay.show_download_done, out_path.name)
+                        return
+            except Exception:
+                pass
             logger.warning(f'Download URL failed: {exc}')
             self.root.after(0, self.refine_overlay.show_error,
-                            f'Download failed: {msg}')
+                            _friendly_download_error(raw))
         finally:
             try:
                 with self._downloads_lock:
@@ -8215,7 +8457,14 @@ class App:
                 f'staying alive.')
 
     def _quit(self) -> None:
-        logger.info('Shutting down.')
+        # Log who called us so we can tell tray-Quit from singleton-conflict
+        # from unexpected code paths in the log post-mortem.
+        try:
+            import traceback
+            stack = ''.join(traceback.format_stack(limit=40)[:-1])
+            logger.info(f'Shutting down. Caller stack:\n{stack}')
+        except Exception:
+            logger.info('Shutting down.')
 
         # Block briefly to let any in-flight atomic JSON save threads
         # finish. Without this, the 5s force-killer below could fire

@@ -659,10 +659,31 @@ def main():
             storage_path=str(APP_DATA / 'webview_profile'),
         )
     except Exception as e:
-        # If webview itself crashes on init (e.g. corrupted runtime),
-        # surface a real error instead of dying silently.
-        _show_fatal('Whiteboard', f'Failed to start WebView2:\n\n{e}\n\n'
-                    f'{traceback.format_exc()[:800]}')
+        # If webview itself crashes on init, translate the error into
+        # something a non-developer can act on. The two common causes
+        # on end-user PCs are missing .NET Framework 4.7.2+ and missing
+        # Edge WebView2 Runtime — both are free Microsoft installers.
+        err_text = f'{e}\n{traceback.format_exc()}'.lower()
+        missing_runtime = any(k in err_text for k in (
+            'python.runtime', 'pythonnet', 'clr', 'webview2', 'edgechromium',
+            'get_callable', 'get_function', 'loader.initialize',
+        ))
+        if missing_runtime:
+            _show_fatal('Whiteboard cannot start',
+                'The whiteboard needs two free Microsoft components that '
+                "aren't installed on this PC. All other Hotkeys features "
+                'still work, only the offline whiteboard (Shift+F8) is '
+                'affected.\n\n'
+                'To enable the whiteboard, install BOTH:\n\n'
+                '  1. Microsoft .NET Framework 4.8\n'
+                '     https://go.microsoft.com/fwlink/?LinkId=2085155\n\n'
+                '  2. Microsoft Edge WebView2 Runtime\n'
+                '     https://go.microsoft.com/fwlink/p/?LinkId=2124703\n\n'
+                'After both install, restart your PC and re-launch Hotkeys.')
+        else:
+            _show_fatal('Whiteboard',
+                f'Failed to start WebView2:\n\n{e}\n\n'
+                f'{traceback.format_exc()[:800]}')
         raise
 
 
