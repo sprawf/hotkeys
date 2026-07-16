@@ -126,6 +126,10 @@ class AudioCapture:
         # the device accepts 16 kHz directly and no resampling is needed.
         self._device_rate:  int | None = None
         self._resample_buf: np.ndarray = np.zeros(0, dtype=np.float32)
+        # Set by _callback the first time audio actually flows. Used by
+        # start_recording to block briefly on cold-start so users don't
+        # start speaking into a not-yet-flowing WASAPI stream.
+        self._first_chunk_seen: bool = False
         # Surfaced to the UI: when non-empty, the last open-stream error
         # message, lets the "Microphone unavailable" dialog show what
         # actually went wrong (sample rate? permissions? device gone?).
@@ -257,6 +261,16 @@ class AudioCapture:
             return None
 
     def _callback(self, indata, frames, time_info, status):
+        # Mark first-chunk-arrived so start_recording can wait for real
+        # audio flow before returning. Without this, PortAudio's WASAPI
+        # cold-start latency (50-500 ms after .start() returns) means
+        # the first few hundred ms of the user's speech is spoken into
+        # a not-yet-flowing stream, buffer ends up short/silent, VAD
+        # + hallucination guard classify it as "no speech detected."
+        # Only relevant on the FIRST press after opening; subsequent
+        # recordings hit the fast path (stream already flowing).
+        if not self._first_chunk_seen:
+            self._first_chunk_seen = True
         try:
             chunk = np.clip(indata[:, 0].copy(), -1.0, 1.0)
             # Resample on the fly when the device couldn't give us 16 kHz
@@ -343,8 +357,11 @@ class AudioCapture:
             self._interim_last_n = 0
             self._recording      = True
 
-        # Fast path: existing stream is already open + streaming.
-        if self._stream is not None and self._stream.active:
+        # Fast path: existing stream is already open + streaming AND
+        # we've seen audio flow through it. Second-and-later presses go
+        # here (~0 ms latency).
+        if (self._stream is not None and self._stream.active
+                and self._first_chunk_seen):
             return
 
         # Slow path: stream is None or inactive. Clean up any zombie
@@ -372,7 +389,23 @@ class AudioCapture:
                 logger.info(f'Mic open retry #{attempt} after {delay*1000:.0f}ms')
                 time.sleep(delay)
             try:
+                self._first_chunk_seen = False
                 self._open_stream()
+                # Wait up to 500 ms for the first real callback so we don't
+                # return before audio is actually flowing. WASAPI cold-start
+                # latency is typically 50-200 ms; 500 ms covers the tail.
+                # If the callback never fires within the window we proceed
+                # anyway (won't block the user forever) — a truly dead
+                # stream will show up as silence downstream, same as before.
+                t0 = time.perf_counter()
+                while not self._first_chunk_seen and (time.perf_counter() - t0) < 0.5:
+                    time.sleep(0.01)
+                if self._first_chunk_seen:
+                    warmup_ms = (time.perf_counter() - t0) * 1000
+                    if warmup_ms > 50:  # log only if the wait was meaningful
+                        logger.info(f'Mic cold-start warmup: {warmup_ms:.0f}ms')
+                else:
+                    logger.warning('Mic opened but no audio in 500ms — proceeding anyway')
                 return  # success
             except Exception as e:
                 last_exc = e
