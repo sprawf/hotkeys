@@ -7089,14 +7089,27 @@ class App:
         self._whisper_recording = True
         self._whisper_t0 = time.time()
         self._vad.reset()
-        try:
-            self._audio.start_recording()
-        except Exception as e:
+        # Retry once on transient failure: WASAPI / PortAudio doesn't fully
+        # release the input handle instantly after the previous recording
+        # ends, so a rapid second hotkey press (~<500ms after "no speech
+        # detected") can hit "device busy" even though the mic is fine.
+        # Silent 300ms retry catches this and avoids a scary popup. Only
+        # if the second attempt still fails do we surface the dialog.
+        first_err = None
+        for attempt in range(2):
+            try:
+                self._audio.start_recording()
+                first_err = None
+                break
+            except Exception as e:
+                first_err = e
+                if attempt == 0:
+                    logger.warning(f'Mic open failed on first try, retrying in 300ms: {e}')
+                    time.sleep(0.3)
+        if first_err is not None:
             self._whisper_recording = False
-            logger.error(f'Microphone error: {e}')
-            # Forward the actual error so the dialog can show the right
-            # fix instead of the generic "permissions" copy.
-            self._show_mic_error(str(e))
+            logger.error(f'Microphone error (after retry): {first_err}')
+            self._show_mic_error(str(first_err))
             return
         play_start()
         self.whisper_overlay.show_recording()
