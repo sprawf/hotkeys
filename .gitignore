@@ -11,6 +11,12 @@ venv/
 .venv/
 env/
 
+# WebView2 Fixed Version runtime bundle (~650 MB, downloaded from Microsoft)
+# Included in dist for the whiteboard. Reproduce locally by downloading
+# Microsoft.WebView2.FixedVersionRuntime.*.x64.cab from Microsoft's site
+# and extracting to this folder.
+webview2_runtime/
+
 # PyInstaller
 build/
 dist/
