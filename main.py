@@ -2663,32 +2663,59 @@ class App:
         """Send Ctrl+V immediately, then 350 ms later check whether the
         focused element's text content actually changed. If it didn't,
         open MiniNotepad with `text` so the user doesn't silently lose
-        the result. This is the post-hoc "paste failed" fallback — the
-        normal path is identical to the pre-change behavior.
+        the result. This is the post-hoc "paste failed" fallback.
 
-        Snapshot logic: ValuePattern.CurrentValue or
-        TextPattern.DocumentRange.GetText, whichever the focused
-        element exposes. If neither is available (None), we treat the
-        before-and-after match as "paste landed on a surface that
-        doesn't expose text" — same conservative rule: fall back to
-        MiniNotepad. The user can always re-paste manually from the
-        still-warm clipboard if the fallback was wrong.
+        Skips verification entirely when the focused window is owned by
+        our own process (Quick Notes, Library, sticky note, etc.) — those
+        are Tk widgets which UIA cannot read, so the snapshot returns
+        None → None matches → false-positive "paste failed" popup fires
+        the MiniNotepad even though the text landed correctly. Trusting
+        our own windows is safe: if paste failed inside our own UI, we
+        already know about it (Tk exceptions surface directly).
         """
+        # Skip verify for our own windows
+        if self._focused_is_own_process():
+            paste_from_clipboard()
+            return
         before = focused_text_snapshot()
         paste_from_clipboard()
         self.root.after(self._PASTE_VERIFY_MS,
                         lambda: self._verify_paste_landed(text, before))
+
+    def _focused_is_own_process(self) -> bool:
+        """True if the currently focused window is owned by our PID."""
+        if sys.platform != 'win32':
+            return False
+        try:
+            import ctypes as _c
+            u32 = _c.windll.user32
+            hwnd = u32.GetForegroundWindow()
+            if not hwnd:
+                return False
+            pid = _c.c_ulong(0)  # DWORD
+            u32.GetWindowThreadProcessId(hwnd, _c.byref(pid))
+            return pid.value == os.getpid()
+        except Exception:
+            return False
 
     def _verify_paste_landed(self, text: str, before) -> None:
         try:
             after = focused_text_snapshot()
         except Exception:
             after = before   # treat any read failure as "unknown, don't fallback"
+        # Only open the MiniNotepad fallback when we have DEFINITE proof
+        # the paste didn't land: both snapshots read successfully AND are
+        # identical. If either is None, UIA couldn't inspect the surface
+        # and we can't distinguish "paste failed" from "surface doesn't
+        # expose text via UIA" — trust the paste in that case rather than
+        # popping a spurious MiniNotepad.
+        if before is None or after is None:
+            return
         if before == after:
             logger.info(
                 f'Paste did not visibly land (focused text unchanged'
-                f', len before={len(before) if before else 0}'
-                f', after={len(after) if after else 0}); opening MiniNotepad')
+                f', len before={len(before)}'
+                f', after={len(after)}); opening MiniNotepad')
             self._show_mini_notepad(text)
 
     def _show_mini_notepad(self, text: str) -> None:
