@@ -189,17 +189,46 @@ total = sum(f.stat().st_size for f in DIST.rglob('*') if f.is_file())
 print(f'  Total: {total / 1024 / 1024:.0f} MB  ({DIST})')
 
 print('\n' + '=' * 60)
-if all_ok:
-    print('BUILD COMPLETE, dist/Hotkeys/ is ready to zip and ship')
-    print()
-    print('Distribution notes:')
-    print('  • Zip the entire dist/Hotkeys/ folder and share it')
-    print('  • Recipient: extract anywhere, run Hotkeys.exe, no install needed')
-    print('  • User data (config, logs, prompts) stored in dist/Hotkeys/data/')
-    print('  • User must add their own API keys via the tray icon > Settings')
-    print('=' * 60)
-else:
-    print('BUILD FAILED — one or more critical files are MISSING.')
+if not all_ok:
+    print('BUILD FAILED (step 4) — one or more critical files are MISSING.')
     print('Do NOT ship this dist. Fix the spec, then re-run build_dist.py.')
+    sys.exit(1)
+
+# ── 6. Comprehensive dist verification ────────────────────────────────────────
+# Second-layer check that catches everything Step 4 doesn't (bundled API
+# keys with wrong prefix, whisper models truncated below expected size,
+# whiteboard/audio-editor/webview2 runtime missing, etc.). Historical
+# root cause of the _bundled_keys.py silent-missing bug was that Step 4
+# never explicitly checked it — verify_dist.py enumerates EVERY critical
+# asset. If ANY check fails here, the dist is invalid and we abort.
+print('\n' + '=' * 60)
+print('Step 6: Comprehensive verification (verify_dist.py)')
+print('=' * 60)
+verify_script = ROOT / 'verify_dist.py'
+if verify_script.exists():
+    verify_result = subprocess.run(
+        [sys.executable, str(verify_script)],
+        cwd=str(ROOT),
+    )
+    if verify_result.returncode != 0:
+        print()
+        print('=' * 60)
+        print('BUILD FAILED (step 6 verification).')
+        print('Do NOT zip or release this dist. Fix the issues above and rebuild.')
+        print('=' * 60)
+        sys.exit(verify_result.returncode)
+else:
+    print(f'  [WARN] verify_dist.py not found at {verify_script} — skipping.')
+    print(f'         Manually verify all critical assets before shipping.')
+
+print('\n' + '=' * 60)
+print('BUILD COMPLETE, dist/Hotkeys/ is ready to zip and ship')
+print()
+print('Distribution notes:')
+print('  • Zip the entire dist/Hotkeys/ folder and share it')
+print('  • Recipient: extract anywhere, run Hotkeys.exe, no install needed')
+print('  • User data (config, logs, prompts) stored in dist/Hotkeys/data/')
+print('  • Bundled API keys ship in _bundled_keys.py; user-added keys via tray → Settings')
+print('=' * 60)
     print('=' * 60)
     sys.exit(1)
