@@ -457,6 +457,12 @@ DEFAULT_CONFIG: dict = {
         'web':          'shift+f5',
         'chain':        'shift+f6',
         'notes':        'shift+f7',
+        # Secondary notes hotkey (always active alongside 'notes'). Home
+        # key is easy to reach one-handed; bare Home is bound (not Ctrl+
+        # Home / Alt+Home) because most users don't use Home for anything
+        # in normal workflows. Both keys behave identically: 1st press
+        # opens notes, 2nd press saves+closes.
+        'notes_alt':    'home',
         'whiteboard':   'shift+f8',
         # File/URL transcription pipeline (faster-whisper + pyannote diarization
         # + AI summary + multi-format export). See transcribe/ package.

@@ -1034,6 +1034,17 @@ class App:
                               self._hk_chain)
             kbhook.add_hotkey(hk.get('notes',        'shift+f7'),
                               lambda: self._q.put_nowait(('notes',      None)))
+            # Secondary notes hotkey (e.g. bare Home) alongside the
+            # primary. Same toggle semantics — first press opens, second
+            # press saves+closes. Skips silently if unset or identical
+            # to primary.
+            _notes_alt = (hk.get('notes_alt') or '').strip()
+            if _notes_alt and _notes_alt.lower() != hk.get('notes', 'shift+f7').lower():
+                try:
+                    kbhook.add_hotkey(_notes_alt,
+                                      lambda: self._q.put_nowait(('notes', None)))
+                except Exception as _e:
+                    logger.warning(f'Failed to register notes_alt {_notes_alt!r}: {_e}')
             kbhook.add_hotkey(hk.get('whiteboard',   'shift+f8'),
                               lambda: self._q.put_nowait(('whiteboard', None)))
             kbhook.add_hotkey(hk.get('transcribe',   'shift+f9'),
