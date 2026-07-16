@@ -896,15 +896,18 @@ class App:
             threading.Thread(target=self._load_model, daemon=True).start()
 
         threading.Thread(target=self._prewarm, daemon=True).start()
-        # NOTE: we used to call `self._audio.start()` here to pre-warm the
-        # input stream so the first Ctrl+Enter had zero latency. That pre-
-        # warm probes every WASAPI device on the system, and on machines
-        # where every device rejects our format (16 kHz / mono / float32)
-        # PortAudio's C library corrupts its internal heap after ~5 failed
-        # opens and crashes the whole process with STATUS_STACK_BUFFER_OVERRUN
-        # (0xc0000409). start_recording() already lazy-opens the stream on
-        # demand, so removing the pre-warm only adds ~100 ms to the first
-        # voice-typing press but makes the app survive mic-less machines.
+        # Pre-warm the mic input stream so the first Ctrl+Enter /
+        # Alt+Space captures the user's speech from the very first
+        # syllable instead of eating 200-500 ms of WASAPI cold-start
+        # latency (which cuts off the beginning of dictation). Uses
+        # audio.prewarm() which is SAFE — single-attempt (system
+        # default @ 16 kHz only), so it consumes at most 1 of the ~5
+        # failed-open PortAudio-heap-corruption budget. Runs in a
+        # daemon thread so app startup isn't blocked; if the mic
+        # scan takes a moment (rare) the tray icon still appears
+        # instantly.
+        threading.Thread(target=self._audio.prewarm, daemon=True,
+                         name='mic-prewarm').start()
         threading.Thread(target=self._watch_singleton_socket, daemon=True).start()
 
         self.root.after(30, self._poll)

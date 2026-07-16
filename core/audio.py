@@ -139,6 +139,66 @@ class AudioCapture:
     def db(self):
         return self._db
 
+    def prewarm(self) -> bool:
+        """Open the mic once at app startup so the first Ctrl+Enter /
+        Alt+Space has zero cold-start latency.
+
+        SINGLE-ATTEMPT ONLY: system default at 16 kHz. Nothing else. If
+        that specific attempt fails, silently give up — do NOT try any
+        other combos. Rationale: PortAudio's C library corrupts its
+        internal heap after ~5 failed sd.InputStream opens on a machine
+        with weird device configs, and the runtime's full-scan path
+        (start_recording → _open_stream) does 4 attempts of its own.
+        We can afford 1 pre-warm attempt safely; more would risk the
+        heap-corruption crash the original pre-warm code hit.
+
+        Idempotent: safe to call multiple times. Returns True on success,
+        False on any failure (including "stream already open").
+        """
+        if self._stream is not None and self._stream.active:
+            return True
+        try:
+            self._first_chunk_seen = False
+            self._stream = sd.InputStream(
+                device=None,           # system default
+                samplerate=SAMPLE_RATE,
+                channels=1,
+                dtype='float32',
+                blocksize=BLOCKSIZE,
+                callback=self._callback,
+            )
+            self._stream.start()
+            self._device_rate  = None
+            self._resample_buf = np.zeros(0, dtype=np.float32)
+            # Wait for first real audio flow so subsequent recordings
+            # capture from a genuinely-warm buffer (WASAPI's cold-start
+            # latency is 50-200 ms; first callback may itself contain
+            # silence padding for another ~100 ms).
+            t0 = time.perf_counter()
+            while not self._first_chunk_seen and (time.perf_counter() - t0) < 0.8:
+                time.sleep(0.01)
+            # Extra 150 ms after first chunk to let WASAPI settle past
+            # any silence padding in the initial buffer.
+            if self._first_chunk_seen:
+                time.sleep(0.15)
+            logger.info(
+                f'Mic pre-warmed (system default @ 16 kHz) in '
+                f'{(time.perf_counter()-t0)*1000:.0f}ms; '
+                f'first-chunk-seen={self._first_chunk_seen}')
+            return True
+        except Exception as e:
+            # Silent give-up. start_recording's full 4-attempt scan
+            # runs later on user's first press. We consumed AT MOST
+            # 1 failed open, well under PortAudio's ~5 threshold.
+            logger.info(
+                f'Mic pre-warm skipped (system default rejected 16 kHz): {e}. '
+                f'First recording will use lazy full-scan path (adds ~200 ms).')
+            if self._stream is not None:
+                try: self._stream.close()
+                except Exception: pass
+                self._stream = None
+            return False
+
     def _open_stream(self):
         """Open the input stream. Self-healing, tries every reasonable
         combination before surfacing an error to the user, so a stale
@@ -401,9 +461,15 @@ class AudioCapture:
                 while not self._first_chunk_seen and (time.perf_counter() - t0) < 0.5:
                     time.sleep(0.01)
                 if self._first_chunk_seen:
+                    # Extra 150 ms after first chunk to skip past the
+                    # silence padding at the start of WASAPI's initial
+                    # buffer — without this, first-syllable of user's
+                    # speech still gets truncated even though the
+                    # callback has fired.
+                    time.sleep(0.15)
                     warmup_ms = (time.perf_counter() - t0) * 1000
-                    if warmup_ms > 50:  # log only if the wait was meaningful
-                        logger.info(f'Mic cold-start warmup: {warmup_ms:.0f}ms')
+                    if warmup_ms > 50:
+                        logger.info(f'Mic cold-start warmup: {warmup_ms:.0f}ms (+150ms settle)')
                 else:
                     logger.warning('Mic opened but no audio in 500ms — proceeding anyway')
                 return  # success
