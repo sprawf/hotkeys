@@ -5,12 +5,11 @@
 Select text anywhere → press a hotkey → AI rewrites it and pastes it back in under a second.
 Speak into any text field. Record your screen. Sketch on an offline whiteboard. Transcribe podcasts with speaker labels. Edit audio. All from one tiny tray icon, all offline-first, all keyboard-driven.
 
-[![Windows](https://img.shields.io/badge/Windows-Download_v3.1-0078D6?style=for-the-badge&logo=windows)](https://github.com/sprawf/hotkeys/releases/download/v3.1.0/Hotkeys-v3.1-win64.zip)
-[![Mac](https://img.shields.io/badge/Mac-Download_v3.1-999999?style=for-the-badge&logo=apple)](https://github.com/sprawf/hotkeys/releases/download/v3.1.0/Hotkeys-mac.dmg)
+[![Windows](https://img.shields.io/badge/Windows-Download_latest-0078D6?style=for-the-badge&logo=windows)](https://github.com/sprawf/hotkeys/releases/latest/download/Hotkeys-Windows.zip)
 [![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10+-blue?style=for-the-badge&logo=python)](https://python.org)
 
-> Legacy builds: [v3.0 Windows](https://github.com/sprawf/hotkeys/releases/download/v3.0.0/Hotkeys-v3.1-win64.zip) · [v2.0 Windows](https://github.com/sprawf/hotkeys/releases/download/v2.0.0/Hotkeys-v2.0-win64.zip) · [v1.0 Windows](https://github.com/sprawf/hotkeys/releases/download/v1.0.0/Hotkeys-v1.0-win64.zip)
+> [See all releases →](https://github.com/sprawf/hotkeys/releases)
 
 ---
 
@@ -79,24 +78,14 @@ These are the starting point. Hit **+ Add** to write your own.
 
 ### ⊞ Windows, one click, no setup
 
-1. **[Download Hotkeys-v3.1-win64.zip](https://github.com/sprawf/hotkeys/releases/download/v3.1.0/Hotkeys-v3.1-win64.zip)**
+1. **[Download Hotkeys-Windows.zip (latest release)](https://github.com/sprawf/hotkeys/releases/latest/download/Hotkeys-Windows.zip)**
 2. Extract the zip anywhere outside `Downloads/` (e.g. `C:\Hotkeys\`)
 3. Double-click `Hotkeys.exe`
 4. The ⚡ icon appears in your taskbar tray, you're done
 
 No Python. No pip. No API key. No installing anything.
 
-> **If your antivirus pops up** (AVG / Defender / etc.): the build is unsigned for now (signed builds via SignPath are pending approval). Right-click → restore + add exception. One-time, then it's clean.
-
-### 🍎 Mac, plug and play
-
-1. **[Download Hotkeys-mac.dmg](https://github.com/sprawf/hotkeys/releases/download/v3.1.0/Hotkeys-mac.dmg)**
-2. Open the DMG, drag **Hotkeys.app** to your Applications folder
-3. Double-click **Open Hotkeys.command** inside the DMG (bypasses macOS quarantine)
-4. Grant **Accessibility** permission when prompted (one-time, 30 seconds)
-5. The ⚡ icon appears in your menu bar
-
-> **Prefer to install from source?** [Download install_mac.command](https://github.com/sprawf/hotkeys/raw/main/install_mac.command), right-click → Open, terminal does everything automatically (~10 min).
+> **If your antivirus pops up** (AVG / Defender / etc.): the build is unsigned for now (signed builds coming later). Right-click → restore + add exception. One-time, then it's clean.
 
 ---
 
