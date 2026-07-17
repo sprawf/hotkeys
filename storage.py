@@ -481,7 +481,7 @@ DEFAULT_CONFIG: dict = {
                      'vision_model': 'qwen/qwen3.6-27b'},
         # llama3.1-8b was retired by Cerebras (404s on every call); the
         # current default matches engine.CEREBRAS_MODELS[0].
-        'cerebras': {'api_key': '', 'model': 'llama-3.3-70b'},
+        'cerebras': {'api_key': '', 'model': 'gpt-oss-120b'},
     },
     'whisper': {
         'model': {
@@ -573,7 +573,14 @@ def load_config() -> dict:
         # silently upgrade to the current default so the user doesn't
         # have to discover Settings and re-pick. The user's API key
         # still works; only the model id was retired.
-        _RETIRED_CEREBRAS = {'llama3.1-8b', 'llama3.1-70b'}
+        # Cerebras deprecation history (Developer tier):
+        #   • llama3.1-8b, llama3.1-70b — retired earlier
+        #   • llama-3.3-70b — retired (404s since 2026-07)
+        #   • glm-4.7 — retired 2026-08-17 per Cerebras 30-day notice
+        _RETIRED_CEREBRAS = {
+            'llama3.1-8b', 'llama3.1-70b', 'llama-3.3-70b',
+            'glm-4.7', 'zai-glm-4.7',
+        }
         try:
             _cb = merged['providers'].get('cerebras', {})
             if _cb.get('model') in _RETIRED_CEREBRAS:

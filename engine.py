@@ -36,8 +36,14 @@ PROVIDER_LABELS  = {
 }
 GROQ_MODELS      = ['openai/gpt-oss-120b', 'qwen/qwen3.6-27b',
                     'llama-3.1-8b-instant']
-CEREBRAS_MODELS  = ['llama-3.3-70b', 'gpt-oss-120b']
-# Cerebras retired `llama3.1-8b` (404s on every call). llama-3.3-70b is
+CEREBRAS_MODELS  = ['gpt-oss-120b', 'gemma-4-31b']
+# Cerebras Developer-tier model roster as of 2026-07 (verified via
+# `GET /v1/models` with our key):
+#   • gpt-oss-120b        — primary, fast + reliable
+#   • gemma-4-31b         — fallback
+#   • zai-glm-4.7         — DEPRECATED 2026-08-17 (Cerebras notice)
+# Retired earlier: llama3.1-8b, llama3.1-70b, llama-3.3-70b — all 404
+# now. Original comment kept below for context. llama-3.3-70b is
 # their current high-quality default and matches Groq's flagship in
 # capability, so the fallback chain is even.
 OPENAI_MODELS    = ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-3.5-turbo', 'o1', 'o1-mini']
