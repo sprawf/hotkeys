@@ -2703,20 +2703,43 @@ class App:
             after = focused_text_snapshot()
         except Exception:
             after = before   # treat any read failure as "unknown, don't fallback"
-        # Only open the MiniNotepad fallback when we have DEFINITE proof
-        # the paste didn't land: both snapshots read successfully AND are
-        # identical. If either is None, UIA couldn't inspect the surface
-        # and we can't distinguish "paste failed" from "surface doesn't
-        # expose text via UIA" — trust the paste in that case rather than
-        # popping a spurious MiniNotepad.
+
+        # Trust the paste if UIA couldn't inspect either state — we
+        # can't distinguish "paste failed" from "surface doesn't expose
+        # text via UIA."
         if before is None or after is None:
             return
-        if before == after:
-            logger.info(
-                f'Paste did not visibly land (focused text unchanged'
-                f', len before={len(before)}'
-                f', after={len(after)}); opening MiniNotepad')
-            self._show_mini_notepad(text)
+
+        # STRONG proof it worked: pasted text appears in the after
+        # snapshot. Covers the common case (paste into an empty field or
+        # append to existing content) regardless of what `before` was.
+        if text and text in after:
+            return
+
+        # WEAKER proof it worked: the focused element's text CHANGED
+        # since before. Some app somewhere reacted; we can't easily
+        # prove the change was our paste, but false-positives here
+        # would be harder to trigger than the before==after case.
+        if before != after:
+            return
+
+        # Both snapshots read the same value AND pasted text isn't
+        # visible in `after`. Before opening MiniNotepad, apply one more
+        # guard: if `before` was EMPTY, we have no way to detect success
+        # via UIA when focus shifts after paste (Chrome omnibox +
+        # autocomplete popup being the canonical case: paste lands in
+        # the omnibox, focus jumps to the autocomplete popup which
+        # returns "" for its value, we see before=="" after=="" — a
+        # ghost failure). Trust the paste when before was empty; only
+        # trigger the fallback when there was NON-EMPTY content that
+        # should have changed but didn't.
+        if not before:
+            return
+
+        logger.info(
+            f'Paste unverified (before==after=={before[:30]!r}..., '
+            f'text={text[:30]!r}...); opening MiniNotepad as fallback')
+        self._show_mini_notepad(text)
 
     def _show_mini_notepad(self, text: str) -> None:
         """Show the prewarmed MiniNotepad with `text` loaded. Recreates
