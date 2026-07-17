@@ -150,6 +150,12 @@ else:
 # var and it gets appended alongside _av_bins et al.
 _md_datas, _md_bins, _md_hidden = collect_all('markitdown')
 datas    += _md_datas
+# Magika is markitdown's file-type detector — separate package with its
+# own ONNX model tree under magika/models/standard_v*. `collect_all` on
+# markitdown does NOT walk into it (transitive dep). Missing model dir
+# = every ingest 404s with MagikaError. Bundle it explicitly.
+_mg_datas, _mg_bins, _mg_hidden = collect_all('magika')
+datas    += _mg_datas
 # tokenizers, fitz (PyMuPDF), and the rest of markitdown's optional
 # converter backends need explicit hidden imports so PyInstaller ships
 # the .pyd / native extensions.
@@ -252,6 +258,7 @@ binaries += _pynput_bins   # pynput Windows backend
 binaries += _ytdl_bins     # yt-dlp Cython speedups if present
 binaries += _ioff_bins     # imageio-ffmpeg's ffmpeg.exe
 binaries += _md_bins       # markitdown converter binaries (from Ask Docs)
+binaries += _mg_bins       # magika ONNX runtime (file-type detector)
 
 # ── Hidden imports ────────────────────────────────────────────────────────────
 
@@ -442,6 +449,7 @@ hiddenimports += _av_hidden   # av submodules from collect_all
 # Ask Docs (subpackage + markitdown converters + native tokenizers/fitz).
 hiddenimports += collect_submodules('ask_docs')
 hiddenimports += _extra_ad_hidden
+hiddenimports += _mg_hidden   # magika submodules
 hiddenimports += collect_submodules('ctranslate2')
 hiddenimports += [m for m in collect_submodules('onnxruntime') if 'quantization' not in m and 'onnx' not in m]
 hiddenimports += collect_submodules('groq')

@@ -388,8 +388,18 @@ class AskDocsWindow(ctk.CTkToplevel):
         )
         self._send_btn.pack(side='left')
 
-        # Ctrl+Enter to send
-        self._input.bind('<Control-Return>', lambda e: (self._send(), 'break')[1])
+        # Return sends; Shift+Return inserts a newline (modern chat UX).
+        # Do NOT use Ctrl+Return — Hotkeys' global whisper hotkey (Ctrl+
+        # Enter) hijacks it before the widget ever sees it, so pressing
+        # Ctrl+Enter inside Ask Docs would trigger voice recording
+        # instead of sending the message.
+        def _on_return(e):
+            if getattr(e, 'state', 0) & 0x0001:   # Shift modifier
+                return None   # allow default newline insertion
+            self._send()
+            return 'break'
+        self._input.bind('<Return>', _on_return)
+        self._input.bind('<KP_Enter>', _on_return)
         # Auto-grow placeholder rendering — CTk doesn't natively support a
         # placeholder on textbox; we fake it with grey "Ask a question…"
         # that clears on first keypress.

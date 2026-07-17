@@ -114,6 +114,11 @@ CHECKS = [
         lambda: whisper_model_size_ok('ask_docs/models/all-MiniLM-L6-v2/model.onnx', 80)),
     ('ask_docs MiniLM tokenizer',
         lambda: file_exists('ask_docs/models/all-MiniLM-L6-v2/tokenizer.json')),
+    # Magika: file-type detector used by markitdown. If its ONNX models
+    # aren't collected, every source-add in Ask Docs 500s with MagikaError.
+    ('magika model dir',
+        lambda: file_exists('magika/models/standard_v3_3')
+                if callable(file_exists) else (False, 'file_exists broken')),
 ]
 
 
