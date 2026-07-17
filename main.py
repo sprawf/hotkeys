@@ -155,7 +155,8 @@ from core.audio       import AudioCapture
 from core.vad         import SileroVAD
 from core.transcriber import Transcriber
 from core.typer       import (copy_to_clipboard, paste_from_clipboard, copy_selection,
-                              undo_last, focused_text_snapshot)
+                              undo_last, focused_text_snapshot,
+                              has_editable_focus_in_foreground)
 from core.sounds      import play_start, play_stop
 from screenshot       import (take_screenshot, start_prtsc_listener,
                               start_prtsc_keylogger)
@@ -2677,6 +2678,21 @@ class App:
         if self._focused_is_own_process():
             paste_from_clipboard()
             return
+        # PRE-check: if UIA confidently reports NO editable target in the
+        # foreground (desktop empty space, browser page with no input
+        # focused, image viewer, PDF read-mode, etc.), skip the paste
+        # attempt entirely and go straight to MiniNotepad. Fires before
+        # Ctrl+V is even sent, so no ghost key event lands in a random
+        # non-editable surface.
+        try:
+            if not has_editable_focus_in_foreground():
+                logger.info(
+                    'No editable focus in foreground; opening MiniNotepad '
+                    'directly (skipping paste attempt).')
+                self._show_mini_notepad(text)
+                return
+        except Exception:
+            pass  # fail-open: fall through to paste + verify path
         before = focused_text_snapshot()
         paste_from_clipboard()
         self.root.after(self._PASTE_VERIFY_MS,
