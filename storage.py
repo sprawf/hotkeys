@@ -474,6 +474,11 @@ DEFAULT_CONFIG: dict = {
         # sites yt-dlp supports). Select a URL in any app → press hotkey →
         # downloads best-quality video into ~/Downloads.
         'download_url': 'ctrl+alt+d',
+        # Ask Docs: NotebookLM-style document Q&A. Load PDFs / Word docs /
+        # PowerPoint / YouTube URLs / audio / images and chat with them
+        # with inline citations. Uses Hotkeys' bundled Groq keys — no
+        # extra setup for the user. See ask_docs/ package.
+        'ask_docs':     'shift+f11',
     },
     'providers': {
         'local':    {'model_id': 'Qwen/Qwen2.5-1.5B-Instruct-GGUF'},
@@ -566,6 +571,14 @@ def load_config() -> dict:
         merged = {**DEFAULT_CONFIG, **cfg}
         merged['providers'] = _deep_merge(DEFAULT_CONFIG['providers'], cfg.get('providers', {}))
         merged['hotkeys']   = {**DEFAULT_CONFIG['hotkeys'],   **cfg.get('hotkeys',   {})}
+        # ── Migration: retired hotkey slots ────────────────────────────
+        # slot11/slot12 were early scaffolding for "unassigned user slots"
+        # and were never wired to a handler. slot11 in particular
+        # collides with the ask_docs default (shift+f11) as of v3.3.0.
+        # Strip them so the printed hotkey dict doesn't advertise ghost
+        # bindings.
+        for _dead in ('slot11', 'slot12'):
+            merged['hotkeys'].pop(_dead, None)
         merged['whisper']   = _deep_merge(DEFAULT_CONFIG['whisper'], cfg.get('whisper', {}))
         # ── Migration: retired provider models ────────────────────────────
         # If the saved config still names a Cerebras model that the

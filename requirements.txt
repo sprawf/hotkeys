@@ -54,3 +54,6 @@ opencv-python-headless>=4.8.0   # OCR image preprocessing (denoise / deskew / th
 # huggingface-hub>=0.20.0
 python-bidi
 arabic-reshaper
+markitdown[all]
+tokenizers
+PyMuPDF

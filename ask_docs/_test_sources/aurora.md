@@ -1,0 +1,11 @@
+# Aurora Photonics — Company Profile
+
+Aurora Photonics Inc. was founded in 2014 by Dr. Elena Voss
+and is headquartered in Geneva, Switzerland. The company employs
+847 people across three continents and holds
+127 patents in quantum-photonic sensing.
+
+Its flagship product is the Lumin-7 quantum sensor, deployed across
+aerospace, biomedical imaging, defense optics industries. Total revenue reached $214 million in fiscal year 2024.
+
+Aurora Photonics' stated mission is to commercialise quantum-photonic sensing for real-world industrial applications.

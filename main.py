@@ -874,6 +874,8 @@ class App:
             # Ctrl+Alt+D, downloads URL from selection/clipboard via yt-dlp.
             'download_url':       lambda url: self._do_download_url(url),
             'download_url_ask':   lambda payload: self._ask_download_playlist(*payload),
+            # Shift+F11, Ask Docs (NotebookLM-style Q&A over your files).
+            'ask_docs':           lambda _: self._do_open_ask_docs(),
         }
 
         self._register_hotkeys()
@@ -936,6 +938,13 @@ class App:
         # opens in <100 ms instead of paying a cold ~300 ms Tk init.
         self._mini_notepad = None
         self.root.after(800, self._prewarm_mini_notepad)
+        # Ask Docs prewarm: import markitdown + load the MiniLM ONNX
+        # embedding model in a background thread so the first Shift+F11
+        # press opens the window instantly instead of paying ~4s of
+        # cold-start (import markitdown ~2s + ONNX load ~1-2s).
+        # Deferred to 2000ms so it doesn't compete with the earlier
+        # prewarms for CPU/I/O during the critical first-second startup.
+        self.root.after(2000, self._prewarm_ask_docs)
         # Wire audio_editor spawns into the cleanup Job Object the same
         # way whiteboard already is. Without this, killing main app
         # ungracefully orphans Tenacity — the exact bug the Job was
@@ -1062,6 +1071,9 @@ class App:
                               lambda: self._q.put_nowait(('audio_editor', None)))
             kbhook.add_hotkey(hk.get('download_url', 'ctrl+alt+d'),
                               self._hk_download_url)
+            # Shift+F11, Ask Docs (NotebookLM-style Q&A).
+            kbhook.add_hotkey(hk.get('ask_docs',    'shift+f11'),
+                              lambda: self._q.put_nowait(('ask_docs', None)))
 
             # Voice-to-text supports TWO simultaneous hotkeys: 'whisper'
             # (default ctrl+enter, technical users) and 'whisper_alt'
@@ -2660,6 +2672,36 @@ class App:
         except Exception as e:
             logger.warning(f'MiniNotepad pre-warm failed: {e}')
 
+    def _prewarm_ask_docs(self) -> None:
+        """Load Ask Docs' heavy deps + MiniLM embedding model in a
+        daemon thread so the first Shift+F11 press opens the window
+        instantly. Skips silently on failure (import markitdown can
+        fail on very stripped Python environments; ONNX load can fail
+        if the model file is missing from the dist). Both those cases
+        would surface a user-facing error only when they actually try
+        to use Ask Docs, not at startup."""
+        def _work():
+            import time
+            t0 = time.time()
+            try:
+                # markitdown import is heavy (~1-2s cold): PDF converters,
+                # docx/pptx/xlsx backends, MIME dispatch tables.
+                import markitdown  # noqa: F401
+                dt_mi = (time.time() - t0) * 1000
+                # MiniLM: ONNX session init + tokenizer load. ~500-1500ms
+                # on typical Windows PCs.
+                t1 = time.time()
+                from ask_docs import embed
+                embed.prewarm()   # triggers the lazy singleton
+                dt_em = (time.time() - t1) * 1000
+                logger.info(
+                    f'Ask Docs pre-warmed: markitdown={dt_mi:.0f}ms '
+                    f'MiniLM={dt_em:.0f}ms')
+            except Exception as e:
+                logger.info(f'Ask Docs pre-warm skipped: {e}')
+        threading.Thread(target=_work, daemon=True,
+                         name='ask-docs-prewarm').start()
+
     # Post-paste verification window: how long we wait after sending
     # Ctrl+V before re-reading the focused element's text. Needs to
     # cover the slowest expected paste round-trip (AV clipboard scans
@@ -3464,6 +3506,46 @@ class App:
             try:
                 with self._downloads_lock:
                     self._downloads_in_flight.discard(url)
+            except Exception:
+                pass
+
+    def _do_open_ask_docs(self) -> None:
+        """Shift+F11, open Ask Docs — NotebookLM-style document Q&A.
+
+        Reuses the existing window if already open (raises + focuses it);
+        otherwise creates a new AskDocsWindow parented to our Tk root.
+        The window has its own light theme intentionally (mirrors
+        NotebookLM's visual style) and doesn't need any provider config
+        from the user — it inherits Hotkeys' bundled Groq keys via the
+        shared engine.py.
+        """
+        try:
+            win = getattr(self, '_ask_docs_win', None)
+            if win is not None:
+                try:
+                    if win.winfo_exists():
+                        try: win.deiconify()
+                        except Exception: pass
+                        try: win.lift()
+                        except Exception: pass
+                        try: win.focus_force()
+                        except Exception: pass
+                        return
+                except Exception:
+                    pass
+                self._ask_docs_win = None
+            from ask_docs.ui import AskDocsWindow
+            self._ask_docs_win = AskDocsWindow(self.root)
+            logger.info('Ask Docs window opened.')
+        except Exception as e:
+            logger.exception(f'Failed to open Ask Docs: {e}')
+            try:
+                import tkinter.messagebox as _mb
+                _mb.showerror(
+                    'Ask Docs',
+                    f"Ask Docs couldn't open.\n\n{e}\n\n"
+                    "See app.log for a full traceback.",
+                    parent=self.root)
             except Exception:
                 pass
 
@@ -8260,7 +8342,7 @@ class App:
         import socket as _sock
         _VALID = {'library', 'notes', 'refine', 'ask', 'recorder',
                   'gif_record', 'macro_record', 'web', 'chain', 'whiteboard',
-                  'transcribe', 'audio_editor',
+                  'transcribe', 'audio_editor', 'ask_docs',
                   # Destructive actions still go through the confirm dialog
                   # before they touch state, safe to expose for scripting.
                   'restore_all_defaults', 'reload_hotkeys',
@@ -8604,6 +8686,13 @@ class App:
         self.provider = build_provider(self.config)
         if isinstance(self.provider, LocalProvider) and not self.provider.ready:
             threading.Thread(target=self._load_model, daemon=True).start()
+        # Ask Docs holds its own provider singleton — reset it so the
+        # next chat turn rebuilds against the freshly-selected provider.
+        try:
+            from ask_docs import llm as _ad_llm
+            _ad_llm.reset_provider()
+        except Exception:
+            pass
         self._update_tray()
         logger.info(f'Switched to provider: {key}')
 
