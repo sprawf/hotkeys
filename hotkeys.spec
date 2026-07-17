@@ -146,9 +146,10 @@ else:
 
 # markitdown pulls in dozens of converter modules dynamically; static
 # import analysis misses several. --collect-all catches them all.
+# `binaries` is defined later in the spec — save _md_bins to a top-level
+# var and it gets appended alongside _av_bins et al.
 _md_datas, _md_bins, _md_hidden = collect_all('markitdown')
 datas    += _md_datas
-binaries += _md_bins
 # tokenizers, fitz (PyMuPDF), and the rest of markitdown's optional
 # converter backends need explicit hidden imports so PyInstaller ships
 # the .pyd / native extensions.
@@ -250,6 +251,7 @@ binaries += _pynput_bins   # pynput Windows backend
 # binaries += _sf_bins
 binaries += _ytdl_bins     # yt-dlp Cython speedups if present
 binaries += _ioff_bins     # imageio-ffmpeg's ffmpeg.exe
+binaries += _md_bins       # markitdown converter binaries (from Ask Docs)
 
 # ── Hidden imports ────────────────────────────────────────────────────────────
 
