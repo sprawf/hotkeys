@@ -2727,34 +2727,33 @@ class App:
             return
 
         # STRONG proof it worked: pasted text appears in the after
-        # snapshot. Covers the common case (paste into an empty field or
-        # append to existing content) regardless of what `before` was.
+        # snapshot. Covers the common case (paste into an empty field
+        # or append to existing content) regardless of what `before` was.
         if text and text in after:
             return
 
-        # WEAKER proof it worked: the focused element's text CHANGED
-        # since before. Some app somewhere reacted; we can't easily
-        # prove the change was our paste, but false-positives here
-        # would be harder to trigger than the before==after case.
-        if before != after:
-            return
-
-        # Both snapshots read the same value AND pasted text isn't
-        # visible in `after`. Before opening MiniNotepad, apply one more
-        # guard: if `before` was EMPTY, we have no way to detect success
-        # via UIA when focus shifts after paste (Chrome omnibox +
-        # autocomplete popup being the canonical case: paste lands in
-        # the omnibox, focus jumps to the autocomplete popup which
-        # returns "" for its value, we see before=="" after=="" — a
-        # ghost failure). Trust the paste when before was empty; only
-        # trigger the fallback when there was NON-EMPTY content that
-        # should have changed but didn't.
+        # `text` isn't visible in after. Before opening MiniNotepad,
+        # apply one guard: if `before` was EMPTY, we have no way to
+        # detect success via UIA when focus shifts after paste (Chrome
+        # omnibox + autocomplete popup being the canonical case: paste
+        # lands in the omnibox, focus jumps to the autocomplete popup
+        # which returns "" or non-matching text). Trust the paste when
+        # before was empty; only trigger the fallback when we KNOW
+        # the target had non-empty content AND our text isn't visible.
+        #
+        # NOTE: we deliberately do NOT trust "before != after" as proof
+        # of success. In Electron/Chromium apps like Claude, VS Code,
+        # Discord, the UIA accessibility tree changes slightly between
+        # snapshots (dynamic content, timestamps, animation state) even
+        # when NO paste happened. Trusting inequality would silently
+        # swallow real paste failures in those apps.
         if not before:
             return
 
         logger.info(
-            f'Paste unverified (before==after=={before[:30]!r}..., '
-            f'text={text[:30]!r}...); opening MiniNotepad as fallback')
+            f'Paste unverified: text not visible in after-snapshot '
+            f'(before-len={len(before)}, after-len={len(after)}, '
+            f'text-preview={text[:30]!r}...); opening MiniNotepad as fallback')
         self._show_mini_notepad(text)
 
     def _show_mini_notepad(self, text: str) -> None:
