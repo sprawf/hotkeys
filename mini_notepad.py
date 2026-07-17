@@ -154,6 +154,14 @@ class MiniNotepad(tk.Toplevel):
         t.bind('<Button-3>',  self._popup_context_menu)
         t.bind('<Shift-F10>', self._popup_context_menu)
         t.bind('<App>',       self._popup_context_menu)
+        # Route Ctrl+C / Ctrl+X through _copy_logical so pasting into
+        # another app gives the original logical-order text, not our
+        # visual-order display transformation. Return 'break' to
+        # suppress Tk's default copy.
+        t.bind('<Control-c>', lambda e: self._copy_logical(cut=False))
+        t.bind('<Control-C>', lambda e: self._copy_logical(cut=False))
+        t.bind('<Control-x>', lambda e: self._copy_logical(cut=True))
+        t.bind('<Control-X>', lambda e: self._copy_logical(cut=True))
 
     @staticmethod
     def _edit_quiet(fn):
@@ -225,15 +233,46 @@ class MiniNotepad(tk.Toplevel):
         elif cmd == 2:
             self._edit_quiet(t.edit_redo)
         elif cmd == 3:
-            t.event_generate('<<Cut>>')
+            self._copy_logical(cut=True)
         elif cmd == 4:
-            t.event_generate('<<Copy>>')
+            self._copy_logical(cut=False)
         elif cmd == 5:
             t.event_generate('<<Paste>>')
         elif cmd == 6:
             self._edit_quiet(lambda: t.delete('sel.first', 'sel.last'))
         elif cmd == 7:
             self._select_all()
+        return 'break'
+
+    def _copy_logical(self, cut: bool = False) -> str:
+        """Ctrl+C / Ctrl+X override: put the ORIGINAL logical-order text
+        onto the clipboard instead of Tk's visual-order display text.
+        Without this, copying Arabic from MiniNotepad and pasting into
+        any BiDi-aware app (browsers, Word, Notepad) would show visually-
+        reversed text, because we already reordered logical→visual on
+        display.
+
+        Reversal only applies when the selected range is exactly the
+        FULL text we loaded (common case: user selects all, copies).
+        For arbitrary sub-selections we fall through to Tk's default
+        copy — the user is editing/rearranging anyway."""
+        t = self._txt
+        try:
+            selection = t.get('sel.first', 'sel.last')
+        except tk.TclError:
+            return 'break'
+        original = getattr(self, '_original_text', '') or ''
+        # If the user selected exactly the full displayed text, replace
+        # with the original logical-order source.
+        full_display = t.get('1.0', 'end-1c')
+        payload = original if (selection == full_display and original) else selection
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(payload)
+        except tk.TclError:
+            pass
+        if cut:
+            self._edit_quiet(lambda: t.delete('sel.first', 'sel.last'))
         return 'break'
 
     _RTL_RANGES = (
