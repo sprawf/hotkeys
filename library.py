@@ -4362,6 +4362,13 @@ class LibraryWindow:
         self._scroll.columnconfigure(0, weight=1)
 
         notes_hk = self.hotkey_cfg.get('notes', 'shift+f7').upper()
+        # Include the secondary hotkey (bare Home by default) in the
+        # description so users discover both openers.
+        notes_alt = (self.hotkey_cfg.get('notes_alt') or '').strip().upper()
+        if notes_alt and notes_alt != notes_hk:
+            notes_hk_display = f'{notes_hk} or {notes_alt}'
+        else:
+            notes_hk_display = notes_hk
 
         container = ctk.CTkFrame(self._scroll, fg_color='transparent')
         container.grid(row=0, column=0, sticky='ew', padx=PAD, pady=PAD)
@@ -4377,7 +4384,7 @@ class LibraryWindow:
         ).grid(row=0, column=0, sticky='w', padx=PAD, pady=(PAD, 2))
         ctk.CTkLabel(
             hdr,
-            text=(f'Press {notes_hk} anywhere to capture a thought. '
+            text=(f'Press {notes_hk_display} anywhere to capture a thought. '
                   'Text, checklist or voice, runs fully offline. All '
                   'your saved notes live in the Quick Notes window.'),
             font=(FONT_FAMILY, 13), text_color=TEXT_P, justify='left',
