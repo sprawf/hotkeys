@@ -2680,51 +2680,85 @@ class App:
             return
         # PRE-check: skip paste + go straight to MiniNotepad if UIA
         # confidently says no editable target is focused.
-        try:
-            _ed = has_editable_focus_in_foreground()
-            logger.info(f'PASTE-PRE: has_editable_focus_in_foreground()={_ed}')
-            if not _ed:
-                logger.info('PASTE-PRE: skipping paste, opening MiniNotepad')
-                self._show_mini_notepad(text)
-                return
-        except Exception as _e:
-            logger.info(f'PASTE-PRE: check raised {_e!r}; fail-open to paste')
-        before = focused_text_snapshot()
-        # Also snapshot the CARET POSITION as a second verification
-        # channel. In Chromium/Electron apps (Claude Code, VS Code,
-        # Discord message history) UIA snapshot often returns None even
-        # when there's a visible caret. Caret movement is a reliable
-        # signal that paste landed — if caret POS didn't change after
-        # paste, the paste went into a non-editable surface.
-        caret_before = self._get_caret_pos()
-        logger.info(
-            f'PASTE-PRE: before-snapshot type={type(before).__name__} '
-            f'len={-1 if before is None else len(before)} '
-            f'caret_before={caret_before}')
+        # Bulletproof paste-verify built on Windows' GetGUIThreadInfo:
+        #
+        #   Foreground window has NO caret at all
+        #     → target isn't accepting text → open MiniNotepad, skip paste
+        #   Foreground has caret
+        #     → paste, then check if the caret rect changed
+        #       → changed  → paste worked
+        #       → same     → paste failed (surface has caret but rejected input)
+        #       → gone     → focus shifted (e.g. autocomplete popup) → trust
+        #
+        # Works uniformly across every Windows UI framework: Win32, Qt,
+        # WPF, Tk, Chromium/Electron, WebView2, Office, browsers. Doesn't
+        # depend on UIA (which returns None for many surfaces) or on
+        # per-app heuristics.
+        caret_before = self._get_foreground_caret()
+        logger.info(f'PASTE-PRE: caret_before={caret_before}')
+
+        # No caret in foreground = definitively not editable
+        if caret_before is not None and caret_before[0] == 0:
+            logger.info(
+                'PASTE-PRE: no caret in foreground window — target not '
+                'editable, opening MiniNotepad')
+            self._show_mini_notepad(text)
+            return
+
+        # Also grab UIA text snapshot as a secondary signal (for
+        # elements without a visible caret but with readable UIA text)
+        before_text = focused_text_snapshot()
         paste_from_clipboard()
         self.root.after(self._PASTE_VERIFY_MS,
-                        lambda: self._verify_paste_landed(text, before, caret_before))
+                        lambda: self._verify_paste_landed(text, before_text, caret_before))
 
-    def _get_caret_pos(self):
-        """Windows GetCaretPos → (x, y) tuple in screen coords, or None.
-        Only the foreground THREAD's caret is reported, so this reflects
-        the focus we care about. Returns (0,0) or None on any failure.
+    def _get_foreground_caret(self):
+        """Return (hwnd_caret, x1, y1, x2, y2) tuple describing the caret
+        in the FOREGROUND thread's window, or None if no caret exists
+        there. Uses GetGUIThreadInfo which correctly reads the foreground
+        thread's caret regardless of which thread this runs on.
+
+        `hwnd_caret == 0` means "focused window has no active caret" —
+        proves the target is not accepting text input (e.g. cursor is
+        on the desktop, in a browser page body, on an image viewer, in
+        a PDF read-mode reader).
+
+        Non-zero hwnd_caret + a rcCaret rect gives us a reliable
+        "before" state to compare against after Ctrl+V. If the caret
+        rectangle changes after paste, text was inserted.
         """
         if sys.platform != 'win32':
             return None
         try:
             import ctypes as _c
             u32 = _c.windll.user32
-            class _POINT(_c.Structure):
-                _fields_ = [('x', _c.c_long), ('y', _c.c_long)]
-            pt = _POINT()
-            # GetCaretPos returns client-area coords; convert to screen
-            # via ClientToScreen with the caret's owner window. But we
-            # only care about POSITION CHANGE, not absolute position, so
-            # raw client coords are fine — they change the same way.
-            if not u32.GetCaretPos(_c.byref(pt)):
+            class _RECT(_c.Structure):
+                _fields_ = [('left', _c.c_long), ('top', _c.c_long),
+                            ('right', _c.c_long), ('bottom', _c.c_long)]
+            class _GUITHREADINFO(_c.Structure):
+                _fields_ = [
+                    ('cbSize',       _c.c_ulong),
+                    ('flags',        _c.c_ulong),
+                    ('hwndActive',   _c.c_void_p),
+                    ('hwndFocus',    _c.c_void_p),
+                    ('hwndCapture',  _c.c_void_p),
+                    ('hwndMenuOwner',_c.c_void_p),
+                    ('hwndMoveSize', _c.c_void_p),
+                    ('hwndCaret',    _c.c_void_p),
+                    ('rcCaret',      _RECT),
+                ]
+            gti = _GUITHREADINFO()
+            gti.cbSize = _c.sizeof(gti)
+            fg = u32.GetForegroundWindow()
+            if not fg:
                 return None
-            return (pt.x, pt.y)
+            fg_thread = u32.GetWindowThreadProcessId(fg, None)
+            if not u32.GetGUIThreadInfo(fg_thread, _c.byref(gti)):
+                return None
+            hwnd = gti.hwndCaret or 0
+            return (hwnd,
+                    gti.rcCaret.left, gti.rcCaret.top,
+                    gti.rcCaret.right, gti.rcCaret.bottom)
         except Exception:
             return None
 
@@ -2748,44 +2782,54 @@ class App:
         try:
             after = focused_text_snapshot()
         except Exception:
-            after = before   # treat any read failure as "unknown, don't fallback"
-        caret_after = self._get_caret_pos()
+            after = before
+        caret_after = self._get_foreground_caret()
 
         _b_len = -1 if before is None else len(before)
         _a_len = -1 if after is None else len(after)
-        _b_snip = (before[:60] if isinstance(before, str) else repr(before))
-        _a_snip = (after[:60] if isinstance(after, str) else repr(after))
         _t_snip = text[:60] if isinstance(text, str) else repr(text)
 
-        # UIA-based strong proof: pasted text visible in the after snapshot
+        # 1. STRONG signal: UIA text-after contains our pasted text
         if before is not None and after is not None and text and text in after:
-            logger.info('PASTE-VERIFY: text visible in after-snapshot — paste verified')
+            logger.info('PASTE-VERIFY: text visible in UIA after-snapshot — verified')
             return
 
-        # UIA-based weak trust: before was empty (Chrome omnibox case)
-        if before == '' and after is not None:
-            logger.info(f'PASTE-VERIFY: before empty (after={_a_snip!r}) — trusting paste')
-            return
-
-        # Caret-position proof: if the caret MOVED during the paste, some
-        # text was inserted. Reliable for Chromium/Electron apps where
-        # UIA returns None but the caret is real. If BOTH caret positions
-        # are non-None AND identical → nothing was inserted → paste failed.
-        if (caret_before is not None and caret_after is not None
-                and caret_before == caret_after):
+        # 2. CARET signal: caret moved between before and after
+        if caret_before is not None and caret_after is not None:
+            # Focus shifted to a window with no caret (autocomplete popup,
+            # notification): can't verify but likely paste worked.
+            if caret_after[0] == 0 and caret_before[0] != 0:
+                logger.info(
+                    f'PASTE-VERIFY: caret vanished (focus shifted from '
+                    f'hwnd={hex(caret_before[0])} to no-caret window) '
+                    f'— trusting paste')
+                return
+            # Caret moved (either to a new hwnd or same hwnd different pos)
+            if caret_after != caret_before:
+                logger.info(
+                    f'PASTE-VERIFY: caret moved '
+                    f'{caret_before} → {caret_after} — verified')
+                return
+            # Caret unchanged AND we can measure it: paste did NOT land
             logger.info(
-                f'PASTE-VERIFY: FAIL (caret stationary) '
-                f'caret={caret_before} UIA before-len={_b_len} after-len={_a_len} '
+                f'PASTE-VERIFY: FAIL (caret stationary at {caret_before}) '
+                f'UIA before-len={_b_len} after-len={_a_len} '
                 f'text={_t_snip!r} — opening MiniNotepad')
             self._show_mini_notepad(text)
             return
 
-        # Caret moved (or we couldn't measure it) — combined with UIA
-        # snapshots we couldn't verify against, we err on the side of
-        # trusting the paste.
+        # 3. No caret signal available (both measurements failed) AND UIA
+        # couldn't confirm text-in-after. We CAN'T tell. Choose safety:
+        # if before was non-empty AND after equals before (nothing changed
+        # in UIA), open MiniNotepad. Otherwise trust.
+        if before and after == before:
+            logger.info(
+                f'PASTE-VERIFY: FAIL (UIA unchanged, no caret signal) '
+                f'before-len={_b_len} — opening MiniNotepad')
+            self._show_mini_notepad(text)
+            return
         logger.info(
-            f'PASTE-VERIFY: inconclusive but caret moved / unmeasurable '
-            f'(caret_before={caret_before} caret_after={caret_after} '
+            f'PASTE-VERIFY: inconclusive (no caret signal, UIA '
             f'before-len={_b_len} after-len={_a_len}) — trusting paste')
 
     def _show_mini_notepad(self, text: str) -> None:
