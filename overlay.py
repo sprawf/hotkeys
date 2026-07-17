@@ -328,13 +328,18 @@ class OverlayWindow:
         self._build('🎙  Recording... (click to cancel)  0.0s',
                     _TEXT_CLR, INFO, clickable=True)
         self._update_recording()
-        # Safety close after 6 minutes (audio.py caps recording at 5 min
-        # via _MAX_RECORD_S; this is a belt-and-suspenders timer that
-        # fires if the auto-stop notification never made it back to the UI).
+        # Safety close after 10 minutes. audio.py already caps active
+        # recording at 5 min via _MAX_RECORD_S, and the normal flow is
+        # Recording (up to 5m) → auto-stop → Transcribing (up to 30s) →
+        # Done → closes. show_transcribing() cancels this timer when it
+        # takes over. 10-min buffer covers: max-recording + slow-network
+        # transcription + any misc lag, without cutting off a legitimate
+        # long dictation. Only fires if the pill is STUCK in "Recording"
+        # state (hotkey hook dead + audio-auto-stop notification lost).
         self._cancel_safety_timer()
         if self._win:
             self._safety_timer_id = self.root.after(
-                6 * 60 * 1000, self._safety_force_close)
+                10 * 60 * 1000, self._safety_force_close)
 
     def _safety_force_close(self):
         """Fires 6 minutes after show_recording. Triggers cancel so
