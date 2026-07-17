@@ -2680,34 +2680,41 @@ class App:
             return
         # PRE-check: skip paste + go straight to MiniNotepad if UIA
         # confidently says no editable target is focused.
-        # Bulletproof paste-verify built on Windows' GetGUIThreadInfo:
+        # Bulletproof paste-verify combining multiple universal signals:
         #
-        #   Foreground window has NO caret at all
-        #     → target isn't accepting text → open MiniNotepad, skip paste
-        #   Foreground has caret
-        #     → paste, then check if the caret rect changed
-        #       → changed  → paste worked
-        #       → same     → paste failed (surface has caret but rejected input)
-        #       → gone     → focus shifted (e.g. autocomplete popup) → trust
+        # PREFLIGHT (fast reject, no key events sent):
+        #   1. UIA _uia_focused_editable() with TextEditPattern check:
+        #      distinguishes editable text from read-only text in ALL
+        #      frameworks (Win32/Chromium/Electron/Qt/WPF). Returns
+        #      True/False/None.
+        #      - False → skip paste, open MiniNotepad
+        #      - True or None → proceed to paste
+        #   2. Win32 caret: additional evidence for Win32-native apps
+        #      that don't expose UIA cleanly. Only used as fallback when
+        #      UIA is None.
         #
-        # Works uniformly across every Windows UI framework: Win32, Qt,
-        # WPF, Tk, Chromium/Electron, WebView2, Office, browsers. Doesn't
-        # depend on UIA (which returns None for many surfaces) or on
-        # per-app heuristics.
-        caret_before = self._get_foreground_caret()
-        logger.info(f'PASTE-PRE: caret_before={caret_before}')
-
-        # No caret in foreground = definitively not editable
-        if caret_before is not None and caret_before[0] == 0:
-            logger.info(
-                'PASTE-PRE: no caret in foreground window — target not '
-                'editable, opening MiniNotepad')
-            self._show_mini_notepad(text)
-            return
-
-        # Also grab UIA text snapshot as a secondary signal (for
-        # elements without a visible caret but with readable UIA text)
+        # POSTFLIGHT (after Ctrl+V):
+        #   1. UIA text-in-after → strong proof
+        #   2. Caret rect moved → also strong proof (Win32)
+        #   3. Caret vanished (focus shifted to popup) → trust
+        #   4. Caret stationary AND we had a caret before → paste failed
+        #      → MiniNotepad
+        #   5. No caret + UIA unchanged → paste failed → MiniNotepad
+        try:
+            _ed = has_editable_focus_in_foreground()
+            logger.info(f'PASTE-PRE: has_editable_focus_in_foreground()={_ed}')
+            if not _ed:
+                logger.info('PASTE-PRE: not editable → opening MiniNotepad, skip paste')
+                self._show_mini_notepad(text)
+                return
+        except Exception as _e:
+            logger.info(f'PASTE-PRE: editability check raised {_e!r}; fail-open')
         before_text = focused_text_snapshot()
+        caret_before = self._get_foreground_caret()
+        logger.info(
+            f'PASTE-PRE: before-text-len='
+            f'{-1 if before_text is None else len(before_text)} '
+            f'caret_before={caret_before}')
         paste_from_clipboard()
         self.root.after(self._PASTE_VERIFY_MS,
                         lambda: self._verify_paste_landed(text, before_text, caret_before))

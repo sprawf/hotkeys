@@ -243,7 +243,16 @@ if sys.platform == 'win32':
                             30046,   # Value.IsReadOnly
                             30095,   # LegacyIAccessible.Role
                             30096,   # LegacyIAccessible.State
-                            30101):  # AriaRole
+                            30101,   # AriaRole
+                            30115):  # IsTextEditPatternAvailable — the
+                                     # cleanest editable-vs-readonly signal
+                                     # for Chromium/Electron. Read-only
+                                     # text (Claude message history, VS
+                                     # Code output pane, Discord scroll)
+                                     # exposes only TextPattern (30040);
+                                     # editable text (input, textarea,
+                                     # contenteditable=true) exposes both
+                                     # TextPattern AND TextEditPattern.
                     req.AddProperty(pid)
                 _uia_tls.uia = uia
                 _uia_tls.req = req
@@ -265,12 +274,23 @@ if sys.platform == 'win32':
             if legacy_role == 42 and not (legacy_state & 0x40):  # TEXT, not RO
                 return True
             if ct == _UIA_GROUP:
-                # Chromium exposes bare contenteditable as Group+TextPattern
-                if bool(el.GetCachedPropertyValue(30040)):     # TextPattern avail
+                # Chromium exposes bare contenteditable AS WELL AS
+                # read-only content areas (message logs, docs, articles)
+                # as Group+TextPattern. TextPattern alone can't
+                # distinguish them. TextEditPattern (30115) is present
+                # ONLY on editable text — use it as the decisive check.
+                if bool(el.GetCachedPropertyValue(30115)):     # TextEditPattern
                     return True
+                if bool(el.GetCachedPropertyValue(30040)):     # TextPattern only
+                    return False   # read-only text (Claude message area, etc.)
                 return None
             if ct in _UIA_NEVER_EDITABLE:
                 return False
+            # For Document controls (browser page body, PDF viewer),
+            # apply the same TextEditPattern rule so a contenteditable
+            # <body> registers as editable but a normal page doesn't.
+            if bool(el.GetCachedPropertyValue(30115)):
+                return True
             return None
         except Exception:
             return None
