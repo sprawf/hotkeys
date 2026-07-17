@@ -303,6 +303,13 @@ hiddenimports = [
     'theme',
     'spellcheck',
     'sticky_note',
+    # RTL text rendering for MiniNotepad — Tk's Text widget doesn't
+    # apply Unicode BiDi, so we preprocess Arabic/Hebrew via these two
+    # libs before insertion. Missing → Arabic in MiniNotepad renders
+    # visually reversed (word-order flipped, characters scrambled).
+    'bidi',
+    'bidi.algorithm',
+    'arabic_reshaper',
     '_bundled_keys',
     'core',
     'core.audio',

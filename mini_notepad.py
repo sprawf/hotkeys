@@ -247,10 +247,7 @@ class MiniNotepad(tk.Toplevel):
     )
 
     @classmethod
-    def _text_is_rtl(cls, text: str) -> bool:
-        """True if any Arabic/Hebrew character appears — enough to
-        warrant right-alignment of the whole line for correct visual
-        reading order in tk.Text (which defaults to left alignment)."""
+    def _text_has_rtl(cls, text: str) -> bool:
         for ch in text:
             cp = ord(ch)
             for lo, hi in cls._RTL_RANGES:
@@ -258,24 +255,25 @@ class MiniNotepad(tk.Toplevel):
                     return True
         return False
 
-    def _apply_bidi(self, text: str) -> None:
-        """Configure a per-line tag that right-aligns lines containing
-        RTL characters. Fixes the 'Arabic looks reversed' complaint —
-        Tk's Text widget stores + shapes characters correctly (logical
-        order, correct BiDi run resolution) but its default LEFT
-        alignment makes RTL text visually confusing when reading. Right-
-        aligning restores the expected 'reads from the right' feel.
-        Applied line-by-line so mixed LTR/RTL notes still align each
-        line appropriately."""
+    @classmethod
+    def _prepare_for_tk(cls, text: str) -> str:
+        """Convert logical-order text into display-order glyphs for Tk.
+        Tk's Text widget doesn't apply Unicode BiDi — RTL content stored
+        in logical order comes out visually wrong (word-order reversed
+        AND word-internal character scrambling). arabic_reshaper joins
+        Arabic letters into contextual forms; python-bidi reorders the
+        result for LTR display. If either lib isn't available, return
+        the text unchanged (falls back to Tk's default broken rendering,
+        but at least app doesn't crash)."""
+        if not cls._text_has_rtl(text):
+            return text
         try:
-            self._txt.tag_configure('rtl', justify='right')
-            self._txt.tag_configure('ltr', justify='left')
-            lines = text.split('\n')
-            for idx, line in enumerate(lines, start=1):
-                tag = 'rtl' if self._text_is_rtl(line) else 'ltr'
-                self._txt.tag_add(tag, f'{idx}.0', f'{idx}.end')
+            import arabic_reshaper
+            from bidi.algorithm import get_display
+            reshaped = arabic_reshaper.reshape(text)
+            return get_display(reshaped)
         except Exception:
-            pass
+            return text
 
     def show_text(self, text: str) -> None:
         """Replace contents with `text`, show + raise + focus the window.
@@ -288,10 +286,21 @@ class MiniNotepad(tk.Toplevel):
         """
         self._txt.delete('1.0', 'end')
         if text:
-            self._txt.insert('1.0', text)
+            # Tk's Text widget doesn't apply the Unicode BiDi Algorithm,
+            # so raw Arabic/Hebrew content stored in logical order comes
+            # out with words in reverse reading order AND with
+            # word-internal character scrambling. Preprocess via
+            # arabic-reshaper (joins letters into initial/medial/final
+            # contextual forms) + python-bidi (reorders logical → visual)
+            # so the LTR layout Tk uses displays the RIGHT-TO-LEFT reading
+            # correctly. Purely a DISPLAY transformation — the LOGICAL
+            # source text remains available via `self._original_text`
+            # for save/copy operations that need the original bytes.
+            self._original_text = text
+            display_text = self._prepare_for_tk(text)
+            self._txt.insert('1.0', display_text)
             self._txt.mark_set('insert', '1.0')
             self._txt.see('1.0')
-            self._apply_bidi(text)
         self.deiconify()
         self.lift()
         self.attributes('-topmost', True)
@@ -318,8 +327,22 @@ class MiniNotepad(tk.Toplevel):
         if not path:
             return 'break'
         try:
+            # If the user didn't edit the loaded content, save the ORIGINAL
+            # logical-order text (before our bidi/reshaper preprocessing)
+            # so downstream apps get correctly-ordered Unicode. If they
+            # edited it, we save what's in the widget as-is (best effort
+            # — a partial-edit of RTL content is inherently ambiguous).
+            current = self._txt.get('1.0', 'end-1c')
+            original_display = ''
+            try:
+                original_display = self._prepare_for_tk(
+                    getattr(self, '_original_text', '') or '')
+            except Exception:
+                pass
+            to_save = getattr(self, '_original_text', current) \
+                if current == original_display else current
             with open(path, 'w', encoding='utf-8') as f:
-                f.write(self._txt.get('1.0', 'end-1c'))
+                f.write(to_save)
         except Exception as e:
             messagebox.showerror('Save failed', str(e), parent=self)
         return 'break'
