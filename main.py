@@ -2678,25 +2678,55 @@ class App:
         if self._focused_is_own_process():
             paste_from_clipboard()
             return
-        # PRE-check: if UIA confidently reports NO editable target in the
-        # foreground (desktop empty space, browser page with no input
-        # focused, image viewer, PDF read-mode, etc.), skip the paste
-        # attempt entirely and go straight to MiniNotepad. Fires before
-        # Ctrl+V is even sent, so no ghost key event lands in a random
-        # non-editable surface.
+        # PRE-check: skip paste + go straight to MiniNotepad if UIA
+        # confidently says no editable target is focused.
         try:
-            if not has_editable_focus_in_foreground():
-                logger.info(
-                    'No editable focus in foreground; opening MiniNotepad '
-                    'directly (skipping paste attempt).')
+            _ed = has_editable_focus_in_foreground()
+            logger.info(f'PASTE-PRE: has_editable_focus_in_foreground()={_ed}')
+            if not _ed:
+                logger.info('PASTE-PRE: skipping paste, opening MiniNotepad')
                 self._show_mini_notepad(text)
                 return
-        except Exception:
-            pass  # fail-open: fall through to paste + verify path
+        except Exception as _e:
+            logger.info(f'PASTE-PRE: check raised {_e!r}; fail-open to paste')
         before = focused_text_snapshot()
+        # Also snapshot the CARET POSITION as a second verification
+        # channel. In Chromium/Electron apps (Claude Code, VS Code,
+        # Discord message history) UIA snapshot often returns None even
+        # when there's a visible caret. Caret movement is a reliable
+        # signal that paste landed — if caret POS didn't change after
+        # paste, the paste went into a non-editable surface.
+        caret_before = self._get_caret_pos()
+        logger.info(
+            f'PASTE-PRE: before-snapshot type={type(before).__name__} '
+            f'len={-1 if before is None else len(before)} '
+            f'caret_before={caret_before}')
         paste_from_clipboard()
         self.root.after(self._PASTE_VERIFY_MS,
-                        lambda: self._verify_paste_landed(text, before))
+                        lambda: self._verify_paste_landed(text, before, caret_before))
+
+    def _get_caret_pos(self):
+        """Windows GetCaretPos → (x, y) tuple in screen coords, or None.
+        Only the foreground THREAD's caret is reported, so this reflects
+        the focus we care about. Returns (0,0) or None on any failure.
+        """
+        if sys.platform != 'win32':
+            return None
+        try:
+            import ctypes as _c
+            u32 = _c.windll.user32
+            class _POINT(_c.Structure):
+                _fields_ = [('x', _c.c_long), ('y', _c.c_long)]
+            pt = _POINT()
+            # GetCaretPos returns client-area coords; convert to screen
+            # via ClientToScreen with the caret's owner window. But we
+            # only care about POSITION CHANGE, not absolute position, so
+            # raw client coords are fine — they change the same way.
+            if not u32.GetCaretPos(_c.byref(pt)):
+                return None
+            return (pt.x, pt.y)
+        except Exception:
+            return None
 
     def _focused_is_own_process(self) -> bool:
         """True if the currently focused window is owned by our PID."""
@@ -2714,47 +2744,49 @@ class App:
         except Exception:
             return False
 
-    def _verify_paste_landed(self, text: str, before) -> None:
+    def _verify_paste_landed(self, text: str, before, caret_before) -> None:
         try:
             after = focused_text_snapshot()
         except Exception:
             after = before   # treat any read failure as "unknown, don't fallback"
+        caret_after = self._get_caret_pos()
 
-        # Trust the paste if UIA couldn't inspect either state — we
-        # can't distinguish "paste failed" from "surface doesn't expose
-        # text via UIA."
-        if before is None or after is None:
+        _b_len = -1 if before is None else len(before)
+        _a_len = -1 if after is None else len(after)
+        _b_snip = (before[:60] if isinstance(before, str) else repr(before))
+        _a_snip = (after[:60] if isinstance(after, str) else repr(after))
+        _t_snip = text[:60] if isinstance(text, str) else repr(text)
+
+        # UIA-based strong proof: pasted text visible in the after snapshot
+        if before is not None and after is not None and text and text in after:
+            logger.info('PASTE-VERIFY: text visible in after-snapshot — paste verified')
             return
 
-        # STRONG proof it worked: pasted text appears in the after
-        # snapshot. Covers the common case (paste into an empty field
-        # or append to existing content) regardless of what `before` was.
-        if text and text in after:
+        # UIA-based weak trust: before was empty (Chrome omnibox case)
+        if before == '' and after is not None:
+            logger.info(f'PASTE-VERIFY: before empty (after={_a_snip!r}) — trusting paste')
             return
 
-        # `text` isn't visible in after. Before opening MiniNotepad,
-        # apply one guard: if `before` was EMPTY, we have no way to
-        # detect success via UIA when focus shifts after paste (Chrome
-        # omnibox + autocomplete popup being the canonical case: paste
-        # lands in the omnibox, focus jumps to the autocomplete popup
-        # which returns "" or non-matching text). Trust the paste when
-        # before was empty; only trigger the fallback when we KNOW
-        # the target had non-empty content AND our text isn't visible.
-        #
-        # NOTE: we deliberately do NOT trust "before != after" as proof
-        # of success. In Electron/Chromium apps like Claude, VS Code,
-        # Discord, the UIA accessibility tree changes slightly between
-        # snapshots (dynamic content, timestamps, animation state) even
-        # when NO paste happened. Trusting inequality would silently
-        # swallow real paste failures in those apps.
-        if not before:
+        # Caret-position proof: if the caret MOVED during the paste, some
+        # text was inserted. Reliable for Chromium/Electron apps where
+        # UIA returns None but the caret is real. If BOTH caret positions
+        # are non-None AND identical → nothing was inserted → paste failed.
+        if (caret_before is not None and caret_after is not None
+                and caret_before == caret_after):
+            logger.info(
+                f'PASTE-VERIFY: FAIL (caret stationary) '
+                f'caret={caret_before} UIA before-len={_b_len} after-len={_a_len} '
+                f'text={_t_snip!r} — opening MiniNotepad')
+            self._show_mini_notepad(text)
             return
 
+        # Caret moved (or we couldn't measure it) — combined with UIA
+        # snapshots we couldn't verify against, we err on the side of
+        # trusting the paste.
         logger.info(
-            f'Paste unverified: text not visible in after-snapshot '
-            f'(before-len={len(before)}, after-len={len(after)}, '
-            f'text-preview={text[:30]!r}...); opening MiniNotepad as fallback')
-        self._show_mini_notepad(text)
+            f'PASTE-VERIFY: inconclusive but caret moved / unmeasurable '
+            f'(caret_before={caret_before} caret_after={caret_after} '
+            f'before-len={_b_len} after-len={_a_len}) — trusting paste')
 
     def _show_mini_notepad(self, text: str) -> None:
         """Show the prewarmed MiniNotepad with `text` loaded. Recreates
