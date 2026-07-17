@@ -340,6 +340,19 @@ class MiniNotepad(tk.Toplevel):
             self._txt.insert('1.0', display_text)
             self._txt.mark_set('insert', '1.0')
             self._txt.see('1.0')
+            # After the bidi transform, each line is in visual order but
+            # still LEFT-aligned by Tk default. A native RTL reader
+            # expects the first (rightmost) word at the RIGHT edge of
+            # the widget, not scrunched at the left. Per-line right-
+            # alignment for RTL-containing lines gives the proper feel.
+            try:
+                self._txt.tag_configure('rtl', justify='right')
+                self._txt.tag_configure('ltr', justify='left')
+                for idx, line in enumerate(display_text.split('\n'), start=1):
+                    tag = 'rtl' if self._text_has_rtl(line) else 'ltr'
+                    self._txt.tag_add(tag, f'{idx}.0', f'{idx}.end')
+            except Exception:
+                pass
         self.deiconify()
         self.lift()
         self.attributes('-topmost', True)
