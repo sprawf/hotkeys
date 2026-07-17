@@ -121,6 +121,48 @@ else:
         f'CEREBRAS/GROQ/CEREBRAS_2/GROQ_2 keys before building.'
     )
 
+# ── Ask Docs (Shift+F11 NotebookLM-style Q&A subpackage) ────────────────────
+# Bundle every .py in ask_docs/ + the MiniLM ONNX embedding model + tokenizer
+# so the frozen dist has zero external deps. hiddenimports for markitdown +
+# tokenizers + fitz picked up via collect_all below (dynamic converter
+# imports would otherwise be silently dropped by PyInstaller's static
+# analysis).
+_ad_dir = ROOT / 'ask_docs'
+if _ad_dir.exists():
+    for _p in _ad_dir.rglob('*'):
+        if _p.is_file():
+            _rel = _p.relative_to(ROOT).parent
+            datas += [(str(_p), str(_rel))]
+    _minilm = _ad_dir / 'models' / 'all-MiniLM-L6-v2' / 'model.onnx'
+    if _minilm.exists():
+        print(f'++ ask_docs bundled (MiniLM ONNX '
+              f'{_minilm.stat().st_size / (1024*1024):.1f} MB)')
+    else:
+        raise SystemExit(
+            f'!! FATAL: ask_docs MiniLM ONNX missing at {_minilm}. '
+            f'Ask Docs embedding + retrieval will crash at first source-add.')
+else:
+    raise SystemExit(f'!! FATAL: ask_docs subpackage missing at {_ad_dir}.')
+
+# markitdown pulls in dozens of converter modules dynamically; static
+# import analysis misses several. --collect-all catches them all.
+_md_datas, _md_bins, _md_hidden = collect_all('markitdown')
+datas    += _md_datas
+binaries += _md_bins
+# tokenizers, fitz (PyMuPDF), and the rest of markitdown's optional
+# converter backends need explicit hidden imports so PyInstaller ships
+# the .pyd / native extensions.
+_extra_ad_hidden = _md_hidden + [
+    'tokenizers',
+    'fitz', 'pymupdf',
+    # markitdown's optional backends — each corresponds to a supported
+    # file type. Missing backends silently degrade to a "no plugin"
+    # error at ingest time.
+    'mammoth', 'python_pptx', 'openpyxl', 'pdfminer', 'pdfminer.six',
+    'olefile', 'youtube_transcript_api', 'speechrecognition',
+    'pydub', 'xlrd',
+]
+
 # ── Whiteboard offline bundle (Shift+F8 whiteboard) ──────────────────────────
 # whiteboard.py loads whiteboard_assets/dist/index.html via file://.
 # Path resolution at runtime: when frozen, looks under sys._MEIPASS — so the
@@ -395,6 +437,9 @@ datas += _hf_datas
 binaries += _hf_bins
 hiddenimports += _hf_hidden
 hiddenimports += _av_hidden   # av submodules from collect_all
+# Ask Docs (subpackage + markitdown converters + native tokenizers/fitz).
+hiddenimports += collect_submodules('ask_docs')
+hiddenimports += _extra_ad_hidden
 hiddenimports += collect_submodules('ctranslate2')
 hiddenimports += [m for m in collect_submodules('onnxruntime') if 'quantization' not in m and 'onnx' not in m]
 hiddenimports += collect_submodules('groq')

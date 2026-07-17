@@ -107,6 +107,13 @@ CHECKS = [
     ('tessdata english',     lambda: file_exists('tessdata/eng.traineddata')),
     ('tessdata arabic',      lambda: file_exists('tessdata/ara.traineddata')),
     ('tessdata osd',         lambda: file_exists('tessdata/osd.traineddata')),
+    # Ask Docs (Shift+F11 NotebookLM-style Q&A)
+    ('ask_docs subpackage',
+        lambda: file_exists('ask_docs/ui.py')),
+    ('ask_docs MiniLM model',
+        lambda: whisper_model_size_ok('ask_docs/models/all-MiniLM-L6-v2/model.onnx', 80)),
+    ('ask_docs MiniLM tokenizer',
+        lambda: file_exists('ask_docs/models/all-MiniLM-L6-v2/tokenizer.json')),
 ]
 
 
