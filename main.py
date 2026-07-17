@@ -2801,11 +2801,16 @@ class App:
             logger.info('PASTE-VERIFY: text visible in UIA after-snapshot — verified')
             return
 
-        # 2. CARET signal: caret moved between before and after
-        if caret_before is not None and caret_after is not None:
-            # Focus shifted to a window with no caret (autocomplete popup,
-            # notification): can't verify but likely paste worked.
-            if caret_after[0] == 0 and caret_before[0] != 0:
+        # 2. CARET signal: ONLY applies when there was a Win32 caret in
+        # the foreground BEFORE the paste (hwndCaret != 0). Chromium /
+        # Electron apps have no Win32 caret at all, so this whole check
+        # is skipped for them — their post-verify falls through to
+        # signal 3 (UIA delta).
+        if (caret_before is not None and caret_before[0] != 0
+                and caret_after is not None):
+            # Focus shifted to a no-caret window (Chrome autocomplete
+            # popup, notification): can't verify but likely paste worked.
+            if caret_after[0] == 0:
                 logger.info(
                     f'PASTE-VERIFY: caret vanished (focus shifted from '
                     f'hwnd={hex(caret_before[0])} to no-caret window) '
@@ -2819,24 +2824,31 @@ class App:
                 return
             # Caret unchanged AND we can measure it: paste did NOT land
             logger.info(
-                f'PASTE-VERIFY: FAIL (caret stationary at {caret_before}) '
+                f'PASTE-VERIFY: FAIL (Win32 caret stationary at {caret_before}) '
                 f'UIA before-len={_b_len} after-len={_a_len} '
                 f'text={_t_snip!r} — opening MiniNotepad')
             self._show_mini_notepad(text)
             return
 
-        # 3. No caret signal available (both measurements failed) AND UIA
-        # couldn't confirm text-in-after. We CAN'T tell. Choose safety:
-        # if before was non-empty AND after equals before (nothing changed
-        # in UIA), open MiniNotepad. Otherwise trust.
-        if before and after == before:
+        # 3. No usable caret signal (Chromium/Electron, or foreground
+        # window has no caret at all). Fall back to UIA text delta.
+        # Only open MiniNotepad on DEFINITE proof of failure: before was
+        # non-empty AND after equals before AND text isn't in after.
+        # This catches Claude Code message history (UIA reads content
+        # like "5 messages ago...", paste doesn't change it, text not
+        # visible in the unchanged after-snapshot).
+        if before and after is not None and after == before:
             logger.info(
-                f'PASTE-VERIFY: FAIL (UIA unchanged, no caret signal) '
+                f'PASTE-VERIFY: FAIL (UIA unchanged, no Win32 caret) '
                 f'before-len={_b_len} — opening MiniNotepad')
             self._show_mini_notepad(text)
             return
+        # Otherwise trust: either UIA snapshot returned None (many
+        # Chromium editable elements do this — but paste still worked),
+        # OR before was empty (Chrome omnibox case).
         logger.info(
-            f'PASTE-VERIFY: inconclusive (no caret signal, UIA '
+            f'PASTE-VERIFY: inconclusive but no failure signal '
+            f'(caret_before={caret_before} caret_after={caret_after} '
             f'before-len={_b_len} after-len={_a_len}) — trusting paste')
 
     def _show_mini_notepad(self, text: str) -> None:
