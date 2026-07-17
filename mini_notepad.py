@@ -236,6 +236,47 @@ class MiniNotepad(tk.Toplevel):
             self._select_all()
         return 'break'
 
+    _RTL_RANGES = (
+        (0x0590, 0x05FF),   # Hebrew
+        (0x0600, 0x06FF),   # Arabic
+        (0x0750, 0x077F),   # Arabic Supplement
+        (0x08A0, 0x08FF),   # Arabic Extended-A
+        (0xFB1D, 0xFB4F),   # Hebrew presentation forms
+        (0xFB50, 0xFDFF),   # Arabic presentation forms-A
+        (0xFE70, 0xFEFF),   # Arabic presentation forms-B
+    )
+
+    @classmethod
+    def _text_is_rtl(cls, text: str) -> bool:
+        """True if any Arabic/Hebrew character appears — enough to
+        warrant right-alignment of the whole line for correct visual
+        reading order in tk.Text (which defaults to left alignment)."""
+        for ch in text:
+            cp = ord(ch)
+            for lo, hi in cls._RTL_RANGES:
+                if lo <= cp <= hi:
+                    return True
+        return False
+
+    def _apply_bidi(self, text: str) -> None:
+        """Configure a per-line tag that right-aligns lines containing
+        RTL characters. Fixes the 'Arabic looks reversed' complaint —
+        Tk's Text widget stores + shapes characters correctly (logical
+        order, correct BiDi run resolution) but its default LEFT
+        alignment makes RTL text visually confusing when reading. Right-
+        aligning restores the expected 'reads from the right' feel.
+        Applied line-by-line so mixed LTR/RTL notes still align each
+        line appropriately."""
+        try:
+            self._txt.tag_configure('rtl', justify='right')
+            self._txt.tag_configure('ltr', justify='left')
+            lines = text.split('\n')
+            for idx, line in enumerate(lines, start=1):
+                tag = 'rtl' if self._text_is_rtl(line) else 'ltr'
+                self._txt.tag_add(tag, f'{idx}.0', f'{idx}.end')
+        except Exception:
+            pass
+
     def show_text(self, text: str) -> None:
         """Replace contents with `text`, show + raise + focus the window.
         Cheap: no widget recreation, just a delete + insert.
@@ -250,6 +291,7 @@ class MiniNotepad(tk.Toplevel):
             self._txt.insert('1.0', text)
             self._txt.mark_set('insert', '1.0')
             self._txt.see('1.0')
+            self._apply_bidi(text)
         self.deiconify()
         self.lift()
         self.attributes('-topmost', True)
