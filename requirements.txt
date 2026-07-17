@@ -52,3 +52,5 @@ opencv-python-headless>=4.8.0   # OCR image preprocessing (denoise / deskew / th
 # ── Optional: local Qwen GGUF (heavy — skip for cloud-only builds) ────────────
 # llama-cpp-python>=0.2.0
 # huggingface-hub>=0.20.0
+python-bidi
+arabic-reshaper
