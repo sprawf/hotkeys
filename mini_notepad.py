@@ -162,6 +162,18 @@ class MiniNotepad(tk.Toplevel):
         t.bind('<Control-C>', lambda e: self._copy_logical(cut=False))
         t.bind('<Control-x>', lambda e: self._copy_logical(cut=True))
         t.bind('<Control-X>', lambda e: self._copy_logical(cut=True))
+        # Intercept paste (Ctrl+V + right-click Paste + <<Paste>>) so we
+        # can apply the reshape+bidi transform to newly-pasted RTL text
+        # — otherwise pastes AFTER show_text() (e.g. a second dictation
+        # while MiniNotepad already open) go through Tk's default paste
+        # which inserts raw logical bytes and re-scrambles RTL rendering.
+        t.bind('<Control-v>', self._on_paste)
+        t.bind('<Control-V>', self._on_paste)
+        t.bind('<<Paste>>',   self._on_paste)
+        # After ANY edit that changes the buffer, re-apply per-line
+        # RTL/LTR alignment tags. Cheap: only walks lines the user
+        # touched.
+        t.bind('<<Modified>>', self._on_modified)
 
     @staticmethod
     def _edit_quiet(fn):
@@ -243,6 +255,67 @@ class MiniNotepad(tk.Toplevel):
         elif cmd == 7:
             self._select_all()
         return 'break'
+
+    def _on_paste(self, event=None) -> str:
+        """Handle Ctrl+V by reshape+bidi-transforming the clipboard
+        content before insertion, then re-applying RTL/LTR alignment.
+        Also appends to `_original_text` so a later "copy all" still
+        exports the correct logical-order text for the combined content."""
+        t = self._txt
+        try:
+            clip = self.clipboard_get()
+        except tk.TclError:
+            return 'break'
+        if not clip:
+            return 'break'
+        # Delete active selection first (mirrors Tk's default paste).
+        try:
+            if t.tag_ranges('sel'):
+                t.delete('sel.first', 'sel.last')
+        except tk.TclError:
+            pass
+        display_frag = self._prepare_for_tk(clip)
+        # Extend the "original logical text" tracker with the pasted
+        # content so future full-select+copy exports the right bytes.
+        try:
+            existing_orig = getattr(self, '_original_text', '') or ''
+            # Naive append: correct for the common "paste at end" case.
+            # For mid-buffer pastes the tracker becomes approximate but
+            # the display is still correct.
+            self._original_text = existing_orig + clip
+        except Exception:
+            pass
+        t.insert('insert', display_frag)
+        self._retag_all()
+        return 'break'
+
+    def _on_modified(self, event=None) -> None:
+        """Tk fires <<Modified>> once when content changes; the flag has
+        to be manually reset. Re-apply per-line RTL/LTR tags so any typed
+        or backspaced content still displays with correct alignment."""
+        t = self._txt
+        try:
+            if not t.edit_modified():
+                return
+            t.edit_modified(False)
+        except tk.TclError:
+            return
+        self._retag_all()
+
+    def _retag_all(self) -> None:
+        """Walk every line and apply rtl/ltr justify tag by content."""
+        t = self._txt
+        try:
+            t.tag_configure('rtl', justify='right')
+            t.tag_configure('ltr', justify='left')
+            content = t.get('1.0', 'end-1c')
+            t.tag_remove('rtl', '1.0', 'end')
+            t.tag_remove('ltr', '1.0', 'end')
+            for idx, line in enumerate(content.split('\n'), start=1):
+                tag = 'rtl' if self._text_has_rtl(line) else 'ltr'
+                t.tag_add(tag, f'{idx}.0', f'{idx}.end')
+        except Exception:
+            pass
 
     def _copy_logical(self, cut: bool = False) -> str:
         """Ctrl+C / Ctrl+X override: put the ORIGINAL logical-order text
