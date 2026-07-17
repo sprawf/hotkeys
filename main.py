@@ -705,6 +705,13 @@ class App:
         # ── UI windows ───────────────────────────────────────────────────────
         self.refine_overlay    = OverlayWindow(self.root, slot=0)
         self.whisper_overlay   = OverlayWindow(self.root, slot=1)
+        # Wire click-to-cancel on the whisper pill so the user can
+        # dismiss a stuck recording even if the global hotkey hook
+        # died mid-session (Ctrl+Enter/Esc would silently do nothing
+        # in that state). Route through the same queue as the escape
+        # hotkey so cancel/cleanup logic is identical.
+        self.whisper_overlay._click_cancel = lambda: (
+            self._q.put_nowait(('whisper:cancel', None)))
         self.macro_overlay     = OverlayWindow(self.root, slot=2)
         self.recorder_overlay  = OverlayWindow(self.root, slot=3)
         self.gif_overlay       = OverlayWindow(self.root, slot=4)

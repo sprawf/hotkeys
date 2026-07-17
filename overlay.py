@@ -115,6 +115,11 @@ class OverlayWindow:
         self._fnt_mono        = TkFont(family=FONT_MONO, size=11)
         self._safety_timer_id = None   # after() ID for the 30 s transcribe safety close
         self._pulse_job       = None   # after() ID for chain step pulse animation
+        # Optional click-to-cancel callback. Set by main.py so if the
+        # global hotkey hook dies mid-recording, the user can still
+        # dismiss the pill by clicking it — no keyboard interaction
+        # required. Same escape hatch principle as the tray menu.
+        self._click_cancel = None
 
     # ── Refine pill states ────────────────────────────────────────────────────
 
@@ -307,12 +312,44 @@ class OverlayWindow:
     # ── Whisper pill states ───────────────────────────────────────────────────
 
     def show_recording(self) -> None:
-        """Recording in progress, animated elapsed-time pill."""
+        """Recording in progress, animated elapsed-time pill.
+
+        Two escape hatches from the pill in case the global hotkey hook
+        dies mid-recording (which would leave Ctrl+Enter / Esc unable
+        to stop the recording — user would otherwise have to force-kill
+        the app from taskbar):
+          1. Click on the pill itself → cancels the recording.
+          2. Safety timer: pill force-closes after 6 minutes regardless
+             of any hotkey activity, so it can never stick around forever.
+        """
         self._close()
         self._t0   = time.time()
         self._tick = True
-        self._build('🎙  Recording...  0.0s', _TEXT_CLR, INFO)
+        self._build('🎙  Recording... (click to cancel)  0.0s',
+                    _TEXT_CLR, INFO, clickable=True)
         self._update_recording()
+        # Safety close after 6 minutes (audio.py caps recording at 5 min
+        # via _MAX_RECORD_S; this is a belt-and-suspenders timer that
+        # fires if the auto-stop notification never made it back to the UI).
+        self._cancel_safety_timer()
+        if self._win:
+            self._safety_timer_id = self.root.after(
+                6 * 60 * 1000, self._safety_force_close)
+
+    def _safety_force_close(self):
+        """Fires 6 minutes after show_recording. Triggers cancel so
+        state resets cleanly, then closes the pill."""
+        try:
+            import logging
+            logging.getLogger('overlay').warning(
+                'Whisper pill stuck for 6 minutes — force-closing via '
+                'safety timer. Hotkey hook may have died.')
+        except Exception:
+            pass
+        if self._click_cancel:
+            try: self._click_cancel()
+            except Exception: pass
+        self._close()
 
     def show_transcribing(self) -> None:
         """Audio captured, running Whisper."""
@@ -398,7 +435,8 @@ class OverlayWindow:
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
-    def _build(self, text: str, fg: str, bar_color: str) -> None:
+    def _build(self, text: str, fg: str, bar_color: str,
+               clickable: bool = False) -> None:
         tw = self._fnt.measure(text)
         th = self._fnt.metrics('linespace')
         bar_w = 4
@@ -484,6 +522,20 @@ class OverlayWindow:
             _u32.SetWindowDisplayAffinity(hwnd, 0x00000011)
         except Exception:
             pass
+
+        # Wire click-to-cancel if the caller asked for it. Both left-
+        # and right-click trigger cancel — user reflex on a stuck
+        # popup is often right-click, don't want to make them figure
+        # out which button.
+        if clickable and self._click_cancel:
+            def _on_click(_evt, cb=self._click_cancel):
+                try: cb()
+                except Exception: pass
+                try: win.destroy()
+                except Exception: pass
+            canvas.bind('<Button-1>', _on_click)
+            canvas.bind('<Button-3>', _on_click)
+            canvas.configure(cursor='hand2')
 
         self._win     = win
         self._canvas  = canvas
