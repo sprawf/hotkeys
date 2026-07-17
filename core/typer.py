@@ -204,18 +204,19 @@ if sys.platform == 'win32':
     _uia_tls = threading.local()
     _uia_seen_pids: set = set()   # processes whose a11y tree we already woke
 
-    def _uia_focused_editable():
+    def _uia_focused_editable(_diag_log=None):
         """Three-state UIA verdict on the focused element.
 
         True  = definitely editable (paste will land)
         False = confidently NOT editable (notepad fallback is right)
         None  = unknown -> caller must fail open to paste
 
+        Optional _diag_log(dict) called with all cached properties for
+        one-shot instrumentation when diagnosing per-app behavior.
+
         Needed because Chromium/Electron apps (Claude, Chrome, Discord,
         VS Code...) never create a Win32 caret; UIA is the only API that
-        sees their text inputs. Observed mappings: <input>/<textarea>/
-        role=textbox -> Edit; bare contenteditable (Claude's prompt) ->
-        Group with TextPattern; read-mode page body -> Document.
+        sees their text inputs.
         """
         try:
             import comtypes
@@ -258,8 +259,23 @@ if sys.platform == 'win32':
                 _uia_tls.req = req
             el = uia.GetFocusedElementBuildCache(_uia_tls.req)
             if el is None:
+                if _diag_log: _diag_log({'error': 'no focused element'})
                 return None
             ct = int(el.GetCachedPropertyValue(30003) or 0)    # ControlType
+            if _diag_log:
+                try:
+                    _diag_log({
+                        'ControlType':          ct,
+                        'IsTextPattern':        bool(el.GetCachedPropertyValue(30040)),
+                        'IsValuePattern':       bool(el.GetCachedPropertyValue(30043)),
+                        'ValueIsReadOnly':      el.GetCachedPropertyValue(30046),
+                        'LegacyRole':           el.GetCachedPropertyValue(30095),
+                        'LegacyState':          el.GetCachedPropertyValue(30096),
+                        'AriaRole':             el.GetCachedPropertyValue(30101),
+                        'IsTextEditPattern':    bool(el.GetCachedPropertyValue(30115)),
+                    })
+                except Exception as _e:
+                    _diag_log({'diag error': repr(_e)})
             if ct in (_UIA_EDIT, _UIA_COMBOBOX):
                 return True
             # Writable ValuePattern = editable regardless of control type
@@ -274,19 +290,15 @@ if sys.platform == 'win32':
             if legacy_role == 42 and not (legacy_state & 0x40):  # TEXT, not RO
                 return True
             if ct == _UIA_GROUP:
-                # Chromium exposes bare contenteditable as Group+TextPattern.
-                # Prefer TextEditPattern (30115) as a strong "definitely
-                # editable" signal, but fall back to TextPattern because
-                # many rich-text editors (ProseMirror in Claude Code, some
-                # Slack/Discord inputs) don't expose TextEditPattern even
-                # though they ARE editable. Post-verify will catch the
-                # false-positive case (read-only message area with
-                # TextPattern) via caret/UIA-delta measurement.
-                if bool(el.GetCachedPropertyValue(30115)):     # TextEditPattern
+                # DECISIVE, empirically verified against Claude Code:
+                # Chromium exposes editable inputs (contenteditable, rich
+                # text editors like ProseMirror) as Group WITH TextPattern.
+                # Read-only content areas (message history, article body,
+                # log widgets) are also Group but WITHOUT TextPattern.
+                # TextPattern availability is the exact discriminator.
+                if bool(el.GetCachedPropertyValue(30040)):     # TextPattern
                     return True
-                if bool(el.GetCachedPropertyValue(30040)):     # TextPattern only
-                    return None   # unknown — let post-verify decide
-                return None
+                return False   # Group without TextPattern = read-only container
             if ct in _UIA_NEVER_EDITABLE:
                 return False
             return None

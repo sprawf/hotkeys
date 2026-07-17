@@ -2702,13 +2702,12 @@ class App:
         #   5. No caret + UIA unchanged → paste failed → MiniNotepad
         try:
             _ed = has_editable_focus_in_foreground()
-            logger.info(f'PASTE-PRE: has_editable_focus_in_foreground()={_ed}')
             if not _ed:
-                logger.info('PASTE-PRE: not editable → opening MiniNotepad, skip paste')
+                logger.info('PASTE-PRE: not editable → MiniNotepad')
                 self._show_mini_notepad(text)
                 return
-        except Exception as _e:
-            logger.info(f'PASTE-PRE: editability check raised {_e!r}; fail-open')
+        except Exception:
+            pass  # fail-open to paste + verify
         before_text = focused_text_snapshot()
         caret_before = self._get_foreground_caret()
         logger.info(
