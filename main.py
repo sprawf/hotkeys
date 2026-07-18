@@ -782,6 +782,8 @@ class App:
         self.library._on_open_whiteboard = self._do_open_whiteboard
         # Wire the library's Audio editor tab "Open" button → toggle Tenacity
         self.library._on_open_audio_editor = self._do_open_audio_editor
+        # Wire the library's Ask Docs tab "Open" button → open Ask Docs
+        self.library._on_open_ask_docs = self._do_open_ask_docs
         self.settings = SettingsWindow(self.root, self.config,
                                        on_save=self._on_settings_saved,
                                        on_restore=lambda: self._q.put_nowait(('restore_all_defaults', None)))
@@ -941,10 +943,12 @@ class App:
         # Ask Docs prewarm: import markitdown + load the MiniLM ONNX
         # embedding model in a background thread so the first Shift+F11
         # press opens the window instantly instead of paying ~4s of
-        # cold-start (import markitdown ~2s + ONNX load ~1-2s).
-        # Deferred to 2000ms so it doesn't compete with the earlier
-        # prewarms for CPU/I/O during the critical first-second startup.
-        self.root.after(2000, self._prewarm_ask_docs)
+        # cold-start (import markitdown ~2s + ONNX load ~1-2s). Scheduled
+        # right after the MiniNotepad prewarm (800 ms) so it kicks off
+        # early enough that a Shift+F11 in the ~1.5 s window still hits
+        # the warm path, but doesn't contend with the earlier critical
+        # first-second startup work.
+        self.root.after(1000, self._prewarm_ask_docs)
         # Wire audio_editor spawns into the cleanup Job Object the same
         # way whiteboard already is. Without this, killing main app
         # ungracefully orphans Tenacity — the exact bug the Job was

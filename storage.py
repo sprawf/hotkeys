@@ -606,18 +606,24 @@ def load_config() -> dict:
         except Exception:
             pass
         # ── Migration: vision-model rollback ────────────────────────────────
-        # An earlier release attempted to move to llama-4-maverick which
-        # turns out NOT to be on Groq (only Scout is). Any saved config
-        # naming maverick → 404. Snap it back to Scout so OCR works.
+        # Groq periodically retires model IDs. Any saved config naming a
+        # dead one → 404 the moment the user hits PrtSc translate. When
+        # we spot a known-retired ID, silently snap to the current
+        # default (qwen/qwen3.6-27b) and re-save so the fix survives
+        # relaunches.
+        # Retired history (Groq):
+        #   • llama-4-maverick — never actually on Groq's inventory
+        #   • meta-llama/llama-4-scout-17b-16e-instruct — retired 2026-07
+        _RETIRED_VISION = ('maverick', 'llama-4-scout', 'scout-17b')
         _migrated = False
         try:
             _gq = merged['providers'].get('groq', {})
             _vm = _gq.get('vision_model', '')
-            if 'maverick' in _vm:
+            if _vm and any(dead in _vm for dead in _RETIRED_VISION):
                 _new_vm = DEFAULT_CONFIG['providers']['groq']['vision_model']
                 logger.info(
                     f'Config migration: Groq vision_model '
-                    f'{_vm!r} → {_new_vm!r} (maverick not on Groq).')
+                    f'{_vm!r} → {_new_vm!r} (retired from Groq inventory).')
                 _gq['vision_model'] = _new_vm
                 merged['providers']['groq'] = _gq
                 _migrated = True

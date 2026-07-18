@@ -42,9 +42,11 @@ def bundled_keys_valid() -> tuple[bool, str]:
             continue
         text = p.read_text(encoding='utf-8', errors='ignore')
         checks = {
-            'GROQ':     "gsk_",
-            'GROQ_2':   "gsk_",
-            'CEREBRAS': "csk-",
+            'GROQ':       "gsk_",
+            'GROQ_2':     "gsk_",
+            'GROQ_3':     "gsk_",
+            'CEREBRAS':   "csk-",
+            'CEREBRAS_2': "csk-",
         }
         missing = []
         for name, prefix in checks.items():

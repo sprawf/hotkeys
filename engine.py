@@ -37,15 +37,21 @@ PROVIDER_LABELS  = {
 GROQ_MODELS      = ['openai/gpt-oss-120b', 'qwen/qwen3.6-27b',
                     'llama-3.1-8b-instant']
 CEREBRAS_MODELS  = ['gpt-oss-120b', 'gemma-4-31b']
-# Cerebras Developer-tier model roster as of 2026-07 (verified via
-# `GET /v1/models` with our key):
-#   • gpt-oss-120b        — primary, fast + reliable
-#   • gemma-4-31b         — fallback
-#   • zai-glm-4.7         — DEPRECATED 2026-08-17 (Cerebras notice)
-# Retired earlier: llama3.1-8b, llama3.1-70b, llama-3.3-70b — all 404
-# now. Original comment kept below for context. llama-3.3-70b is
-# their current high-quality default and matches Groq's flagship in
-# capability, so the fallback chain is even.
+# Cerebras Developer-tier model roster verified live 2026-07-18 against
+# GET /v1/models with the bundled key (see refresh_models.py):
+#   • gpt-oss-120b   — reasoning model, primary; ~600ms end-to-end at
+#                      max_tokens=4096. Needs the reasoning-aware refine()
+#                      path below (spends ~100 tokens on internal reasoning
+#                      before emitting content).
+#   • gemma-4-31b    — plain chat model, ~1.4s. Reliable fallback when
+#                      reasoning models truncate.
+# Deliberately EXCLUDED even though currently live:
+#   • zai-glm-4.7    — Cerebras served a 30-day retirement notice
+#                      effective 2026-08-17. Not offered as a Settings
+#                      choice; storage.py's migration set already
+#                      auto-rescues any user who's saved it.
+# Retired (all 404 now): llama3.1-8b, llama3.1-70b, llama-3.3-70b.
+# Re-verify quarterly with:  python E:\Hotkeys\refresh_models.py
 OPENAI_MODELS    = ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-3.5-turbo', 'o1', 'o1-mini']
 ANTHROPIC_MODELS = ['claude-3-5-sonnet-20241022', 'claude-3-5-haiku-20241022',
                     'claude-3-opus-20240229', 'claude-3-haiku-20240307']
@@ -60,11 +66,21 @@ try:
         from _bundled_keys import CEREBRAS_2 as _CB_KEY_2, GROQ_2 as _GQ_KEY_2
     except ImportError:
         _CB_KEY_2 = _GQ_KEY_2 = ''
+    try:
+        from _bundled_keys import GROQ_3 as _GQ_KEY_3
+    except ImportError:
+        _GQ_KEY_3 = ''
+    try:
+        from _bundled_keys import CEREBRAS_3 as _CB_KEY_3
+    except ImportError:
+        _CB_KEY_3 = ''
     _BUNDLED = {
         'groq':       _GQ_KEY,
         'groq_2':     _GQ_KEY_2,
+        'groq_3':     _GQ_KEY_3,
         'cerebras':   _CB_KEY,
         'cerebras_2': _CB_KEY_2,
+        'cerebras_3': _CB_KEY_3,
     }
 except ImportError as _bk_exc:
     # LOUD — missing bundled keys is a critical dist bug.
@@ -75,7 +91,8 @@ except ImportError as _bk_exc:
         f'Settings. This is almost always a dist packaging bug — '
         f'_bundled_keys.py should be beside the .exe.'
     )
-    _BUNDLED: dict = {'groq': '', 'groq_2': '', 'cerebras': '', 'cerebras_2': ''}
+    _BUNDLED: dict = {'groq': '', 'groq_2': '', 'groq_3': '',
+                      'cerebras': '', 'cerebras_2': '', 'cerebras_3': ''}
 
 _SSL_ERRS = (
     # SSL / TLS layer (all AV vendors)
@@ -375,8 +392,10 @@ def _resolve_keys(config: dict, provider: str) -> list[str]:
     candidates = [
         pcfg.get('api_key',   ''),
         pcfg.get('api_key_2', ''),
+        pcfg.get('api_key_3', ''),
         _BUNDLED.get(provider,        ''),
         _BUNDLED.get(f'{provider}_2', ''),
+        _BUNDLED.get(f'{provider}_3', ''),
     ]
     seen: set[str] = set()
     keys: list[str] = []
@@ -610,11 +629,18 @@ class CerebrasProvider(Provider):
     def ready(self) -> bool: return bool(self.api_keys)
 
     def refine(self, text: str, system_prompt: str) -> str:
+        # Cerebras' current lineup includes reasoning models (gpt-oss-120b,
+        # zai-glm-4.7) whose `reasoning` trace can easily exceed 4k tokens
+        # on complex exhaustive prompts. 16384 gives the reasoning stage
+        # room to finish AND emit a several-hundred-item answer (each
+        # bullet ~25-40 tokens, so 16k output = up to ~400 bullets).
+        # Plain-chat models (gemma-4-31b) are unaffected — they use what
+        # they need.
         payload = {
             'model': self.model,
             'messages': [{'role': 'system', 'content': system_prompt},
                          {'role': 'user',   'content': text}],
-            'max_tokens': 1024,
+            'max_tokens': 16384,
         }
         last_err: Exception | None = None
         for key in self.api_keys:
@@ -622,7 +648,21 @@ class CerebrasProvider(Provider):
                 headers = {'Authorization': f'Bearer {key}',
                            'Content-Type': 'application/json'}
                 data = _robust_post(self._URL, payload, headers)
-                return _clean(data['choices'][0]['message']['content'])
+                # Reasoning models: response is {content: '...', reasoning: '...'}.
+                # Non-reasoning models: response is {content: '...'} only.
+                # A 200 with empty content means the model burned every token
+                # on reasoning without producing an answer — treat as a
+                # transient failure so the FallbackProvider rotates to Groq
+                # instead of crashing with a KeyError.
+                msg = data.get('choices', [{}])[0].get('message', {})
+                content = (msg.get('content') or '').strip()
+                if not content:
+                    raise RuntimeError(
+                        f'Cerebras {self.model}: empty content '
+                        f'(reasoning tokens={len(msg.get("reasoning", ""))}, '
+                        f'try a higher max_tokens or a non-reasoning model)'
+                    )
+                return _clean(content)
             except RuntimeError as e:
                 if _is_rate_limit(e):
                     logger.warning(f'Cerebras key …{key[-6:]} rate-limited, rotating to next key')

@@ -16,6 +16,7 @@ can just import the parent-app modules by name.
 from __future__ import annotations
 
 import logging
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -23,42 +24,66 @@ logger = logging.getLogger(__name__)
 # ── Lazy provider singleton ──────────────────────────────────────────────────
 
 _provider = None
+_provider_lock = threading.Lock()
 
 
 def _get_provider():
     """Build the provider chain once, on first use. Reads config from
     Hotkeys' standard storage so a user's API keys and provider choice
-    transfer across both apps."""
+    transfer across both apps.
+
+    Thread-safe: reset_provider() from the tray + concurrent ingest
+    workers can race — the lock serialises rebuilds and avoids two
+    threads both paying the ~200ms GroqProvider construction cost.
+    """
     global _provider
     if _provider is not None:
         return _provider
+    with _provider_lock:
+        if _provider is not None:
+            return _provider
+        return _build_provider_locked()
+
+
+def _build_provider_locked():
+    global _provider
     try:
         import storage as hk_storage
         import engine  as hk_engine
         cfg = hk_storage.load_config()
 
-        # Notebooks bypasses Cerebras and builds a Groq-first chain
-        # directly. Reasons:
-        #   • Cerebras-tier accounts on the bundled keys 404 on every
-        #     supported model name in practice (8b retired; 70b not
-        #     provisioned for many accounts). The wasted call adds
-        #     ~500ms per chat turn.
-        #   • Notebooks does many small LLM calls per ingest (titling,
-        #     summary, source guide, follow-ups). 500ms × 4 = 2s of
-        #     wasted latency PER source added.
-        #   • Hotkeys text refine still keeps the full Cerebras-first
-        #     chain — we only override here for the Notebooks app.
+        # Chain: Cerebras -> Groq -> Local (Qwen GGUF).
+        # Rationale (re-verified 2026-07-18 via refresh_models.py):
+        #   • Cerebras gpt-oss-120b returns in ~600 ms, faster than
+        #     Groq's llama-3.3-70b at ~1.0 s. Free tier, no monthly cap.
+        #   • Earlier revisions bypassed Cerebras because the response
+        #     parser KeyError'd on reasoning-model bodies at max_tokens
+        #     =1024 — fixed in engine.py CerebrasProvider (bumped to
+        #     4096 + empty-content rotation).
+        #   • Groq stays as the second link so a Cerebras outage / rate
+        #     limit still gets an answer.
+        #   • Local Qwen kicks in only when both cloud providers are
+        #     offline; not bundled in dev source, only in the release.
+        cb_keys = hk_engine._resolve_keys(cfg, 'cerebras')
+        cb_model = (cfg.get('providers', {}).get('cerebras', {})
+                    .get('model', hk_engine.CEREBRAS_MODELS[0]))
+        cerebras = (hk_engine.CerebrasProvider(api_keys=cb_keys, model=cb_model)
+                    if cb_keys else None)
+
         groq_keys = hk_engine._resolve_keys(cfg, 'groq')
         groq_model = (cfg.get('providers', {}).get('groq', {})
                       .get('model', hk_engine.GROQ_MODELS[0]))
         groq = hk_engine.GroqProvider(api_keys=groq_keys, model=groq_model)
+
         local = (hk_engine.LocalProvider()
                  if hk_engine.local_provider_available() else None)
-        if local:
-            _provider = hk_engine.FallbackProvider(groq, local)
-        else:
-            _provider = groq
-        logger.info(f'Ask Docs LLM: Groq-first chain ready ({_provider.name})')
+
+        # Build the chain right-to-left: innermost = last resort.
+        chain = groq if local is None else hk_engine.FallbackProvider(groq, local)
+        if cerebras is not None:
+            chain = hk_engine.FallbackProvider(cerebras, chain)
+        _provider = chain
+        logger.info(f'Ask Docs LLM: chain ready ({_provider.name})')
     except Exception as e:
         logger.exception(f'Ask Docs LLM: provider build failed: {e}')
         raise RuntimeError(f'Could not initialise AI provider: {e}') from e
@@ -202,6 +227,13 @@ def stream(prompt: str, system: str = ''):
                 if 'rate limit' in msg or '429' in msg:
                     last_err = e
                     continue  # rotate keys, then break to outer backoff
+                # Auth errors: one-shot fallback would 401 again with the
+                # same dead keys. Surface directly so the user sees the
+                # real cause instead of a second wasted round-trip.
+                if ('401' in msg or 'unauthorized' in msg
+                        or 'invalid api key' in msg or 'api_key' in msg):
+                    logger.error(f'Stream auth failed ({e}); not retrying')
+                    raise
                 # Non-rate-limit error — hard fail, fall back to one-shot.
                 logger.warning(f'Stream failed ({e}); falling back to one-shot')
                 yield ask(prompt, system)
@@ -221,4 +253,5 @@ def reset_provider() -> None:
     active (matches Hotkeys' tray menu behaviour). Forces a rebuild on
     next ask()."""
     global _provider
-    _provider = None
+    with _provider_lock:
+        _provider = None

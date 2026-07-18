@@ -373,31 +373,92 @@ class VectorIndex:
         ]
 
     def lexical_search(self, terms: list[str], top_k: int = 50) -> list[dict]:
-        """Pure keyword search: return every chunk that contains any of the
-        whole-word `terms` (case-insensitive). Useful for exhaustive counting
-        questions ("how many mentions of dog?") where semantic retrieval
-        would miss long-tail occurrences after top-K cutoff.
+        """Whole-word keyword search with IDF-weighted scoring.
 
-        Score = number of matches in that chunk (so a chunk with 3 hits
-        ranks above one with 1). Chunks with zero matches are filtered out.
+        Old behaviour was: sum of literal match counts across all terms.
+        On a tabular corpus that repeats one term everywhere (e.g. the
+        Quran-morphology file has "root" in ~2/3 of rows), that scoring
+        buried the rare, target terms — a query for ["list", "ant",
+        "root", "nml"] returned the highest-"root"-density chunks and
+        never the four chunks actually containing "nml".
+
+        New scoring is a lightweight TF-IDF:
+          weight(term) = log(1 + N / (1 + df))
+        where N = total chunks and df = chunks containing that term.
+        Rare targets ("klb", "nml", "114:6") dominate; corpus-wide
+        boilerplate ("root", "stem") ends up near-zero.
         """
-        import re
+        import math, re
         if not terms:
             return []
-        # Build a single regex with word boundaries for each term.
-        pats = [re.compile(r'\b' + re.escape(t) + r'\b', re.IGNORECASE)
-                for t in terms]
+        # Boundary logic depends on the term's edges. For a plain-word
+        # term ("klb") we want `(?<!\w)klb(?!\w)`. For a punctuation-
+        # edged term like `(108:` the leading `(` and trailing `:` are
+        # already anchors — enforcing (?!\w) after `:` would fail the
+        # match because the next char in a corpus row `(108:1:...` is a
+        # digit (word char). So we only apply the boundary check on
+        # the side of the token that starts/ends with a word char.
+        def _mk(t: str):
+            left  = r'(?<!\w)' if t[:1].isalnum() else r''
+            right = r'(?!\w)'  if t[-1:].isalnum() else r''
+            return re.compile(left + re.escape(t) + right, re.IGNORECASE)
+        pats = [(t, _mk(t)) for t in terms]
         rows = self._conn.execute(
             'SELECT source_id, chunk_idx, text FROM chunks').fetchall()
+        n_docs = len(rows) or 1
+
+        # First pass: doc-frequency per term (in how many chunks does it
+        # occur at least once?).
+        df = {t: 0 for t, _ in pats}
+        for _sid, _idx, text in rows:
+            for t, p in pats:
+                if p.search(text):
+                    df[t] += 1
+
+        # IDF weight per term. High-frequency corpus tokens (df ≈ n_docs)
+        # get near-zero weight; rare tokens get the largest weight.
+        idf = {t: math.log(1 + n_docs / (1 + d)) for t, d in df.items()}
+
+        # Prune uninformative terms outright: anything appearing in >50%
+        # of chunks (like "root" in the Quran-morphology file, which is
+        # in ~2/3 of rows) is noise and can distort the ranking even
+        # after IDF. Also prune terms with df=0 (no match anywhere) —
+        # they can't contribute a signal.
+        # But: never prune ALL terms — if every term is too common, we
+        # keep the least-common few so scoring still ranks something.
+        active = {t: w for t, w in idf.items()
+                  if 0 < df[t] <= max(1, n_docs // 2)}
+        if not active:
+            # Every query term was either absent or a corpus keyword.
+            # Fall back to the least-common half so we don't return
+            # empty on a query where all terms are boilerplate.
+            ranked = sorted(df.items(), key=lambda kv: kv[1])
+            active = {t: idf[t] for t, _ in ranked[:max(1, len(ranked) // 2)]
+                      if df[t] > 0}
+        active_pats = [(t, p) for t, p in pats if t in active]
+
         hits = []
         for src_id, idx, text in rows:
-            score = sum(len(p.findall(text)) for p in pats)
+            score = 0.0
+            for t, p in active_pats:
+                m = len(p.findall(text))
+                if m:
+                    # log(1+m) saturation prevents a chunk with 20 hits
+                    # of a common term (PN, DET) from outranking a chunk
+                    # with 1 hit of a rare target term (muHam~ad, klb).
+                    # Under raw m × idf: 20 × log(1+6695/2000)=1.5 = 30
+                    # beats 1 × log(1+6695/5)=7.4 = 7.4. Under log-tf:
+                    # log(21) × 1.5 = 4.6 loses to log(2) × 7.4 = 5.1.
+                    # That's the whole point of BM25-style TF saturation:
+                    # one rare hit is worth more than a chunk full of
+                    # boilerplate.
+                    score += math.log1p(m) * active[t]
             if score > 0:
                 hits.append({
                     'source_id': src_id,
                     'chunk_idx': idx,
                     'text':      text,
-                    'score':     float(score),
+                    'score':     score,
                 })
         hits.sort(key=lambda h: -h['score'])
         return hits[:top_k]

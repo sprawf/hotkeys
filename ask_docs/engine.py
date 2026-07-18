@@ -124,11 +124,13 @@ _EXHAUSTIVE_RE = re.compile(
     # This rejects "How many years did Noah preach?" (years is not an
     # enumeration noun) while still catching "How many mentions of X?" and
     # "List every verse mentioning Y."
-    r'\b(how many|count|number of|all|every|list|each|enumerate)\b'
-    r'.{0,40}'
+    r'\b(how many|count|number of|all|every|list|each|enumerate|show)\b'
+    r'.{0,60}'
     r'\b(mention|mentions|mentioned|occurrence|occurrences|instance|'
-    r'instances|appearance|appearances|reference|references|verse|verses|'
-    r'time|times|usage|usages)\b',
+    r'instances|appearance|appearances|appear|appears|appeared|appearing|'
+    r'reference|references|verse|verses|time|times|usage|usages|'
+    r'row|rows|entry|entries|entrie|record|records|location|locations|'
+    r'place|places|line|lines)\b',
     re.IGNORECASE,
 )
 # Words to NOT use as lexical search terms (stop words).
@@ -152,25 +154,128 @@ def _detect_exhaustive_intent(question: str) -> tuple[bool, list[str]]:
     should fold into the lexical retrieval.
     """
     is_exhaustive = bool(_EXHAUSTIVE_RE.search(question))
-    # Pull terms inside quotes first (these are usually the literal words
-    # the user wants counted, e.g. how many mentions of "dog"?).
+    # Cap depends on intent: exhaustive queries frequently list many
+    # keyword categories (e.g. "oaths / swearing / vow / By Allah / By my
+    # Lord / La uqsimu / abstention / breaking / pledge") and a 12-term
+    # cap eats them all with the quoted phrases alone. 30 gives enough
+    # room for the non-quoted content words too. Normal queries stay at
+    # 12 to avoid seed noise.
+    cap = 30 if is_exhaustive else 12
+    seed = _content_words(question, cap=cap)
     quoted = re.findall(r'["\']([^"\']{2,40})["\']', question)
     if quoted:
-        # Split each quoted phrase into words, deduped.
-        terms = []
-        for q in quoted:
-            for w in re.findall(r"[A-Za-z']{2,30}", q):
+        quoted_terms: list[str] = []
+        for qphrase in quoted:
+            for w in re.findall(r"[A-Za-z']{2,30}", qphrase):
                 if w.lower() not in _STOPWORDS:
-                    terms.append(w)
-        return is_exhaustive, terms or _content_words(question)
-    return is_exhaustive, _content_words(question)
+                    quoted_terms.append(w)
+        # Deduplicate while preserving order: quoted first, then seed.
+        seen: set[str] = set()
+        merged: list[str] = []
+        for t in quoted_terms + seed:
+            if t.lower() in seen:
+                continue
+            seen.add(t.lower())
+            merged.append(t)
+        return is_exhaustive, merged[:cap]
+    return is_exhaustive, seed
 
 
-def _content_words(question: str) -> list[str]:
-    """Extract content (non-stopword) words from a question. Used to seed
-    lexical retrieval when no quoted phrase is present."""
-    words = re.findall(r"[A-Za-z']{3,30}", question.lower())
-    return [w for w in words if w not in _STOPWORDS][:10]
+def _content_words(question: str, cap: int = 12) -> list[str]:
+    """Extract content (non-stopword) tokens from a question. Used to seed
+    lexical retrieval when no quoted phrase is present.
+
+    Grammar covers four shapes:
+      • Plain 2+ letter words  ("dog", "klb", "ant", "qsm")
+      • Buckwalter-flavoured tokens with punctuation ("{ll~ah", "n~aAs",
+        ">anaAmila")
+      • Verse-location codes like "114:6", "27:18", or standalone digits
+        like "2", "108", "286". Kept so the retriever can find literal
+        Quran-corpus rows keyed on (S:A:W:P).
+      • Location-anchored rewrites: "Surah 108" / "chapter 2" is
+        equivalent to "every corpus row starting with (108:" / "(2:".
+        We synthesise "(108:" as a lex term so the retriever hits the
+        surah's own rows instead of arbitrary chunks that happen to
+        contain "108" somewhere in a different context.
+
+    The original impl was `[A-Za-z']{3,30}` which silently dropped every
+    digit and every Buckwalter punctuation char. Structural questions on
+    the Quran corpus therefore retrieved nothing — the lexical seed was
+    empty of the very tokens the corpus actually contains.
+    """
+    # Location-anchored rewrites: pull "Surah N" / "chapter N" / "verse
+    # S:V" and synthesise the corpus-native location prefixes.
+    # More-specific anchors first: they score higher because they match
+    # fewer (or exactly one) chunks. Order matters for the [:12] cap.
+    anchors: list[str] = []
+    q_lower = question.lower()
+
+    # Detect "first (token|word|entry) of Surah N" and inject the exact
+    # verse-1 prefix. Without this, "(2:" matches 15% of the corpus and
+    # the specific (2:1:1:1) chunk gets buried under other (2:X:Y:Z) hits.
+    is_first_of = bool(re.search(
+        r'\b(?:first|opening|beginning|initial)\b.{0,40}'
+        r'\b(?:surah|sura|chapter)\s+\d',
+        q_lower))
+    is_last_of = bool(re.search(
+        r'\b(?:last|final|closing|ending)\b.{0,40}'
+        r'\b(?:surah|sura|chapter|verse)\s+\d',
+        q_lower))
+
+    for m in re.finditer(r'\b(?:surah|sura|chapter)\s+(\d{1,3})\b',
+                          question, flags=re.IGNORECASE):
+        s = m.group(1)
+        if is_first_of:
+            anchors.append(f'({s}:1:1:1)')  # exact opening token
+            anchors.append(f'({s}:1:')       # opening verse anchor
+        # General surah anchor (least specific, always included).
+        anchors.append(f'({s}:')
+
+    for m in re.finditer(r'\bverse\s+(\d{1,3}):(\d{1,3})\b',
+                          question, flags=re.IGNORECASE):
+        s, v = m.group(1), m.group(2)
+        if is_first_of:
+            anchors.append(f'({s}:{v}:1:1)')
+        anchors.append(f'({s}:{v}:')
+
+    # Verse-location codes like "114:6" or "27:18:6" — kept verbatim.
+    locs = re.findall(r'\d{1,3}:\d{1,3}(?:\:\d{1,3})?', question)
+
+    # Plain 2+ char alpha / Buckwalter tokens. Hyphens split into
+    # separate tokens: "INL-tagged" should retrieve "INL" (which IS a
+    # corpus tag) as its own term. Same for compound phrases like
+    # "Al-Kawthar" -> "Al" + "Kawthar".
+    words = re.findall(r"[A-Za-z'{}~`]{2,30}", question)
+    filtered = [w for w in words if w.lower() not in _STOPWORDS]
+
+    # Standalone integers 1-4 digits (surah / verse / word numbers).
+    # Allow single-digit so "Surah 2" is retrievable — the earlier
+    # 2-digit minimum lost every reference to surahs 1-9.
+    nums = re.findall(r'\b\d{1,4}\b', question)
+
+    seen: set[str] = set()
+    out: list[str] = []
+    # Anchors first (highest signal), then locations, then words, then bare
+    # numbers. Order matters — earlier terms get retained if the [:12] cap
+    # is hit.
+    for t in anchors + locs + filtered + nums:
+        if t.lower() in seen:
+            continue
+        seen.add(t.lower())
+        out.append(t)
+    return out[:cap]
+
+
+_REFUSAL_PATTERNS = re.compile(
+    r'(not\s+(?:mentioned|found|present|available|discussed|covered|included)'
+    r'\s+in\s+(?:the\s+)?(?:provided\s+)?sources?'
+    r'|(?:the\s+)?sources?\s+(?:do\s+not|don\'?t|does\s+not|doesn\'?t)\s+'
+    r'(?:contain|mention|discuss|cover|include|have|address|specify)'
+    r'|no\s+information\s+(?:about|regarding|on|is\s+provided)'
+    r'|(?:i\s+)?(?:can(?:not|\'?t)\s+find|couldn\'?t\s+find)'
+    r'|is\s+not\s+(?:in|part\s+of)\s+(?:the\s+)?(?:provided\s+)?sources?)',
+    re.IGNORECASE,
+)
 
 
 def _postprocess_answer(answer: str, *,
@@ -186,10 +291,38 @@ def _postprocess_answer(answer: str, *,
        "Total occurrences: 5" but lists 6 bullets, we override the
        total with the actual bullet count.
 
+    3. Refusal citation spam: when the answer is a "not in sources"
+       refusal, the LLM habitually trails the sentence with every
+       chunk id it inspected (e.g. "not mentioned [1] [2] [3] … [18]").
+       Those chips are pure visual noise for a non-answer, so we drop
+       every citation marker from short refusal responses.
+
     The transformations are deliberately conservative — anything we
     can't safely fix we leave alone rather than risk corrupting the
     answer text.
     """
+    # ── CJK-bracket normalisation ──────────────────────────────────────────
+    # Cerebras' gpt-oss-120b non-deterministically emits fullwidth CJK
+    # brackets 【N】 instead of ASCII [N] around citations. The rest of
+    # this function (and the UI citation-chip renderer) matches only
+    # ASCII, so without this the chips silently don't render and
+    # `used_chunk_ids` comes back empty. Same trick works for the
+    # (rarer) fullwidth 〔N〕 and 「N」.
+    answer = re.sub(r'[【〔「]\s*(\d+)\s*[】〕」]', r'[\1]', answer)
+
+    # ── Refusal citation-chip suppression ──────────────────────────────────
+    # Applies BEFORE the valid_citation_ids guard so refusals without
+    # citations aren't a special case. Threshold on length keeps this
+    # from misfiring on real answers that happen to include a caveat
+    # sentence: a legitimate partial-refusal ("the sources mention X
+    # but do not discuss Y") is > 400 chars in practice.
+    plain = re.sub(r'\[\d+\]', '', answer).strip()
+    if _REFUSAL_PATTERNS.search(plain) and len(plain) < 400:
+        answer = re.sub(r'\s*\[\d+\]', '', answer)
+        # Collapse runs of whitespace introduced by the stripping.
+        answer = re.sub(r'[ \t]{2,}', ' ', answer).strip()
+        return answer
+
     if not valid_citation_ids:
         return answer
 
@@ -216,6 +349,12 @@ def _postprocess_answer(answer: str, *,
             return f'[{min_id}]'
         return m.group(0)
     answer = re.sub(r'\[(\d+)\]', _fix_cite, answer)
+
+    # Collapse consecutive duplicate citation markers: "[13] [13]" or
+    # "[7][7][7]" → "[13]" / "[7]". Cerebras' reasoning models occasionally
+    # emit the same chunk id back-to-back when they double-cite for
+    # emphasis; a single chip reads cleaner.
+    answer = re.sub(r'(\[(\d+)\])(?:\s*\[\2\])+', r'\1', answer)
 
     # ── Exhaustive total/bullet count reconciliation ────────────────────
     if is_exhaustive:
@@ -306,6 +445,18 @@ def ask(nb_id: str, question: str, *,
     if nb is None:
         raise RuntimeError(f'Doc set {nb_id} not found')
 
+    # ── Empty-query guard ────────────────────────────────────────────────
+    # Whitespace-only / empty prompts must not reach the LLM. Left alone
+    # the model happily invents a "general overview" answer, wastes a
+    # round-trip and pollutes the answer cache with a bogus entry keyed
+    # on the empty string.
+    if not (question or '').strip():
+        return {
+            'answer':         'Type a question first, then press Enter.',
+            'citations':      [],
+            'used_chunk_ids': [],
+        }
+
     # ── Answer cache lookup ───────────────────────────────────────────────
     # Cache key includes: notebook, normalised question, selected sources,
     # and persona — change any of these and the cached answer is wrong.
@@ -357,25 +508,55 @@ def ask(nb_id: str, question: str, *,
             # Pull a generous top-K — we want every occurrence, not just
             # the most "relevant". 200 should fit a 50-mention term
             # comfortably while staying inside any LLM's context budget.
-            raw_hits = idx.lexical_search(lex_terms, top_k=200)
+            raw_hits = idx.lexical_search(lex_terms, top_k=500)
+            # Semantic fallback: if the corpus doesn't literally contain
+            # the question's content words (e.g. Buckwalter-transliterated
+            # Quran morphology, where "verse" or "fatiha" don't appear as
+            # strings), the lexical search returns 0 hits and the user
+            # sees "no relevant passages found" for a question the corpus
+            # actually answers structurally. Fall back to the standard
+            # semantic path so meaning survives absence of the exact word.
+            if not raw_hits:
+                _log('Lexical returned 0 hits — falling back to semantic.')
+                q_vec = embed.encode_query(question)
+                raw_hits = idx.search(q_vec, top_k=_TOP_K * 3)
         else:
             q_vec = embed.encode_query(question)
             over_fetch = _TOP_K * 3 if selected_set is not None else _TOP_K * 2
             semantic_hits = idx.search(q_vec, top_k=over_fetch)
-            # Hybrid backfill: also lexical-search for content words from
-            # the question, and merge in any chunks the semantic pass
-            # missed. This helps catch literal-keyword questions ("Did
-            # Newton write about gravity?") that semantic similarity can
-            # rank below paraphrases.
+            # Hybrid retrieval: run a lexical pass in parallel and
+            # INTERLEAVE the two lists so both survive the chunk_cap
+            # trim. Old behaviour appended lex hits past the semantic
+            # tail, then chunk_cap truncated them off — result: literal-
+            # keyword questions (e.g. "segments of verse 114:6" on a
+            # tabular corpus where the semantic embedding is useless)
+            # got zero of the lex hits into the final context.
             if lex_terms:
-                seen = {(h['source_id'], h['chunk_idx']) for h in semantic_hits}
                 lex_hits = idx.lexical_search(lex_terms, top_k=_TOP_K * 2)
-                for h in lex_hits:
-                    key = (h['source_id'], h['chunk_idx'])
-                    if key not in seen:
-                        semantic_hits.append(h)
-                        seen.add(key)
-            raw_hits = semantic_hits
+                # Round-robin merge: sem, lex, sem, lex, ... skipping
+                # duplicates by (source_id, chunk_idx). Guarantees the
+                # top lex match is in position 2 no matter how many
+                # semantic hits precede it.
+                seen: set[tuple[str, int]] = set()
+                merged: list[dict] = []
+                sem_it = iter(semantic_hits)
+                lex_it = iter(lex_hits)
+                while True:
+                    took = False
+                    for it in (sem_it, lex_it):
+                        for h in it:
+                            key = (h['source_id'], h['chunk_idx'])
+                            if key in seen:
+                                continue
+                            seen.add(key)
+                            merged.append(h)
+                            took = True
+                            break
+                    if not took:
+                        break
+                raw_hits = merged
+            else:
+                raw_hits = semantic_hits
 
     if selected_set is not None:
         hits = [h for h in raw_hits if h['source_id'] in selected_set]
@@ -383,7 +564,7 @@ def ask(nb_id: str, question: str, *,
         hits = raw_hits
     # Cap how many chunks we feed to the LLM: more for exhaustive queries,
     # tight for normal chat (model writes shorter answers when given less).
-    chunk_cap = 60 if is_exhaustive else _TOP_K
+    chunk_cap = 200 if is_exhaustive else _TOP_K
     hits = hits[:chunk_cap]
 
     # Context expansion — for non-exhaustive questions, pull the immediate
@@ -421,12 +602,20 @@ def ask(nb_id: str, question: str, *,
     citations = []
     context_lines = []
     total_chars = 0
-    # Exhaustive queries need a bigger context budget so we can pack in
-    # all the chunks containing the term. We cap at 80k chars — Groq's
-    # request size limit (not the token limit) kicks in around 100-120k
-    # raw bytes for Llama-3.3-70B-versatile, so 80k leaves headroom for
-    # the prompt instructions + system prompt + response.
-    char_budget = 80_000 if is_exhaustive else _CONTEXT_CHAR_BUDGET
+    # Exhaustive queries pack extra chunks so we can enumerate every
+    # occurrence, but the budget has to survive the smallest provider
+    # in the fallback chain — Groq llama-3.3-70b's HTTP endpoint 413s
+    # around ~40k characters of body (well below the model's actual
+    # context window; a request-body cap, not a token cap). We land at
+    # 30k so header + user prompt + system prompt still fit under 40k.
+    # For a corpus like the Quran morphology (~900 char/chunk) that's
+    # still ~30-35 chunks — plenty to enumerate a term appearing 5-25
+    # times across the file.
+    # Cerebras gpt-oss-120b is primary and has huge context; 50k fits
+    # ~55 chunks of ~900 chars each. On a Groq fallback this will 413
+    # (Groq caps around 40k body) but Cerebras stays up 99% of the time.
+    # Higher would need per-provider dispatch.
+    char_budget = 50_000 if is_exhaustive else _CONTEXT_CHAR_BUDGET
     for n, hit in enumerate(hits, start=1):
         chunk_text = hit['text']
         # Stop adding chunks once we'd exceed the context budget — keeps
@@ -493,22 +682,49 @@ def ask(nb_id: str, question: str, *,
             '## You are answering an EXHAUSTIVE / COUNTING question.\n'
             'Hard rules for this kind of question:\n'
             '1. Scan EVERY source passage above. Do not stop early.\n'
-            '2. Find every literal occurrence of the term the user is asking '
-            'about. Use word-boundary matching (so "dog" matches "dog" and '
-            '"dogs" but not "doctrine").\n'
+            '2. Match LITERALLY on whatever the user named — a word, a '
+            'root code, a tag, a location pattern. If the user says '
+            '"ROOT:klb" or "root klb", every row containing the exact '
+            'string "klb" as a token counts, regardless of surrounding '
+            'lemma or translation. Do not filter by semantic meaning; '
+            'do not pre-decide that some matches are "the same thing."\n'
             '3. Report the EXACT count of distinct occurrences.\n'
-            '4. List each occurrence with its surrounding context and a '
-            'citation marker [N] pointing to the chunk it came from.\n'
+            '4. Quote each occurrence VERBATIM from the source with '
+            'its location code. Do NOT paraphrase, translate, or '
+            'reformat the row. Copy the text as-is between quotes.\n'
             '5. **COUNT YOUR BULLETS**: before writing the final total, '
             'literally count the bullet items in your "Each occurrence" '
             'list. The number in your total MUST equal that bullet count. '
             'If you list 6 bullets, the total is 6 — not 5, not 7.\n'
-            '6. If the term appears 0 times, say so plainly.\n'
-            '7. Do not extrapolate to passages not in the sources.\n\n'
-            'Output format:\n'
-            '**Total occurrences: <count of bullets below>**\n\n'
+            '6. If the term appears 0 times, say so plainly and STOP. '
+            'Do not fabricate example rows.\n'
+            '7. **NEVER invent locations or content.** If a specific '
+            'verse number, chunk id, or row is not literally present in '
+            'the retrieved passages, do NOT claim it exists. Extrapolating '
+            'a pattern ("verses 1 through 32 must all be there") is '
+            'strictly forbidden — count only what is physically shown.\n'
+            '8. When the user asks about a location code like "S:V:W:P" '
+            '(surah:verse:word:position), those are FOUR different axes. '
+            'Do not confuse the "word" or "position" axis with the verse '
+            'axis when counting verses.\n\n'
+            '9. **Ultra-compact output.** Do NOT write a description, '
+            'summary, or per-item explanation. Do NOT restate the '
+            'question. One line per occurrence in the exact format '
+            'shown below. This makes room for hundreds of matches '
+            'inside the token budget; verbose per-item text truncates '
+            'the answer.\n'
+            '10. **Scan every chunk in the source above.** Some retrieved '
+            'chunks contain many matches; do not stop at the first '
+            'match in each chunk. If you see 10 matching rows in one '
+            'chunk, emit 10 bullets from that chunk.\n\n'
+            'Output format (exactly, nothing else):\n'
+            '**Total occurrences: <N>**\n\n'
             '## Each occurrence\n'
-            '- [N] "<short surrounding context>" — <where it appears>.\n\n'
+            '- (S:V) "<exact verbatim quote>" [N]\n\n'
+            'Where (S:V) is the surah:verse reference from the source, '
+            'the quote is the exact English gloss verbatim from the '
+            'row, and [N] is the chunk id it came from. One line per '
+            'row. No section headers between surahs. No prose.\n\n'
             if is_exhaustive else
             # Custom persona → ONLY the citation rule is mandatory.
             # Everything else (style, length, bold, structure) is left to

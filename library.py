@@ -1194,6 +1194,7 @@ class LibraryWindow:
         'whiteboard':   'whiteboard',
         'transcribe':   'transcribe',
         'audio_editor': 'audio_editor',
+        'ask_docs':     'ask_docs',
     }
 
     # No placeholder slots — F11/F12 will be wired when real features arrive.
@@ -1252,6 +1253,7 @@ class LibraryWindow:
         self._on_new_note: Callable | None = None    # set by main.py → opens QuickNotesWindow
         self._on_open_whiteboard: Callable | None = None  # set by main.py → opens Whiteboard
         self._on_open_audio_editor: Callable | None = None  # set by main.py → toggles audio_editor
+        self._on_open_ask_docs: Callable | None = None  # set by main.py → opens Ask Docs
         self._active_tab         = 'prompts'   # 'prompts' | 'macros' | 'recorder' | 'gif' | 'ask'
         self.active_idx  = 0
         self._cards: list[ctk.CTkFrame] = []
@@ -1487,6 +1489,10 @@ class LibraryWindow:
         _make_tab_btn('🎵  Audio editor', 'audio_editor')
         Tooltip(self._tab_btns['audio_editor'],
                 f'{ae_hk_h2} to open it from anywhere')
+        ad_hk_h2 = hk.get('ask_docs', 'shift+f11').upper()
+        _make_tab_btn('📚  Ask Docs', 'ask_docs')
+        Tooltip(self._tab_btns['ask_docs'],
+                f'{ad_hk_h2} to open Ask Docs from anywhere')
         # ── Reserved Shift+F11..F12 placeholder tabs ────────────────────────
         # Compact buttons, just the function-key label, so the tab row
         # doesn't blow out horizontally. Tooltip still shows the full hint.
@@ -2015,6 +2021,9 @@ class LibraryWindow:
             return
         if self._active_tab == 'audio_editor':
             self._render_audio_editor_tab()
+            return
+        if self._active_tab == 'ask_docs':
+            self._render_ask_docs_tab()
             return
         if self._active_tab.startswith('slot'):
             self._render_slot_tab(self._active_tab)
@@ -4630,6 +4639,66 @@ class LibraryWindow:
                 self._on_open_audio_editor()
 
         _btn(container, f'🎵  Open audio editor  ({ae_hk})', _open, width=260,
+             fg_color=ACCENT, hover=ACCENTL,
+             ).grid(row=1, column=0, sticky='w', pady=(PAD, 0))
+
+    def _render_ask_docs_tab(self) -> None:
+        """Render the Ask Docs tab: hotkey hint plus an Open button.
+
+        The Ask Docs window itself is a Toplevel built in ask_docs.ui and
+        gets opened via the same callback main.py uses when Shift+F11 is
+        pressed. This tab is just a launcher card, same shape as
+        Whiteboard / Audio editor.
+        """
+        if self._render_tab_guard('ask_docs'):
+            return
+        for w in self._scroll.winfo_children():
+            w.destroy()
+        self._cards.clear()
+        self._folder_headers.clear()
+
+        for _c in range(max(2, self._current_cols) + 1):
+            self._scroll.columnconfigure(_c, weight=0)
+        self._scroll.columnconfigure(0, weight=1)
+
+        ad_hk = self.hotkey_cfg.get('ask_docs', 'shift+f11').upper()
+
+        container = ctk.CTkFrame(self._scroll, fg_color='transparent')
+        container.grid(row=0, column=0, sticky='ew', padx=PAD, pady=PAD)
+        container.columnconfigure(0, weight=1)
+
+        hdr = ctk.CTkFrame(container, fg_color=SURFACE, corner_radius=RADIUS_SM)
+        hdr.grid(row=0, column=0, sticky='ew')
+        hdr.columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            hdr, text='📚  Ask Docs',
+            font=(FONT_FAMILY, 15, 'bold'), text_color=TEXT_P,
+        ).grid(row=0, column=0, sticky='w', padx=PAD, pady=(PAD, 2))
+        ctk.CTkLabel(
+            hdr,
+            text=(f'Press {ad_hk} anywhere to open Ask Docs. Load PDFs, '
+                  'Word docs, PowerPoint, spreadsheets, HTML, EPUB, images '
+                  '(with OCR), audio (transcribed), YouTube URLs, or paste '
+                  'text. Ask questions and get answers with inline citation '
+                  'chips linking back to the exact passage. Runs offline '
+                  'except for the answer LLM call.'),
+            font=(FONT_FAMILY, 13), text_color=TEXT_P, justify='left',
+            wraplength=900,
+        ).grid(row=1, column=0, sticky='w', padx=PAD, pady=(0, PAD_SM))
+
+        ctk.CTkLabel(
+            hdr,
+            text=('💡  Tip: while dictating with Ctrl+Enter, say "ask docs" '
+                  'to open this hands-free from any app.'),
+            font=(FONT_FAMILY, 12, 'italic'), text_color=TEXT_S, justify='left',
+            wraplength=900,
+        ).grid(row=2, column=0, sticky='w', padx=PAD, pady=(0, PAD))
+
+        def _open():
+            if self._on_open_ask_docs:
+                self._on_open_ask_docs()
+
+        _btn(container, f'📚  Open Ask Docs  ({ad_hk})', _open, width=260,
              fg_color=ACCENT, hover=ACCENTL,
              ).grid(row=1, column=0, sticky='w', pady=(PAD, 0))
 

@@ -1509,7 +1509,11 @@ class AskDocsWindow(ctk.CTkToplevel):
         if self._on_close:
             try: self._on_close()
             except Exception: pass
-        self.destroy()
+        # destroy() can raise if Tk has already torn the widget down (e.g.
+        # root shutdown fired first). Swallow — the following owns_root
+        # branch must still run so we don't leak a mainloop.
+        try: self.destroy()
+        except Exception: pass
         if self._owns_root:
             try: self._root_ref.quit()
             except Exception: pass
