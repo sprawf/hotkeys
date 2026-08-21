@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import copy
 import json
 import shutil
@@ -193,7 +194,19 @@ def write_json_atomic(path: str, data, *, indent: int = 2,
                         # fsync may fail on certain network mounts; we still
                         # got the write, just lose the durability guarantee.
                         pass
-            os.replace(tmp, path)
+            # os.replace() can hit a transient WinError 5 (Access is denied)
+            # when Defender/AVG's real-time scanner has the just-written
+            # .tmp file open for scanning at the exact moment we try to
+            # rename it — the lock clears within milliseconds on its own.
+            # Retry a few times before giving up for real.
+            for _attempt in range(5):
+                try:
+                    os.replace(tmp, path)
+                    break
+                except PermissionError:
+                    if _attempt == 4:
+                        raise
+                    time.sleep(0.08 * (_attempt + 1))
         except Exception:
             # Clean up the orphan tmp so future loads don't pick it up.
             try:

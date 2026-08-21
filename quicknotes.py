@@ -3660,8 +3660,11 @@ class QuickNotesWindow(ctk.CTkToplevel):
                         n['pinned'] = self._pinned
                         break
                 self._invalidate_notes_cache()
-                save_notes(notes)
-                logger.info('Quick note updated')
+                try:
+                    save_notes(notes)
+                    logger.info('Quick note updated')
+                except Exception:
+                    logger.exception('Quick note update failed to save')
             else:
                 border_hex = None
                 for chip_clr, bdr_clr, _ in NOTE_COLORS:
@@ -3680,8 +3683,11 @@ class QuickNotesWindow(ctk.CTkToplevel):
                 notes = load_notes()
                 notes.append(note)
                 self._invalidate_notes_cache()
-                save_notes(notes)
-                logger.info('Quick note saved')
+                try:
+                    save_notes(notes)
+                    logger.info('Quick note saved')
+                except Exception:
+                    logger.exception('Quick note failed to save')
 
         # Persist geometry so next open restores size/position.
         # Matching guard to the load-side 80% check: refuse to PERSIST a

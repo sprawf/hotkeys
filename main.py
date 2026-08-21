@@ -2596,7 +2596,8 @@ class App:
                     self._notes_win._save_and_close()
                     return
             except Exception:
-                pass
+                logger.exception('Quick Notes: toggle/restore failed; '
+                                  'discarding window reference')
             self._notes_win = None
 
         self._build_notes_window()
