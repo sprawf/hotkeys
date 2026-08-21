@@ -71,6 +71,34 @@ def _exe_path() -> Path:
     return _bundled_root() / 'audio_editor_assets' / 'tenacity' / 'tenacity.exe'
 
 
+def _desktop_path() -> str:
+    """Resolve the user's real Desktop folder via the Windows Known
+    Folder API (FOLDERID_Desktop), not ~\\Desktop string-building —
+    many Windows setups redirect Desktop into OneDrive, and a naive
+    join would silently point at a folder that doesn't exist or isn't
+    what the user actually sees on their desktop."""
+    if sys.platform != 'win32':
+        return str(Path.home() / 'Desktop')
+    try:
+        import ctypes
+        from ctypes import wintypes
+        # FOLDERID_Desktop = {B4BFCC3A-DB2C-424C-B029-7FE99A87C641}
+        FOLDERID_Desktop = ctypes.create_string_buffer(
+            b'\x3a\xcc\xbf\xb4\x2c\xdb\x4c\x42\xb0\x29\x7f\xe9\x9a\x87\xc6\x41', 16)
+        _ole32 = ctypes.windll.ole32
+        _shell32 = ctypes.windll.shell32
+        path_ptr = ctypes.c_wchar_p()
+        hr = _shell32.SHGetKnownFolderPath(
+            ctypes.byref(FOLDERID_Desktop), 0, None, ctypes.byref(path_ptr))
+        if hr == 0 and path_ptr.value:
+            result = path_ptr.value
+            _ole32.CoTaskMemFree(path_ptr)
+            return result
+    except Exception:
+        pass
+    return str(Path.home() / 'Desktop')
+
+
 def _portable_settings_dir() -> Path:
     """The Portable Settings folder sibling to tenacity.exe. Tenacity
     detects this folder at launch and uses it for tenacity.cfg, but
@@ -103,10 +131,32 @@ def _ensure_portable_state() -> None:
     # keep pinned in the portable cfg before every launch. The walker
     # reasserts them only when missing or different, so user changes
     # outside of these keys are preserved.
+    _desktop = _desktop_path().replace('\\', '\\\\')
+    # TempDir previously defaulted to %LOCALAPPDATA%\Tenacity\SessionData
+    # (unset in our cfg, so upstream's own hardcoded fallback kicked in)
+    # — the one remaining path that still spelled out the upstream name.
+    # Point it inside our own portable settings folder instead, matching
+    # every other piece of state we already keep self-contained there.
+    _temp_dir = str(_portable_settings_dir() / 'SessionData').replace('\\', '\\\\')
     _SEED_KEYS = (
         # Suppress the upstream welcome splash, the wxHTMLWindow body
         # leaks the upstream brand and is unreachable to our scrubber.
         ('GUI', 'ShowSplashScreen', '0'),
+        # Default folder for Open/Save/Export dialogs. Unset, upstream
+        # falls back to its own hardcoded ~\Documents\Tenacity (creating
+        # that folder on first use and leaking the brand name into every
+        # file-dialog path the user sees). Pin both keys to the real
+        # Desktop (OneDrive-redirection aware, see _desktop_path) so nothing
+        # ever defaults there, and the front UI never shows "Tenacity" in
+        # a path either. Directories/Export LastUsed does get overwritten
+        # by the user's own most-recent choice each time they export
+        # somewhere else — that's expected; this only re-pins Desktop as
+        # the FIRST-launch default for someone who's never exported before.
+        ('Directories',        'DefaultOpenPath',   _desktop),
+        ('Directories/Export', 'LastUsed',          _desktop),
+        # Redirect the session/autosave temp folder off the upstream-
+        # named AppData path (see comment above _temp_dir).
+        ('Directories',        'TempDir',           _temp_dir),
         # Enable the bundled FFmpeg shared libs sitting next to
         # tenacity.exe (avformat-61.dll etc), needed for mkv / mp4 /
         # mov / m4a video import so users can drag a video and have
@@ -770,10 +820,54 @@ def _rebrand_all_owned_windows(pid: int) -> None:
     # Only kicks in when there are 2+ windows AND one of them isn't the
     # branded main window, so it's a no-op in the normal single-window
     # case.
-    if len(seen) >= 2:
+    #
+    # Additional guard: skip the whole rescue pass if the user is
+    # ALREADY looking at one of our own windows (main, dialog, or a
+    # transient control inside one — e.g. a folder/file-type dropdown
+    # in the Export dialog, which is itself a distinct owned window
+    # while open). The "hidden modal" scenario this net exists for is
+    # specifically when NONE of our windows has focus; forcing anything
+    # while the user is actively using a legitimate, already-visible
+    # dialog just interrupts it — this is what caused the Export/Save
+    # dialog to flicker and refuse input right after the File/Edit menu
+    # fix (same underlying mechanism, different owned window).
+    fg_owned_by_us = False
+    try:
+        fg_hwnd = _user32.GetForegroundWindow()
+        if fg_hwnd:
+            fg_pid = wintypes.DWORD()
+            _user32.GetWindowThreadProcessId(fg_hwnd, ctypes.byref(fg_pid))
+            fg_owned_by_us = (fg_pid.value == pid)
+    except Exception:
+        pass
+
+    if len(seen) >= 2 and not fg_owned_by_us:
         for h, title in seen:
             if title == DISPLAY_TITLE:
                 continue  # skip the main window
+            # Native Win32 popup menus (File/Edit dropdowns, right-click
+            # context menus — anything opened via TrackPopupMenu) are
+            # THEMSELVES a separate top-level window owned by the same
+            # PID for as long as they're open, so they satisfy the
+            # "2+ windows, not the main one" trigger above just like a
+            # real orphaned dialog would. But ShowWindow/topmost-flip/
+            # SetForegroundWindow on a live popup menu immediately kills
+            # its modal tracking loop — Windows dismisses it the instant
+            # anything touches its activation state. Since this poll
+            # runs every _TITLE_POLL_S (250ms), that meant every open
+            # File/Edit menu got yanked shut within a quarter-second of
+            # opening, then reopened by the user, over and over — the
+            # exact "menu keeps flickering" bug. Skip the menu window
+            # class (and tooltips, same fragility) so only genuine
+            # dialogs get this treatment.
+            try:
+                cls_buf = ctypes.create_unicode_buffer(64)
+                _user32.GetClassNameW(h, cls_buf, 64)
+                cls_name = cls_buf.value
+            except Exception:
+                cls_name = ''
+            if cls_name in ('#32768', 'tooltips_class32'):
+                continue
             try:
                 _force_dialog_to_front(h)
             except Exception:

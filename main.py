@@ -2573,10 +2573,24 @@ class App:
         if self._notes_win is not None:
             try:
                 if self._notes_win.winfo_exists():
-                    # If minimized (withdrawn), restore it
+                    # If minimized (withdrawn), restore it. Bare deiconify()
+                    # + lift() isn't enough on Windows when another one of
+                    # our own windows (e.g. MiniNotepad) currently holds OS
+                    # foreground focus — the restored window becomes
+                    # viewable at the Tk level but stays stuck behind it,
+                    # looking like Shift+F7/Home "did nothing" until the
+                    # foreground-holder closes. Same topmost-flip trick
+                    # used in _on_ask_followup above forces real foreground.
                     if not self._notes_win.winfo_viewable():
                         self._notes_win.deiconify()
                         self._notes_win.lift()
+                        try:
+                            self._notes_win.attributes('-topmost', True)
+                            self._notes_win.update_idletasks()
+                            self._notes_win.attributes('-topmost', False)
+                            self._notes_win.focus_force()
+                        except Exception:
+                            pass
                         return
                     # If visible, close+save it
                     self._notes_win._save_and_close()
@@ -2727,9 +2741,20 @@ class App:
         our own windows is safe: if paste failed inside our own UI, we
         already know about it (Tk exceptions surface directly).
         """
-        # Skip verify for our own windows
+        # Skip verify for our own windows — but only when a real editable
+        # widget is actually focused. Previously this trusted ANY focus
+        # inside our own process (a tab, a button, empty canvas space)
+        # and fired a blind Ctrl+V with no fallback. If nothing was
+        # actually capturing keystrokes, the transcription vanished
+        # silently — MiniNotepad never got a chance to catch it, unlike
+        # every other paste-target in the app.
         if self._focused_is_own_process():
-            paste_from_clipboard()
+            if self._own_window_focus_is_editable():
+                paste_from_clipboard()
+            else:
+                logger.info('PASTE-PRE: own-process focus not editable '
+                           '→ MiniNotepad')
+                self._show_mini_notepad(text)
             return
         # PRE-check: skip paste + go straight to MiniNotepad if UIA
         # confidently says no editable target is focused.
@@ -2836,6 +2861,34 @@ class App:
             return pid.value == os.getpid()
         except Exception:
             return False
+
+    def _own_window_focus_is_editable(self) -> bool:
+        """True if the Tk widget currently holding keyboard focus inside
+        our own process is something Ctrl+V can actually land text into
+        (Entry/Text and their CustomTkinter/ttk equivalents).
+
+        CustomTkinter widgets (CTkEntry, CTkTextbox) wrap a real
+        tk.Entry/tk.Text internally — Tk's focus_get() returns that
+        concrete inner widget, not the CTk wrapper, so checking the raw
+        Tk widget class name catches both plain and CTk variants without
+        importing customtkinter here.
+
+        Used only to decide whether the 'skip verify for our own
+        windows' fast-path is safe, or whether the paste has nowhere to
+        go and MiniNotepad should catch the transcription instead — same
+        safety net every foreign-app paste already gets.
+        """
+        try:
+            w = self.root.focus_get()
+        except Exception:
+            return True  # fail-open: unknown -> trust paste (old behaviour)
+        if w is None:
+            return False
+        try:
+            cls_name = w.winfo_class()
+        except Exception:
+            return True  # fail-open
+        return 'Entry' in cls_name or 'Text' in cls_name or 'Spinbox' in cls_name
 
     def _verify_paste_landed(self, text: str, before, caret_before) -> None:
         try:
@@ -6235,7 +6288,7 @@ class App:
 
             txt = ctk.CTkTextbox(
                 win, fg_color='#0e0e0e', text_color=TEXT_P,
-                font=(FONT_MONO, 11), border_color=BORDER, border_width=1,
+                font=(FONT_MONO, 15), border_color=BORDER, border_width=1,
                 wrap='word',
             )
             txt.pack(fill='both', expand=True, padx=14, pady=(0, 8))
@@ -9016,11 +9069,21 @@ def _find_other_hotkeys_pids() -> list[int]:
                 if name in FROZEN_NAMES:
                     candidates[proc.pid] = proc.info.get('ppid') or 0
             else:
-                # Source run: python interpreter running main.py inside Hotkeys dir
+                # Source run: python interpreter running main.py (or one of
+                # its detached-and-breakaway child scripts) inside Hotkeys
+                # dir. Whiteboard is spawned with CREATE_BREAKAWAY_FROM_JOB
+                # so it survives even if main.py crashes — great for crash
+                # recovery, but it also means a stray Whiteboard from a
+                # PREVIOUS launch is invisible here unless we explicitly
+                # look for it too. In frozen dist builds this isn't an
+                # issue: Whiteboard re-execs the same Hotkeys.exe, so the
+                # executable-name check above already covers it.
                 if name not in SOURCE_NAMES:
                     continue
                 cmdline = ' '.join(proc.info['cmdline'] or []).lower()
-                if 'main.py' in cmdline and 'hotkeys' in cmdline:
+                if 'hotkeys' not in cmdline:
+                    continue
+                if 'main.py' in cmdline or 'whiteboard.py' in cmdline:
                     candidates[proc.pid] = proc.info.get('ppid') or 0
         except Exception:
             pass
@@ -9086,13 +9149,41 @@ def _ensure_single_instance(_depth: int = 0) -> None:
         mutex = kernel32.CreateMutexW(None, True, MUTEX_NAME)
         err   = kernel32.GetLastError()
 
-        if err == 183:      # ERROR_ALREADY_EXISTS, another launch is starting
+        if err == 183:      # ERROR_ALREADY_EXISTS, another instance is running
             kernel32.CloseHandle(mutex)
             if _depth >= 3:
+                # Three attempts already killed the previous holder(s) and
+                # retried; if a fourth launch still can't get the mutex,
+                # something outside our control is holding it. Give up
+                # loudly rather than looping forever.
+                logger.error('Could not acquire startup mutex after 3 '
+                             'kill-and-retry attempts. Exiting.')
                 sys.exit(1)
-            time.sleep(4.0)
-            if _find_other_hotkeys_pids():
-                sys.exit(0)
+            # THIS launch is the one the user just asked for — it should
+            # win, not the older one. Ask the existing instance to quit
+            # gracefully, then hard-kill anything left (main.py AND any
+            # detached-breakaway children like whiteboard.py --prewarm,
+            # which survive a plain process-kill of their parent). Once
+            # the old holder's process exits, Windows auto-releases its
+            # mutex handle, so retrying CreateMutexW succeeds.
+            try:
+                c = socket.create_connection(('127.0.0.1', _SINGLETON_PORT),
+                                             timeout=1)
+                c.sendall(b'QUIT')
+                c.close()
+                time.sleep(2.5)
+            except Exception:
+                pass
+            for pid in _find_other_hotkeys_pids():
+                try:
+                    proc = psutil.Process(pid)
+                    for child in proc.children(recursive=True):
+                        try: child.kill()
+                        except Exception: pass
+                    proc.kill()
+                except Exception:
+                    pass
+            time.sleep(0.5)
             _ensure_single_instance(_depth + 1)
             return
 

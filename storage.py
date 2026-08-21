@@ -605,6 +605,28 @@ def load_config() -> dict:
                 merged['providers']['cerebras'] = _cb
         except Exception:
             pass
+        # ── Migration: retired Groq CHAT model (separate from vision_model
+        # below — this is providers.groq.model, used by Refine/Ask/Chains).
+        # Groq retires model IDs periodically; a saved config naming a dead
+        # one 404s on every refine call, forcing an immediate fall-through
+        # to Cerebras (and then local, if that's also unavailable) instead
+        # of ever reaching Groq at all. Verified live via refresh_models.py:
+        #   • llama-3.1-8b-instant   — retired
+        #   • llama-3.3-70b-versatile — retired (404 since ~2026-08)
+        _RETIRED_GROQ = {
+            'llama-3.1-8b-instant', 'llama-3.3-70b-versatile',
+        }
+        try:
+            _gqm = merged['providers'].get('groq', {})
+            if _gqm.get('model') in _RETIRED_GROQ:
+                _new = DEFAULT_CONFIG['providers']['groq']['model']
+                logger.info(
+                    f'Config migration: Groq model '
+                    f'{_gqm.get("model")!r} retired, upgrading to {_new!r}.')
+                _gqm['model'] = _new
+                merged['providers']['groq'] = _gqm
+        except Exception:
+            pass
         # ── Migration: vision-model rollback ────────────────────────────────
         # Groq periodically retires model IDs. Any saved config naming a
         # dead one → 404 the moment the user hits PrtSc translate. When

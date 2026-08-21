@@ -52,36 +52,45 @@ def _build_provider_locked():
         import engine  as hk_engine
         cfg = hk_storage.load_config()
 
-        # Chain: Cerebras -> Groq -> Local (Qwen GGUF).
-        # Rationale (re-verified 2026-07-18 via refresh_models.py):
-        #   • Cerebras gpt-oss-120b returns in ~600 ms, faster than
-        #     Groq's llama-3.3-70b at ~1.0 s. Free tier, no monthly cap.
-        #   • Earlier revisions bypassed Cerebras because the response
-        #     parser KeyError'd on reasoning-model bodies at max_tokens
-        #     =1024 — fixed in engine.py CerebrasProvider (bumped to
-        #     4096 + empty-content rotation).
-        #   • Groq stays as the second link so a Cerebras outage / rate
-        #     limit still gets an answer.
+        # Chain: Groq -> Cerebras -> Local (Qwen GGUF).
+        # Rationale (re-verified 2026-08-21 via live probe, not just
+        # refresh_models.py's /v1/models check — that endpoint lists
+        # Cerebras' models regardless of the key's billing status, so it
+        # doesn't catch this):
+        #   • Both bundled Cerebras keys now return 402 Payment Required
+        #     on every actual chat call — their free tier appears to
+        #     have fully sunset for these accounts, not a transient
+        #     rate-limit. Putting Cerebras first means EVERY Ask Docs
+        #     question wastes a guaranteed-to-fail round-trip before
+        #     reaching Groq.
+        #   • All 3 bundled Groq keys are fully healthy. Groq goes
+        #     first now; Cerebras stays in the chain as a low-cost
+        #     fallback attempt in case its billing status ever
+        #     resolves, but is no longer on the hot path.
         #   • Local Qwen kicks in only when both cloud providers are
         #     offline; not bundled in dev source, only in the release.
+        groq_keys = hk_engine._resolve_keys(cfg, 'groq')
+        groq_model = (cfg.get('providers', {}).get('groq', {})
+                      .get('model', hk_engine.GROQ_MODELS[0]))
+        groq = hk_engine.GroqProvider(api_keys=groq_keys, model=groq_model)
+
         cb_keys = hk_engine._resolve_keys(cfg, 'cerebras')
         cb_model = (cfg.get('providers', {}).get('cerebras', {})
                     .get('model', hk_engine.CEREBRAS_MODELS[0]))
         cerebras = (hk_engine.CerebrasProvider(api_keys=cb_keys, model=cb_model)
                     if cb_keys else None)
 
-        groq_keys = hk_engine._resolve_keys(cfg, 'groq')
-        groq_model = (cfg.get('providers', {}).get('groq', {})
-                      .get('model', hk_engine.GROQ_MODELS[0]))
-        groq = hk_engine.GroqProvider(api_keys=groq_keys, model=groq_model)
-
         local = (hk_engine.LocalProvider()
                  if hk_engine.local_provider_available() else None)
 
         # Build the chain right-to-left: innermost = last resort.
-        chain = groq if local is None else hk_engine.FallbackProvider(groq, local)
-        if cerebras is not None:
-            chain = hk_engine.FallbackProvider(cerebras, chain)
+        chain = cerebras if local is None else hk_engine.FallbackProvider(cerebras, local)
+        if chain is None:
+            chain = local
+        if chain is not None:
+            chain = hk_engine.FallbackProvider(groq, chain)
+        else:
+            chain = groq
         _provider = chain
         logger.info(f'Ask Docs LLM: chain ready ({_provider.name})')
     except Exception as e:

@@ -792,13 +792,13 @@ class AskDocsWindow(ctk.CTkToplevel):
         guide_text = src.get('guide') or ''
         guide_body = tk.Text(
             guide_card, wrap='word', bg=SURF3, fg=TEXT_P,
-            font=(FONT_BODY, 11), bd=0, highlightthickness=0,
+            font=(FONT_BODY, 14), bd=0, highlightthickness=0,
             padx=0, pady=0, cursor='arrow', height=4,
         )
         guide_body.pack(fill='x', padx=PAD_SM, pady=(0, PAD_SM))
         md_render.install_tags(
             guide_body,
-            body_font=(FONT_BODY, 11), mono_font=(FONT_MONO, 10),
+            body_font=(FONT_BODY, 14), mono_font=(FONT_MONO, 12),
             fg=TEXT_P, accent=ACCENT, accent_bg=USER_BUBBLE,
             code_bg=SURFACE, heading_font_family=FONT_FAMILY,
         )
@@ -816,13 +816,13 @@ class AskDocsWindow(ctk.CTkToplevel):
         body_card.pack(fill='both', expand=True)
         body_text = tk.Text(
             body_card, wrap='word', bg=SURFACE, fg=TEXT_P,
-            font=(FONT_BODY, 11), bd=0, highlightthickness=0,
+            font=(FONT_BODY, 14), bd=0, highlightthickness=0,
             padx=0, pady=0, cursor='arrow',
         )
         body_text.pack(fill='both', expand=True)
         md_render.install_tags(
             body_text,
-            body_font=(FONT_BODY, 11), mono_font=(FONT_MONO, 10),
+            body_font=(FONT_BODY, 14), mono_font=(FONT_MONO, 12),
             fg=TEXT_P, accent=ACCENT, accent_bg=USER_BUBBLE,
             code_bg=SURF2, heading_font_family=FONT_FAMILY,
         )
@@ -1195,7 +1195,7 @@ class AskDocsWindow(ctk.CTkToplevel):
         # assistant answers to fit the panel width.
         tw = tk.Text(
             text_col, wrap='word', bg=SURFACE, fg=TEXT_P,
-            font=(FONT_BODY, 12), bd=0, highlightthickness=0,
+            font=(FONT_BODY, 14), bd=0, highlightthickness=0,
             padx=0, pady=0, cursor='arrow',
             spacing1=0, spacing2=2, spacing3=2,
         )
@@ -1203,8 +1203,8 @@ class AskDocsWindow(ctk.CTkToplevel):
 
         md_render.install_tags(
             tw,
-            body_font=(FONT_BODY, 12),
-            mono_font=(FONT_MONO, 11),
+            body_font=(FONT_BODY, 14),
+            mono_font=(FONT_MONO, 12),
             fg=TEXT_P, accent=ACCENT, accent_bg=USER_BUBBLE,
             code_bg=SURF2, heading_font_family=FONT_FAMILY,
         )
