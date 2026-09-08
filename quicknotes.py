@@ -550,6 +550,16 @@ class QuickNotesWindow(ctk.CTkToplevel):
         self._notes_cache: list = []
         self._notes_dirty = True
 
+        # Autosave: periodic safety-net save-to-disk for whatever's
+        # open in the plain-text editor. Chat-kind notes already
+        # persist after every turn (_save_current_chat), but a plain
+        # note only ever reached disk on close (_save_and_close) —
+        # meaning any crash before that (a native-dialog access
+        # violation, a force-kill, a power loss) lost everything typed
+        # since the note was last closed, with zero trace anywhere.
+        self._autosave_job = None
+        self._autosave_last_snapshot = None
+
         # Theme, apply saved palette to module globals before _build()
         self._theme = initial_theme if initial_theme in ('light', 'dark') else 'light'
         _palette = _LIGHT_PALETTE if self._theme == 'light' else _DARK_PALETTE
@@ -589,6 +599,7 @@ class QuickNotesWindow(ctk.CTkToplevel):
 
         self._build()
         self._bind_keys()
+        self._autosave_job = self.after(8000, self._autosave_tick)
 
         # Centering and clamping use the Windows WORK AREA (screen minus
         # taskbar), same helper the Whiteboard uses. The previous code
@@ -1380,6 +1391,10 @@ class QuickNotesWindow(ctk.CTkToplevel):
         self._editing_nid = nid
         self._pinned      = bool(note.get('pinned', False))
         self._color       = None
+        # New editor context — force the next autosave tick to compare
+        # against this note's actual content instead of whatever the
+        # previously-open note last looked like.
+        self._autosave_last_snapshot = None
 
         # ── Chat-kind note: skip text-note load path entirely ────────────────
         # This is a fully separate code path from the unified text editor;
@@ -3637,7 +3652,80 @@ class QuickNotesWindow(ctk.CTkToplevel):
             return None
         return {'text': text, 'items': items, 'voice': voice}
 
+    def _autosave_tick(self) -> None:
+        """Periodic safety-net save for whatever's currently open in the
+        plain-text editor (see comment on self._autosave_job in
+        __init__ for why this exists). Reschedules itself first so a
+        raised exception below can never kill the loop for the rest
+        of the window's life."""
+        self._autosave_job = self.after(8000, self._autosave_tick)
+        if self._is_chat_mode() or self._rec_state == 'recording':
+            return
+        try:
+            data = self._get_note_data()
+        except Exception:
+            return
+        if not data:
+            return
+        # Cheap dirty-check so we're not hitting disk every 8s when
+        # the user's just reading, not typing.
+        snapshot = (data['text'],
+                    tuple((it.get('text'), it.get('checked'))
+                          for it in data['items']),
+                    data['voice'], self._pinned)
+        if snapshot == self._autosave_last_snapshot:
+            return
+        try:
+            notes = load_notes()
+            if self._editing_nid:
+                found = False
+                for n in notes:
+                    if n.get('id') == self._editing_nid:
+                        n['text']   = data['text']
+                        n['items']  = data['items']
+                        n['voice']  = data['voice']
+                        n['pinned'] = self._pinned
+                        found = True
+                        break
+                if not found:
+                    # Same stale-reference guard as _save_and_close:
+                    # don't write a `notes` list that doesn't actually
+                    # contain the note we think we're editing.
+                    return
+            else:
+                # Brand-new, never-saved draft. First autosave tick
+                # with real content in it creates the note (mirrors
+                # the "new note" branch of _save_and_close) so it
+                # survives from here on, same as chat notes already do.
+                border_hex = None
+                for chip_clr, bdr_clr, _ in NOTE_COLORS:
+                    if self._color == chip_clr:
+                        border_hex = bdr_clr
+                        break
+                note = {
+                    'id':         str(uuid.uuid4()),
+                    'text':       data['text'],
+                    'items':      data['items'],
+                    'voice':      data['voice'],
+                    'color':      border_hex,
+                    'pinned':     self._pinned,
+                    'created_at': datetime.now().isoformat(timespec='seconds'),
+                }
+                notes.append(note)
+                self._editing_nid = note['id']
+            self._invalidate_notes_cache()
+            save_notes(notes)
+            self._autosave_last_snapshot = snapshot
+        except Exception:
+            logger.exception('Quick Notes: autosave failed')
+
     def _save_and_close(self, _=None) -> None:
+        try:
+            if self._autosave_job is not None:
+                self.after_cancel(self._autosave_job)
+                self._autosave_job = None
+        except Exception:
+            pass
         if self._rec_state == 'recording':
             self._stop_rec()
             self.after(320, self._save_and_close)
@@ -3652,19 +3740,38 @@ class QuickNotesWindow(ctk.CTkToplevel):
             if self._editing_nid:
                 # Update existing note
                 notes = load_notes()
+                found = False
                 for n in notes:
                     if n.get('id') == self._editing_nid:
                         n['text']   = data['text']
                         n['items']  = data['items']
                         n['voice']  = data['voice']
                         n['pinned'] = self._pinned
+                        found = True
                         break
-                self._invalidate_notes_cache()
-                try:
-                    save_notes(notes)
-                    logger.info('Quick note updated')
-                except Exception:
-                    logger.exception('Quick note update failed to save')
+                if not found:
+                    # The note this editor was pointed at no longer
+                    # exists on disk (trashed elsewhere, or lost to an
+                    # earlier corruption). Writing `notes` here would
+                    # be a silent no-op at best; the real risk is if
+                    # `notes` were ever shorter than the on-disk list
+                    # (e.g. a stale in-memory copy), this would have
+                    # clobbered it. Skip the save but still fall
+                    # through to close normally below — an early
+                    # return here would skip destroy() and orphan the
+                    # window (the exact bug this pattern caused once
+                    # already, see main.py's toggle/restore path).
+                    logger.warning(
+                        f'Quick Notes: editing_nid {self._editing_nid!r} '
+                        f'not found on save; discarding to avoid '
+                        f'overwriting notes.json with a stale list')
+                else:
+                    self._invalidate_notes_cache()
+                    try:
+                        save_notes(notes)
+                        logger.info('Quick note updated')
+                    except Exception:
+                        logger.exception('Quick note update failed to save')
             else:
                 border_hex = None
                 for chip_clr, bdr_clr, _ in NOTE_COLORS:

@@ -175,14 +175,35 @@ ctk.set_appearance_mode('dark')
 ctk.set_default_color_theme('dark-blue')
 
 # ── Logging ───────────────────────────────────────────────────────────────────
-
+#
+# Every logger in the app funnels up to the root logger's one handler,
+# so every logging call from every thread shares that handler's single
+# lock. If the actual file write ever blocks (a rollover hitting a
+# transient AV lock on app.log, a disk hiccup — the same general class
+# of issue already found and fixed for notes.json's atomic write this
+# session), the thread that made that call sits stuck holding the
+# handler's lock, and every OTHER thread's next logging call blocks
+# right behind it — main GUI thread included. That's disproportionate:
+# a slow disk should cost a delayed log line, not a hung app.
+#
+# QueueHandler/QueueListener decouples the two: application threads
+# only ever do a fast in-memory queue.put() (2026-09-03 incident:
+# traced a real multi-minute Home-key hang to exactly this handler
+# contention risk). The actual, possibly-slow file write happens on
+# one dedicated listener thread — if THAT blocks, only log delivery
+# lags; nothing the user touches waits on it.
 os.makedirs(appdata_dir(), exist_ok=True)
-_log_handler = logging.handlers.RotatingFileHandler(
+_log_file_handler = logging.handlers.RotatingFileHandler(
     log_path(), maxBytes=1_000_000, backupCount=3, encoding='utf-8',
 )
-_log_handler.setFormatter(logging.Formatter('%(asctime)s  %(levelname)-8s  %(name)s: %(message)s'))
+_log_file_handler.setFormatter(logging.Formatter('%(asctime)s  %(levelname)-8s  %(name)s: %(message)s'))
+_log_queue = queue.Queue(-1)   # unbounded — emit() must never block on a full queue
+_log_handler = logging.handlers.QueueHandler(_log_queue)
 logging.getLogger().addHandler(_log_handler)
 logging.getLogger().setLevel(logging.INFO)
+_log_listener = logging.handlers.QueueListener(
+    _log_queue, _log_file_handler, respect_handler_level=True)
+_log_listener.start()   # spins up its own internal daemon thread
 logger = logging.getLogger('main')
 
 VERSION = '1.0.0'
@@ -921,6 +942,26 @@ class App:
         threading.Thread(target=self._audio.prewarm, daemon=True,
                          name='mic-prewarm').start()
         threading.Thread(target=self._watch_singleton_socket, daemon=True).start()
+
+        # Mainloop-liveness watchdog. _poll() below runs every 30ms for
+        # the entire life of the process once the Tk mainloop starts —
+        # it's the single most reliable canary for "is the main thread
+        # actually pumping events." If it stops ticking (a deadlock
+        # somewhere on the main thread — the exact failure mode found
+        # 2026-09-03: a relaunch left a fully alive-looking process
+        # where every background thread, including the IPC listener,
+        # kept working, but the main thread never dispatched a single
+        # queued command again — Home/Shift+F7 and everything else
+        # just silently did nothing forever), nothing above this
+        # thread can ever detect or recover from it on its own.
+        # Self-terminating is the one thing guaranteed to work
+        # regardless of WHAT blocked the main thread: the next launch
+        # (manual, or the "newest instance wins" mutex retry, or the
+        # scheduled task's own periodic health check) then gets a
+        # clean process to start fresh in.
+        self._last_poll_ts = time.monotonic()
+        threading.Thread(target=self._mainloop_watchdog, daemon=True,
+                         name='mainloop-watchdog').start()
 
         self.root.after(30, self._poll)
         # Pre-warm Quick Notes shortly after boot so the first Shift+F7
@@ -3093,14 +3134,14 @@ class App:
                     # foreground, no respawn needed.
                     if not win32gui.IsWindowVisible(h):
                         win32gui.ShowWindow(h, win32con.SW_SHOW)
-                        self._force_foreground(h)
+                        self._force_foreground_async(h)
                     elif win32gui.IsIconic(h):
                         win32gui.ShowWindow(h, win32con.SW_RESTORE)
-                        self._force_foreground(h)
+                        self._force_foreground_async(h)
                     elif win32gui.GetForegroundWindow() == h:
                         win32gui.ShowWindow(h, win32con.SW_MINIMIZE)
                     else:
-                        self._force_foreground(h)
+                        self._force_foreground_async(h)
                     return
             except Exception as e:
                 logger.warning(f'whiteboard toggle failed, will respawn: {e}')
@@ -3693,6 +3734,24 @@ class App:
                 u.AttachThreadInput(cur, fg_t, False)
         except Exception as e:
             logger.warning(f'_force_foreground: {e}')
+
+    @staticmethod
+    def _force_foreground_async(hwnd) -> None:
+        """_force_foreground, off the main thread. Its AttachThreadInput
+        call can BLOCK INDEFINITELY if the target window's owning
+        thread isn't currently pumping messages — a hung/slow external
+        app, a Chromium/WebView2 hiccup, anything. Calling it inline on
+        the main GUI thread means that stall becomes OUR stall: _poll()
+        stops dispatching, hotkeys go dead, and if it lasts long
+        enough Windows force-closes the whole app as unresponsive
+        ("Cross-process" hang, waiting on the other window's process —
+        confirmed root cause of a real incident, 2026-09-08, via the
+        whiteboard-restore path below). Use this wrapper at every
+        _force_foreground call site that targets a window we don't
+        fully control (another app, a WebView2 subprocess) instead of
+        calling it directly."""
+        threading.Thread(target=App._force_foreground, args=(hwnd,),
+                         daemon=True, name='force-fg').start()
 
     # ── Chain hotkey ─────────────────────────────────────────────────────────
 
@@ -6779,12 +6838,70 @@ class App:
             # Same hotkey repeated - user is impatient, don't punish them.
         return False
 
+    def _mainloop_watchdog(self) -> None:
+        """Background thread (NOT scheduled via .after — that's exactly
+        what wouldn't run if the thing we're checking for is stuck):
+        force-exits the process if _poll() stops ticking, meaning the
+        Tk main thread is deadlocked. See the comment where this
+        thread is started in __init__ for the incident that motivated
+        this.
+
+        A 90s startup grace period covers the legitimately slow part
+        of boot (model loads etc.); after that, _poll() should never
+        go quiet for more than a few seconds under any normal
+        circumstance since it's a trivial 30ms-interval queue drain.
+        45s of total silence is a wide margin past that.
+        """
+        start = time.monotonic()
+        while True:
+            time.sleep(15)
+            now = time.monotonic()
+            if now - start < 90:
+                continue   # still in the startup grace period
+            stale_for = now - self._last_poll_ts
+            if stale_for > 45:
+                # Deliberately NOT using logger.* here. Python's logging
+                # module serialises all handler writes through one
+                # process-global lock (logging._lock); if the deadlocked
+                # main thread happens to be stuck mid-emit (e.g. a file
+                # write blocked by a transient AV lock on app.log — the
+                # exact class of issue fixed elsewhere this session for
+                # notes.json), any logger call from THIS thread blocks
+                # on that same lock forever too, and os._exit() below
+                # would simply never be reached.
+                #
+                # Exiting is the actual fix; the trace is best-effort
+                # and must never be allowed to delay it — even a plain
+                # file write could itself stall on the same underlying
+                # disk issue. Fire it on its own thread and don't wait:
+                # os._exit() kills the whole process (all threads,
+                # instantly) the moment it runs, so a stuck diagnostic
+                # write just dies with it instead of blocking recovery.
+                def _best_effort_trace() -> None:
+                    try:
+                        from storage import appdata_dir
+                        p = os.path.join(appdata_dir(), 'watchdog.log')
+                        with open(p, 'a', encoding='utf-8') as f:
+                            f.write(
+                                f'{datetime.datetime.now().isoformat(timespec="seconds")}  '
+                                f'Mainloop watchdog: _poll() has not run in '
+                                f'{stale_for:.0f}s — main thread deadlocked, '
+                                f'force-exiting.\n')
+                    except Exception:
+                        pass
+                try:
+                    threading.Thread(target=_best_effort_trace, daemon=True).start()
+                except Exception:
+                    pass
+                os._exit(1)
+
     def _poll(self) -> None:
         # Reschedule FIRST so a handler that calls wait_window() (which creates
         # a nested Tk event loop) doesn't prevent the next poll from running.
         # Without this, any modal dialog opened from a handler would stop all
         # queue processing, including tray "Reload hotkeys", until it closed.
         self.root.after(30, self._poll)
+        self._last_poll_ts = time.monotonic()   # mainloop-watchdog canary
         try:
             wb_fg = self._is_whiteboard_foreground()
             while True:
@@ -7284,18 +7401,23 @@ class App:
             pass
 
         # ── app.log, truncate so the user really gets a clean slate.
-        # We rotate handlers off the file first so the active RotatingFileHandler
-        # isn't holding a write lock when we truncate (Windows would otherwise
-        # raise PermissionError). The handler reopens lazily on the next log
-        # call, so no logger setup is needed after.
+        # Logging now goes through a QueueHandler -> QueueListener (see
+        # module-level setup near the top of this file) so the actual
+        # RotatingFileHandler isn't reachable via logger.handlers on any
+        # named logger any more (it lives on the listener, not attached
+        # to a logger at all). Stop the listener to close its handle
+        # before truncating (Windows would otherwise raise
+        # PermissionError on a file still open for writing), then build
+        # a fresh handler + listener so logging keeps working after —
+        # unlike the old bare handler, QueueListener.stop() doesn't
+        # auto-reopen on the next log call.
         try:
             lp = log_path()
-            for h in list(logger.handlers):
-                if hasattr(h, 'baseFilename') and os.path.abspath(h.baseFilename) == os.path.abspath(lp):
-                    try:
-                        h.close()
-                    except Exception:
-                        pass
+            global _log_file_handler, _log_listener
+            try:
+                _log_listener.stop()
+            except Exception:
+                pass
             try:
                 with open(lp, 'w', encoding='utf-8'):
                     pass   # truncate
@@ -7307,9 +7429,25 @@ class App:
                             os.remove(side)
                     except Exception:
                         pass
-                logger.info('Restore: app.log truncated.')
+                _restore_log_ok = True
             except Exception as e:
-                logger.warning(f'Restore: app.log truncate failed: {e}')
+                _restore_log_err = e
+                _restore_log_ok = False
+            finally:
+                try:
+                    _log_file_handler = logging.handlers.RotatingFileHandler(
+                        lp, maxBytes=1_000_000, backupCount=3, encoding='utf-8')
+                    _log_file_handler.setFormatter(logging.Formatter(
+                        '%(asctime)s  %(levelname)-8s  %(name)s: %(message)s'))
+                    _log_listener = logging.handlers.QueueListener(
+                        _log_queue, _log_file_handler, respect_handler_level=True)
+                    _log_listener.start()
+                except Exception:
+                    pass
+            if _restore_log_ok:
+                logger.info('Restore: app.log truncated.')
+            else:
+                logger.warning(f'Restore: app.log truncate failed: {_restore_log_err}')
         except Exception:
             pass
 
@@ -7644,15 +7782,14 @@ class App:
             # see "Typed ✓" but no text appears because focus shifted
             # during recording (notification toast, accidental click,
             # the source window losing keyboard focus to the recording
-            # pill on some setups, etc.). The Win32 SetForegroundWindow
-            # workaround in _force_foreground bypasses Windows' anti-
-            # focus-stealing rules using AttachThreadInput.
+            # pill on some setups, etc.). `hwnd` is whatever arbitrary
+            # app the user was typing into, so _force_foreground_async
+            # (not the inline version — see its docstring) matters here
+            # especially: the paste itself already runs 160ms later via
+            # .after(), so restoring focus off-thread doesn't delay it.
             hwnd = getattr(self, '_whisper_target_hwnd', None)
             if hwnd:
-                try:
-                    self._force_foreground(hwnd)
-                except Exception as e:
-                    logger.warning(f'Could not restore focus before paste: {e}')
+                self._force_foreground_async(hwnd)
             # The user's stop press (Ctrl+Enter) passes through to the
             # focused window because our hotkey is suppress=False (the
             # keyboard library's modifier-state machine locks up on
@@ -8444,15 +8581,22 @@ class App:
         def _handle_conn(conn):
             # Per-connection handler. Spun up on its own thread so a
             # slow/silent client can't block any other IPC caller. The
-            # accept loop now spends ~0 ms on each connection.
+            # accept loop now spends ~0 ms on each connection. Wrapped
+            # broadly so an unexpected exception here (a bare thread
+            # target — Python's default is to print to stderr, which a
+            # windowless pythonw.exe doesn't have, so it would
+            # otherwise vanish with no trace at all) still leaves a
+            # line in app.log instead of silently dropping the command.
             try:
                 conn.settimeout(2.0)
                 try:
                     raw = conn.recv(256)
-                except Exception:
+                except Exception as e:
+                    logger.warning(f'IPC: recv failed ({type(e).__name__}: {e})')
                     raw = b''
                 cmd = raw.decode('utf-8', errors='replace').strip()[:64]
                 if not cmd:
+                    logger.warning('IPC: empty payload after recv; closing')
                     return
                 logger.info(f'IPC: received {cmd!r}')
                 if cmd in _VALID:
@@ -8463,6 +8607,8 @@ class App:
                     logger.info(f'IPC: dispatched {cmd!r}')
                 else:
                     logger.warning(f'IPC: rejected unknown cmd {cmd!r}')
+            except Exception:
+                logger.exception('IPC: unhandled exception handling connection')
             finally:
                 try: conn.close()
                 except Exception: pass
