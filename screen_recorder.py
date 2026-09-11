@@ -54,6 +54,28 @@ RECORDINGS_DIR_NAME = 'recordings'   # sub-folder of appdata_dir()
 
 # ── Screen / window helpers ───────────────────────────────────────────────────
 
+def _get_window_text_safe(hwnd, timeout_ms: int = 300) -> str:
+    """GetWindowText, but bounded. GetWindowText internally sends
+    WM_GETTEXT to the target window, which blocks if that window's
+    owning thread (a DIFFERENT process — this walks every visible
+    window on the desktop) isn't servicing messages at that instant.
+    Same root cause, same fix shape as a confirmed real cross-process
+    app hang this session (2026-09-08, recurred 2026-09-11) — this
+    call site runs across every window whenever the user opens the
+    window picker, each one a chance to hang on someone else's stuck
+    app."""
+    length = win32gui.SendMessageTimeout(
+        hwnd, win32con.WM_GETTEXTLENGTH, 0, 0,
+        win32con.SMTO_ABORTIFHUNG, timeout_ms)[1]
+    if length <= 0:
+        return ''
+    buf = ctypes.create_unicode_buffer(length + 1)
+    ok = win32gui.SendMessageTimeout(
+        hwnd, win32con.WM_GETTEXT, length + 1, buf,
+        win32con.SMTO_ABORTIFHUNG, timeout_ms)[0]
+    return buf.value if ok else ''
+
+
 def list_windows() -> list[tuple[int, str]]:
     """Return [(hwnd, title), …] for all visible, non-trivial windows."""
     if sys.platform == 'win32':
@@ -64,7 +86,7 @@ def list_windows() -> list[tuple[int, str]]:
                 return
             if not win32gui.IsWindowEnabled(hwnd):
                 return
-            title = win32gui.GetWindowText(hwnd)
+            title = _get_window_text_safe(hwnd)
             if not title or len(title) < 2:
                 return
             cls = win32gui.GetClassName(hwnd)

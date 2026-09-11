@@ -623,17 +623,14 @@ def main():
                 _u = _c.windll.user32
                 _x, _y, _w, _h = _cw(1216, 796)
                 WB_TITLE = 'Whiteboard (Shift+F8)'
-                hwnd_found = [0]
-                EnumProc = _c.WINFUNCTYPE(_wt.BOOL, _wt.HWND, _wt.LPARAM)
-                def _cb(h, _):
-                    buf = _c.create_unicode_buffer(64)
-                    _u.GetWindowTextW(h, buf, 64)
-                    if buf.value == WB_TITLE:
-                        hwnd_found[0] = h
-                        return False
-                    return True
-                _u.EnumWindows(EnumProc(_cb), 0)
-                hwnd = hwnd_found[0]
+                # FindWindowW matches the window manager's own cached
+                # title directly, unlike the EnumWindows+GetWindowTextW
+                # walk this replaced, which sent a blocking WM_GETTEXT
+                # to every window on the desktop (any one of them
+                # belonging to an unresponsive app would hang this
+                # subprocess — same class of cross-process hang
+                # confirmed and fixed elsewhere this session).
+                hwnd = _u.FindWindowW(None, WB_TITLE)
                 if hwnd:
                     SWP_NOSIZE = 0x0001; SWP_NOZORDER = 0x0004
                     SWP_NOACTIVATE = 0x0010

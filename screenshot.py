@@ -48,9 +48,37 @@ _user32.CallNextHookEx.restype = _LRESULT
 # passes the result into other Win32 calls — a truncated HWND there
 # yields garbage process names and titles for the rare hi-bit window.
 _user32.GetForegroundWindow.restype       = ctypes.c_void_p
-_user32.GetWindowTextLengthW.argtypes     = (ctypes.c_void_p,)
-_user32.GetWindowTextW.argtypes           = (ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int)
 _user32.GetWindowThreadProcessId.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.wintypes.DWORD))
+
+# SendMessageTimeoutW: GetWindowText/GetWindowTextLength internally
+# send WM_GETTEXT(LENGTH) to the target window, which BLOCKS if that
+# window's owning thread isn't servicing messages right then. This
+# fires on every single PrtSc press against whatever app the user
+# happens to be using at that instant — the highest-frequency
+# instance of a class of bug confirmed to hang the whole app this
+# session (2026-09-08, recurred 2026-09-11, via the equivalent
+# pattern in main.py/audio_editor.py). Bounded send instead.
+_user32.SendMessageTimeoutW.argtypes = [
+    ctypes.c_void_p, ctypes.c_uint, ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM,
+    ctypes.c_uint, ctypes.c_uint, ctypes.POINTER(ctypes.wintypes.DWORD)]
+_user32.SendMessageTimeoutW.restype = ctypes.c_void_p
+_SMTO_ABORTIFHUNG = 0x0002
+
+
+def _get_window_text_safe(hwnd, timeout_ms: int = 300) -> str:
+    WM_GETTEXTLENGTH, WM_GETTEXT = 0x000E, 0x000D
+    result = ctypes.wintypes.DWORD(0)
+    ok = _user32.SendMessageTimeoutW(
+        hwnd, WM_GETTEXTLENGTH, 0, 0,
+        _SMTO_ABORTIFHUNG, timeout_ms, ctypes.byref(result))
+    length = result.value
+    if not ok or length <= 0:
+        return ''
+    buf = ctypes.create_unicode_buffer(length + 1)
+    ok = _user32.SendMessageTimeoutW(
+        hwnd, WM_GETTEXT, length + 1, ctypes.cast(buf, ctypes.wintypes.LPARAM),
+        _SMTO_ABORTIFHUNG, timeout_ms, ctypes.byref(result))
+    return buf.value if ok else ''
 ctypes.windll.kernel32.OpenProcess.restype  = ctypes.c_void_p
 ctypes.windll.kernel32.OpenProcess.argtypes = (ctypes.wintypes.DWORD, ctypes.wintypes.BOOL, ctypes.wintypes.DWORD)
 ctypes.windll.kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
@@ -163,10 +191,7 @@ def _get_foreground_window_info() -> str:
             return 'foreground=none'
         # Window title
         try:
-            length = _user32.GetWindowTextLengthW(hwnd)
-            buf = ctypes.create_unicode_buffer(length + 1)
-            _user32.GetWindowTextW(hwnd, buf, length + 1)
-            title = buf.value
+            title = _get_window_text_safe(hwnd)
         except Exception:
             title = '?'
         # Owning PID

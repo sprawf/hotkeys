@@ -316,6 +316,40 @@ if sys.platform == 'win32':
     _user32.SetWindowPos.restype  = wintypes.BOOL
     _kernel32.GetCurrentThreadId.restype = wintypes.DWORD
 
+    # SendMessageTimeoutW: same as SendMessageW but bounded. A plain
+    # SendMessageW to a window owned by another process blocks until
+    # THAT process's thread processes it — if Tenacity is ever busy
+    # (rendering, exporting, a heavy edit) at the exact moment the
+    # title-keeper's 250ms poll fires WM_SETICON/WM_SETTEXT/BM_CLICK
+    # at it, the poll thread hangs for as long as Tenacity does. Same
+    # root cause, same fix shape as the AttachThreadInput incident
+    # this session (2026-09-08, recurred 2026-09-11) — SMTO_ABORTIFHUNG
+    # returns immediately if Windows already considers the target
+    # hung, and the explicit timeout is a hard backstop either way.
+    SMTO_ABORTIFHUNG = 0x0002
+    _user32.SendMessageTimeoutW.argtypes = [
+        wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+        wintypes.UINT, wintypes.UINT, ctypes.POINTER(wintypes.DWORD)]
+    _user32.SendMessageTimeoutW.restype = ctypes.c_void_p
+
+    def _send_message_timeout(hwnd, msg, wparam, lparam, timeout_ms=300) -> bool:
+        """SendMessageW that can never block longer than timeout_ms.
+        Returns whether the target responded within that window."""
+        result = wintypes.DWORD(0)
+        ret = _user32.SendMessageTimeoutW(
+            hwnd, msg, wparam, lparam,
+            SMTO_ABORTIFHUNG, timeout_ms, ctypes.byref(result))
+        return bool(ret)
+
+    def _set_window_text_timeout(hwnd, text, timeout_ms=300) -> bool:
+        """SetWindowTextW that can never block longer than timeout_ms.
+        SetWindowTextW is itself a WM_SETTEXT send under the hood for
+        a window we don't own, so it carries the exact same risk."""
+        WM_SETTEXT = 0x000C
+        buf = ctypes.create_unicode_buffer(text)
+        return _send_message_timeout(hwnd, WM_SETTEXT, 0,
+                                     ctypes.cast(buf, wintypes.LPARAM), timeout_ms)
+
     # Same protection for the HWND/HMENU-returning Win32 calls in the
     # rebrand walker. Without explicit restypes ctypes defaults to c_int
     # which silently truncates handle values on 64-bit Windows. The
@@ -398,8 +432,8 @@ def _apply_brand_icon(hwnd: int) -> None:
     if not hicon:
         return
     try:
-        _user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, hicon)
-        _user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG,   hicon)
+        _send_message_timeout(hwnd, WM_SETICON, ICON_SMALL, hicon)
+        _send_message_timeout(hwnd, WM_SETICON, ICON_BIG,   hicon)
     except Exception:
         pass
     try:
@@ -471,7 +505,7 @@ def _find_main_hwnd_by_pid(pid: int, timeout_s: float = _HWND_WAIT_S) -> Optiona
         for hwnd, title in (visible_candidates + invisible_candidates):
             if 'Tenacity' in title or 'Audacity' in title:
                 try:
-                    _user32.SetWindowTextW(hwnd, DISPLAY_TITLE)
+                    _set_window_text_timeout(hwnd, DISPLAY_TITLE)
                 except Exception:
                     pass
             _apply_brand_icon(hwnd)
@@ -500,7 +534,7 @@ def _set_window_title(hwnd: int, new_title: str) -> bool:
     if sys.platform != 'win32' or not hwnd:
         return False
     try:
-        return bool(_user32.SetWindowTextW(hwnd, new_title))
+        return _set_window_text_timeout(hwnd, new_title)
     except Exception:
         return False
 
@@ -517,13 +551,29 @@ def _rebrand_text(s: str) -> str:
     return out
 
 
-def _get_window_text(hwnd: int) -> str:
-    length = _user32.GetWindowTextLengthW(hwnd)
-    if length <= 0:
+def _get_window_text(hwnd: int, timeout_ms: int = 300) -> str:
+    """GetWindowTextW-equivalent, bounded. GetWindowTextLengthW and
+    GetWindowTextW both internally send WM_GETTEXTLENGTH/WM_GETTEXT to
+    a window we don't own, which blocks exactly like the WM_SETTEXT
+    send in _set_window_text_timeout if that window's thread doesn't
+    service it. Called on every window and every child on every 250ms
+    poll — likely the single highest-frequency blocking-capable call
+    in this whole rebrand pipeline, so it gets the same bounded-send
+    treatment as the rest."""
+    WM_GETTEXTLENGTH = 0x000E
+    WM_GETTEXT = 0x000D
+    result = wintypes.DWORD(0)
+    ok = _user32.SendMessageTimeoutW(
+        hwnd, WM_GETTEXTLENGTH, 0, 0,
+        SMTO_ABORTIFHUNG, timeout_ms, ctypes.byref(result))
+    length = result.value
+    if not ok or length <= 0:
         return ''
     buf = ctypes.create_unicode_buffer(length + 1)
-    _user32.GetWindowTextW(hwnd, buf, length + 1)
-    return buf.value
+    ok = _user32.SendMessageTimeoutW(
+        hwnd, WM_GETTEXT, length + 1, ctypes.cast(buf, wintypes.LPARAM),
+        SMTO_ABORTIFHUNG, timeout_ms, ctypes.byref(result))
+    return buf.value if ok else ''
 
 
 if sys.platform == 'win32':
@@ -668,7 +718,7 @@ def _rebrand_window_and_children(hwnd: int) -> None:
         cur = _get_window_text(hwnd)
         new = _rebrand_text(cur)
         if new != cur:
-            _user32.SetWindowTextW(hwnd, new)
+            _set_window_text_timeout(hwnd, new)
 
         # Menu bar (and every submenu) is outside the HWND tree.
         try:
@@ -686,7 +736,7 @@ def _rebrand_window_and_children(hwnd: int) -> None:
                 c_cur = _get_window_text(child_hwnd)
                 c_new = _rebrand_text(c_cur)
                 if c_new != c_cur:
-                    _user32.SetWindowTextW(child_hwnd, c_new)
+                    _set_window_text_timeout(child_hwnd, c_new)
                 # Hide rules apply ONLY to direct children of the top-
                 # level frame, not deeper descendants. Tenacity nests a
                 # ToolDock inside the Top Panel that holds Transport +
@@ -763,9 +813,9 @@ def _auto_dismiss_warning_dialog(dialog_hwnd: int) -> bool:
             return False
         # BM_CLICK = 0x00F5, simulates a real mouse click that fires
         # the button's WM_COMMAND and writes the cfg suppression.
-        _user32.SendMessageW(ck.value, 0x00F5, 0, 0)
+        _send_message_timeout(ck.value, 0x00F5, 0, 0)
         time.sleep(0.05)
-        _user32.SendMessageW(ok.value, 0x00F5, 0, 0)
+        _send_message_timeout(ok.value, 0x00F5, 0, 0)
         logger.info('audio editor: auto-dismissed warning dialog')
         return True
     except Exception as e:
@@ -868,10 +918,7 @@ def _rebrand_all_owned_windows(pid: int) -> None:
                 cls_name = ''
             if cls_name in ('#32768', 'tooltips_class32'):
                 continue
-            try:
-                _force_dialog_to_front(h)
-            except Exception:
-                pass
+            _force_dialog_to_front_async(h)
 
 
 def _force_dialog_to_front(hwnd: int) -> None:
@@ -902,6 +949,37 @@ def _force_dialog_to_front(hwnd: int) -> None:
         logger.info(f'audio editor: forced hidden dialog hwnd=0x{hwnd:x} to front')
     except Exception:
         pass
+
+
+# hwnds with a force-to-front already in flight, so the 250ms title-
+# keeper poll doesn't stack a new background thread on every tick
+# while a dialog stays orphaned across several polls.
+_force_front_in_flight: set[int] = set()
+
+
+def _force_dialog_to_front_async(hwnd: int) -> None:
+    """_force_dialog_to_front, off the title-keeper thread.
+
+    AttachThreadInput can BLOCK INDEFINITELY if the current foreground
+    window's owning thread isn't pumping messages — not a Hotkeys
+    window necessarily, whatever the user happens to have focused
+    (another app, or one of Hotkeys' own subprocess windows like
+    Whiteboard). Calling it inline on the title-keeper thread means
+    that stall stops the title-keeper loop cold; Windows can then
+    flag the whole process as hung waiting cross-process on whatever
+    it was attached to — confirmed root cause of a real incident
+    (2026-09-08, recurred 2026-09-11: identical WER fault bucket both
+    times) via the equivalent main.py code path, which already got
+    this same fix — this call site was the one still missing it."""
+    if hwnd in _force_front_in_flight:
+        return
+    _force_front_in_flight.add(hwnd)
+    def _run():
+        try:
+            _force_dialog_to_front(hwnd)
+        finally:
+            _force_front_in_flight.discard(hwnd)
+    threading.Thread(target=_run, daemon=True, name='ae-force-fg').start()
 
 
 def _is_window(hwnd: int) -> bool:

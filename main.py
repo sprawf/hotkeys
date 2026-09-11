@@ -1843,10 +1843,9 @@ class App:
         if sys.platform == 'win32':
             try:
                 import win32gui, win32con
-                def _wb_cb(h, _):
-                    if win32gui.GetWindowText(h) == 'Whiteboard (Shift+F8)':
-                        win32gui.PostMessage(h, win32con.WM_CLOSE, 0, 0)
-                win32gui.EnumWindows(_wb_cb, None)
+                _wb_hwnd_close = win32gui.FindWindow(None, 'Whiteboard (Shift+F8)')
+                if _wb_hwnd_close:
+                    win32gui.PostMessage(_wb_hwnd_close, win32con.WM_CLOSE, 0, 0)
             except Exception as e:
                 logger.warning(f'Reload: whiteboard subprocess close failed: {e}')
 
@@ -3114,15 +3113,16 @@ class App:
         if sys.platform == 'win32':
             try:
                 import win32gui, win32con
-                found = []
-                # Exact prefix uniquely identifies our pywebview window,
-                # avoids matching unrelated Chrome tabs etc.
+                # FindWindowW matches against the window manager's own
+                # cached title, not by sending WM_GETTEXT to the target
+                # process — the EnumWindows+GetWindowText pattern this
+                # replaced blocks indefinitely if Whiteboard's WebView2
+                # process isn't servicing messages at that instant
+                # (confirmed root cause of a real cross-process app
+                # hang this session, 2026-09-08, recurred 2026-09-11).
                 WB_TITLE = 'Whiteboard (Shift+F8)'
-                def _cb(h, _):
-                    if not win32gui.IsWindow(h): return
-                    if win32gui.GetWindowText(h) == WB_TITLE:
-                        found.append(h)
-                win32gui.EnumWindows(_cb, None)
+                _wb_hwnd = win32gui.FindWindow(None, WB_TITLE)
+                found = [_wb_hwnd] if _wb_hwnd else []
                 if found:
                     h = found[0]
                     # Already alive → prewarm is a no-op.
@@ -3201,14 +3201,9 @@ class App:
                     try:
                         import win32gui as _wg
                         WB_TITLE = 'Whiteboard (Shift+F8)'
-                        found2 = []
-                        def _cb2(h, _):
-                            if not _wg.IsWindow(h): return
-                            if _wg.GetWindowText(h) == WB_TITLE:
-                                found2.append(h)
-                        _wg.EnumWindows(_cb2, None)
-                        if found2:
-                            _on_ready(found2[0])
+                        _wb_hwnd2 = _wg.FindWindow(None, WB_TITLE)
+                        if _wb_hwnd2:
+                            _on_ready(_wb_hwnd2)
                             return
                     except Exception:
                         pass
@@ -3239,14 +3234,9 @@ class App:
                 try:
                     import win32gui as _wg
                     WB_TITLE = 'Whiteboard (Shift+F8)'
-                    found3 = []
-                    def _cb3(h, _):
-                        if not _wg.IsWindow(h): return
-                        if _wg.GetWindowText(h) == WB_TITLE:
-                            found3.append(h)
-                    _wg.EnumWindows(_cb3, None)
-                    if found3:
-                        _on_ready(found3[0])
+                    _wb_hwnd3 = _wg.FindWindow(None, WB_TITLE)
+                    if _wb_hwnd3:
+                        _on_ready(_wb_hwnd3)
                         return
                 except Exception:
                     pass
@@ -3688,8 +3678,12 @@ class App:
             return False
         try:
             import win32gui
-            h = win32gui.GetForegroundWindow()
-            return win32gui.GetWindowText(h) == 'Whiteboard (Shift+F8)'
+            # Handle comparison instead of GetWindowText(h) == title:
+            # equivalent, and avoids sending WM_GETTEXT cross-process
+            # into Whiteboard's WebView2 process (blocking risk — see
+            # the FindWindowW rationale a few call sites up).
+            return win32gui.GetForegroundWindow() == win32gui.FindWindow(
+                None, 'Whiteboard (Shift+F8)')
         except Exception:
             return False
 
@@ -7191,15 +7185,14 @@ class App:
             try:
                 import win32gui, win32con, win32process
                 closed_pids = set()
-                def _cb(h, _):
-                    if win32gui.GetWindowText(h) == 'Whiteboard (Shift+F8)':
-                        win32gui.PostMessage(h, win32con.WM_CLOSE, 0, 0)
-                        try:
-                            _, pid = win32process.GetWindowThreadProcessId(h)
-                            closed_pids.add(pid)
-                        except Exception:
-                            pass
-                win32gui.EnumWindows(_cb, None)
+                _wb_hwnd_reset = win32gui.FindWindow(None, 'Whiteboard (Shift+F8)')
+                if _wb_hwnd_reset:
+                    win32gui.PostMessage(_wb_hwnd_reset, win32con.WM_CLOSE, 0, 0)
+                    try:
+                        _, pid = win32process.GetWindowThreadProcessId(_wb_hwnd_reset)
+                        closed_pids.add(pid)
+                    except Exception:
+                        pass
                 # Wait for the subprocess(es) to actually exit so their final
                 # save can't land after our reset write.
                 if closed_pids:
@@ -9252,6 +9245,16 @@ def _sweep_ghost_tray_icons() -> None:
         import struct
         u32 = ctypes.windll.user32
         WM_MOUSEMOVE = 0x0200
+        # SendMessageTimeoutW instead of plain SendMessageW: this fires
+        # up to ~280 sends per sweep into explorer.exe's tray toolbar,
+        # each one blocking if explorer.exe's thread doesn't service it
+        # immediately. explorer.exe DOES hang/stall sometimes (shell
+        # restarts, heavy disk I/O) — same class of cross-process hang
+        # root-caused elsewhere in the app this session (2026-09-08,
+        # recurred 2026-09-11, via AttachThreadInput/SetWindowTextW
+        # instead of this specific call), just not yet hit here in
+        # practice. Bounded up front rather than waiting to find out.
+        SMTO_ABORTIFHUNG = 0x0002
 
         def _child(parent: int, cls: str) -> int:
             return u32.FindWindowExW(parent, None, cls, None)
@@ -9263,8 +9266,11 @@ def _sweep_ghost_tray_icons() -> None:
             u32.GetClientRect(toolbar, buf)
             _, _, w, h = struct.unpack('iiii', buf.raw)
             mid_y = (h // 2) & 0xFFFF
+            result = ctypes.c_void_p(0)
             for x in range(0, max(w, 1), 4):
-                u32.SendMessageW(toolbar, WM_MOUSEMOVE, 0, (x & 0xFFFF) | (mid_y << 16))
+                u32.SendMessageTimeoutW(
+                    toolbar, WM_MOUSEMOVE, 0, (x & 0xFFFF) | (mid_y << 16),
+                    SMTO_ABORTIFHUNG, 200, ctypes.byref(result))
 
         # Primary notification area
         tray    = u32.FindWindowW('Shell_TrayWnd', None)
