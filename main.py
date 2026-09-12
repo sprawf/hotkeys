@@ -31,6 +31,208 @@ if __name__ == '__main__' and '--whiteboard' in sys.argv:
     sys.exit(0)
 
 
+# ── EARLY EXIT for --supervisor mode ──────────────────────────────────────────
+# Minimal, always-alive watchdog: launched once at logon via the Startup
+# folder (see _ensure_supervisor_registered, called from normal startup
+# below), runs for the whole session, independent of the main app's own
+# code/threads entirely.
+#
+# Why this exists: three confirmed Windows "Cross-process" hangs of the
+# main app (2026-09-08, -11, -12, identical WER fault bucket every time)
+# were traced to Win32 calls blocking on an unresponsive OTHER process's
+# window (Whiteboard's WebView2 host, in this case correlated with a
+# silent WebView2 Runtime auto-update two days before the first
+# incident — entirely outside this app's own code or control, and not
+# something a future Windows/WebView2/any-third-party update can be
+# assumed not to reintroduce). Code-level fixes (bounding every such
+# call this session found) reduce how often this can happen but cannot
+# promise zero, because the actual freeze can originate inside a
+# dependency's own process, not in anything reachable by review. If the
+# main process's Tk main thread ever truly stops responding, for ANY
+# reason including ones that don't exist yet, nothing running INSIDE
+# that same process can detect or recover from it — a watchdog THREAD
+# sharing the GIL and OS scheduler with a frozen main thread is not a
+# safe bet (confirmed directly this session: a real hang left an
+# in-process watchdog thread never getting scheduled either). Only a
+# fully separate PROCESS, with its own GIL, memory space, and OS
+# scheduling, can reliably detect and recover from that class of
+# failure. This is the same architecture pattern real commercial tray
+# apps use for exactly this reason.
+#
+# Deliberately minimal imports (stdlib + psutil, already a dependency)
+# so this process itself is about as hard to break as code gets — the
+# whole point is it must outlast whatever breaks the main app.
+if __name__ == '__main__' and '--supervisor' in sys.argv:
+    def _run_supervisor() -> None:
+        import time
+        import subprocess
+        import datetime
+        try:
+            import psutil
+        except ImportError:
+            psutil = None
+        from storage import appdata_dir
+
+        frozen = getattr(sys, 'frozen', False)
+        if frozen:
+            app_dir = os.path.dirname(sys.executable)
+            launch_cmd = [sys.executable]
+        else:
+            app_dir = os.path.dirname(os.path.abspath(__file__))
+            launch_cmd = [os.path.join(app_dir, 'venv', 'Scripts', 'pythonw.exe'),
+                         os.path.join(app_dir, 'main.py')]
+        marker_path = os.path.join(appdata_dir(), 'watchdog_alive.marker')
+        log_path    = os.path.join(appdata_dir(), 'supervisor.log')
+
+        # Startup grace covers legitimate slow boot (model loads etc,
+        # matches main.py's own in-process grace period). Marker
+        # staleness threshold is a wide margin over the ~10s write
+        # interval so a scheduling hiccup never false-positives (a
+        # log-mtime-based version of this DID false-positive in an
+        # earlier iteration and got removed for it — this uses a
+        # dedicated marker written only when the Tk main thread proves
+        # itself alive, not general app activity, which is what made
+        # the difference).
+        STARTUP_GRACE_S = 90
+        STALE_MARKER_S  = 60
+        POLL_INTERVAL_S = 15
+
+        def _log(msg: str) -> None:
+            try:
+                with open(log_path, 'a', encoding='utf-8') as f:
+                    f.write(f'{datetime.datetime.now().isoformat(timespec="seconds")}  {msg}\n')
+            except Exception:
+                pass
+
+        def _find_procs():
+            if psutil is None:
+                return None  # can't check — caller treats as "unknown, don't act"
+            found = []
+            for p in psutil.process_iter(['pid', 'name', 'cmdline', 'create_time']):
+                try:
+                    name = (p.info['name'] or '').lower()
+                    if frozen:
+                        if name in ('hotkeys.exe', 'hotkeys'):
+                            found.append((p, p.info['create_time']))
+                    else:
+                        if name not in ('pythonw.exe', 'python.exe'):
+                            continue
+                        cmdline = ' '.join(p.info['cmdline'] or []).lower()
+                        if ('hotkeys' in cmdline and 'main.py' in cmdline
+                                and 'whiteboard' not in cmdline
+                                and '--supervisor' not in cmdline):
+                            found.append((p, p.info['create_time']))
+                except Exception:
+                    continue
+            found.sort(key=lambda t: t[1])
+            return found
+
+        def _kill_all(procs) -> None:
+            for p, _ct in procs:
+                try:
+                    for child in p.children(recursive=True):
+                        try: child.kill()
+                        except Exception: pass
+                    p.kill()
+                except Exception:
+                    pass
+
+        def _launch() -> None:
+            try:
+                subprocess.Popen(launch_cmd, cwd=app_dir)
+                _log('Launched Hotkeys.')
+            except Exception as e:
+                _log(f'Launch FAILED: {e}')
+
+        # Loop-protection: if the marker path itself is ever
+        # permanently unwritable for some unrelated reason (disk
+        # full, a corrupted ACL, persistent AV interference), a
+        # perfectly healthy app would never manage to write a fresh
+        # marker after being relaunched, and every cycle from then on
+        # would look identical to a fresh hang — an infinite kill
+        # loop against an app that was actually fine. Cap it: past a
+        # handful of kills in a short window, stop acting and just
+        # keep logging loudly, so the failure mode is "stopped
+        # helping" rather than "destroys the app forever."
+        MAX_KILLS_PER_WINDOW = 3
+        KILL_WINDOW_S        = 600
+        recent_kills: list[float] = []
+
+        _log(f'Supervisor started (frozen={frozen}, app_dir={app_dir}).')
+        while True:
+            try:
+                procs = _find_procs()
+                if procs is None:
+                    pass  # psutil unavailable, nothing safe to do this tick
+                elif not procs:
+                    _log('No Hotkeys process found; launching.')
+                    _launch()
+                else:
+                    oldest_age = time.time() - procs[0][1]
+                    if oldest_age >= STARTUP_GRACE_S:
+                        try:
+                            marker_age = time.time() - os.path.getmtime(marker_path)
+                        except OSError:
+                            marker_age = None  # no marker yet this run; don't guess
+                        if marker_age is not None and marker_age > STALE_MARKER_S:
+                            now = time.time()
+                            recent_kills = [t for t in recent_kills if now - t < KILL_WINDOW_S]
+                            if len(recent_kills) >= MAX_KILLS_PER_WINDOW:
+                                _log(f'Hotkeys alive {oldest_age:.0f}s, marker stale '
+                                     f'{marker_age:.0f}s, but already killed '
+                                     f'{len(recent_kills)}x in the last '
+                                     f'{KILL_WINDOW_S}s — standing down instead of '
+                                     f'risking a kill loop. Investigate manually.')
+                            else:
+                                recent_kills.append(now)
+                                _log(f'Hotkeys alive {oldest_age:.0f}s but liveness marker '
+                                     f'stale {marker_age:.0f}s — treating as hung. '
+                                     f'Killing and relaunching.')
+                                # Delete the stale marker BEFORE relaunching.
+                                # Without this, a fresh process's own first
+                                # internal-watchdog write can land just
+                                # after this cycle's startup-grace check
+                                # (both use ~90s but from slightly
+                                # different reference points), leaving the
+                                # OLD, now-meaningless marker on disk long
+                                # enough for the NEXT poll tick to judge a
+                                # brand-new healthy process against
+                                # leftover data from the one just killed —
+                                # confirmed directly in testing: a
+                                # perfectly healthy relaunch got killed a
+                                # second time this way. No marker file at
+                                # all is the deliberately-safe state (see
+                                # the OSError branch above): the next tick
+                                # simply waits for a genuine first write
+                                # instead of guessing.
+                                try:
+                                    os.remove(marker_path)
+                                except OSError:
+                                    # Read-only or similarly locked:
+                                    # clear the attribute and retry
+                                    # once before giving up. Confirmed
+                                    # directly in testing that a
+                                    # locked marker survives a plain
+                                    # remove() and causes exactly the
+                                    # spurious-second-kill this whole
+                                    # delete step exists to prevent.
+                                    try:
+                                        import stat as _stat
+                                        os.chmod(marker_path, _stat.S_IWRITE)
+                                        os.remove(marker_path)
+                                    except OSError:
+                                        pass
+                                _kill_all(procs)
+                                time.sleep(1)
+                                _launch()
+            except Exception as e:
+                _log(f'Supervisor tick error (continuing): {e}')
+            time.sleep(POLL_INTERVAL_S)
+
+    _run_supervisor()
+    sys.exit(0)
+
+
 import sys as _sys_for_fh
 import faulthandler as _fh
 import time as _time_for_fh
@@ -613,6 +815,63 @@ class SplashScreen:
             pass
 
 
+def _ensure_supervisor_registered() -> None:
+    """Self-installing: make sure a Windows Startup-folder shortcut
+    launches --supervisor mode (not the app directly) at every logon.
+
+    This is what makes the crash/hang-recovery supervisor (see the
+    --supervisor early-exit block near the top of this file) work on
+    ANY machine with zero manual setup — including a fresh install on
+    a completely different PC — instead of only where someone happened
+    to configure it by hand. Runs on every normal startup but is a
+    cheap no-op after the first (only touches disk if the shortcut is
+    missing or points at the wrong target), so it self-heals if the
+    shortcut is ever deleted or a previous version pointed it directly
+    at the app instead of the supervisor.
+    """
+    if sys.platform != 'win32':
+        return
+    try:
+        startup_dir = os.path.join(
+            os.environ['APPDATA'], 'Microsoft', 'Windows',
+            'Start Menu', 'Programs', 'Startup')
+        shortcut_path = os.path.join(startup_dir, 'Hotkeys.lnk')
+
+        frozen = getattr(sys, 'frozen', False)
+        if frozen:
+            target  = sys.executable
+            args    = '--supervisor'
+            workdir = os.path.dirname(sys.executable)
+        else:
+            app_dir = os.path.dirname(os.path.abspath(__file__))
+            target  = os.path.join(app_dir, 'venv', 'Scripts', 'pythonw.exe')
+            args    = f'"{os.path.abspath(__file__)}" --supervisor'
+            workdir = app_dir
+
+        import win32com.client
+        shell = win32com.client.Dispatch('WScript.Shell')
+        needs_write = True
+        if os.path.exists(shortcut_path):
+            try:
+                existing = shell.CreateShortcut(shortcut_path)
+                if (existing.TargetPath.lower() == target.lower()
+                        and '--supervisor' in (existing.Arguments or '')):
+                    needs_write = False
+            except Exception:
+                pass
+        if needs_write:
+            sc = shell.CreateShortcut(shortcut_path)
+            sc.TargetPath = target
+            sc.Arguments = args
+            sc.WorkingDirectory = workdir
+            sc.WindowStyle = 7   # minimized
+            sc.Description = 'Hotkeys supervisor (auto-recovery watchdog)'
+            sc.Save()
+            logger.info(f'Supervisor Startup shortcut (re)installed: {shortcut_path}')
+    except Exception as e:
+        logger.warning(f'_ensure_supervisor_registered failed: {e}')
+
+
 # ── App ───────────────────────────────────────────────────────────────────────
 
 class App:
@@ -956,12 +1215,14 @@ class App:
         # thread can ever detect or recover from it on its own.
         # Self-terminating is the one thing guaranteed to work
         # regardless of WHAT blocked the main thread: the next launch
-        # (manual, or the "newest instance wins" mutex retry, or the
-        # scheduled task's own periodic health check) then gets a
-        # clean process to start fresh in.
+        # (manual, the "newest instance wins" mutex retry, or the
+        # --supervisor process's own periodic health check just below)
+        # then gets a clean process to start fresh in.
         self._last_poll_ts = time.monotonic()
         threading.Thread(target=self._mainloop_watchdog, daemon=True,
                          name='mainloop-watchdog').start()
+        threading.Thread(target=_ensure_supervisor_registered, daemon=True,
+                         name='supervisor-register').start()
 
         self.root.after(30, self._poll)
         # Pre-warm Quick Notes shortly after boot so the first Shift+F7
@@ -6888,6 +7149,32 @@ class App:
                 except Exception:
                     pass
                 os._exit(1)
+            else:
+                # Healthy: touch a lightweight marker the EXTERNAL
+                # supervisor process (--supervisor mode, launched at
+                # logon, watching for exactly this) checks for real
+                # liveness. app.log's own mtime is NOT a valid proxy
+                # for that — a perfectly healthy, idle instance can go
+                # long stretches without writing anything (its own
+                # heartbeat log line is hourly), which looked
+                # identical to a hang to an earlier log-mtime-based
+                # check and caused false-positive kills every cycle.
+                # This marker updates every ~15s purely from _poll()
+                # being alive, independent of user activity or log
+                # verbosity, so "stale" on THIS file actually means
+                # something. A watchdog THREAD inside this same
+                # process (the one above) cannot catch a true full-
+                # process freeze — confirmed directly this session, a
+                # real hang left it never getting scheduled either —
+                # only a separate process checking this file from
+                # outside can.
+                try:
+                    from storage import appdata_dir
+                    p = os.path.join(appdata_dir(), 'watchdog_alive.marker')
+                    with open(p, 'w', encoding='utf-8') as f:
+                        f.write(str(now))
+                except Exception:
+                    pass
 
     def _poll(self) -> None:
         # Reschedule FIRST so a handler that calls wait_window() (which creates
