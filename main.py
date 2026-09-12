@@ -137,7 +137,36 @@ if __name__ == '__main__' and '--supervisor' in sys.argv:
                 except Exception:
                     pass
 
+        def _clear_marker() -> None:
+            """Delete any leftover marker before launching. A marker
+            from a PREVIOUS process (whether we just killed it or it
+            was already gone when this tick found "no process")
+            outlives that process on disk. Without clearing it, a
+            brand-new healthy process can get judged against that old
+            timestamp for however long it takes its OWN first write to
+            land (~90s) — confirmed as a genuine bug in production
+            (2026-09-12): the "no process found, just launch" path
+            didn't have this and a leftover marker from an earlier run
+            caused a real spurious kill of a healthy 95s-old instance
+            minutes after this fix was first added to the OTHER launch
+            path only. No marker file at all is the deliberately-safe
+            state (see the OSError branch below): the next tick simply
+            waits for a genuine first write instead of guessing.
+            Clears a read-only/locked attribute and retries once —
+            confirmed directly in testing that a locked marker
+            survives a plain remove() and reproduces the same bug."""
+            try:
+                os.remove(marker_path)
+            except OSError:
+                try:
+                    import stat as _stat
+                    os.chmod(marker_path, _stat.S_IWRITE)
+                    os.remove(marker_path)
+                except OSError:
+                    pass
+
         def _launch() -> None:
+            _clear_marker()
             try:
                 subprocess.Popen(launch_cmd, cwd=app_dir)
                 _log('Launched Hotkeys.')
@@ -188,43 +217,9 @@ if __name__ == '__main__' and '--supervisor' in sys.argv:
                                 _log(f'Hotkeys alive {oldest_age:.0f}s but liveness marker '
                                      f'stale {marker_age:.0f}s — treating as hung. '
                                      f'Killing and relaunching.')
-                                # Delete the stale marker BEFORE relaunching.
-                                # Without this, a fresh process's own first
-                                # internal-watchdog write can land just
-                                # after this cycle's startup-grace check
-                                # (both use ~90s but from slightly
-                                # different reference points), leaving the
-                                # OLD, now-meaningless marker on disk long
-                                # enough for the NEXT poll tick to judge a
-                                # brand-new healthy process against
-                                # leftover data from the one just killed —
-                                # confirmed directly in testing: a
-                                # perfectly healthy relaunch got killed a
-                                # second time this way. No marker file at
-                                # all is the deliberately-safe state (see
-                                # the OSError branch above): the next tick
-                                # simply waits for a genuine first write
-                                # instead of guessing.
-                                try:
-                                    os.remove(marker_path)
-                                except OSError:
-                                    # Read-only or similarly locked:
-                                    # clear the attribute and retry
-                                    # once before giving up. Confirmed
-                                    # directly in testing that a
-                                    # locked marker survives a plain
-                                    # remove() and causes exactly the
-                                    # spurious-second-kill this whole
-                                    # delete step exists to prevent.
-                                    try:
-                                        import stat as _stat
-                                        os.chmod(marker_path, _stat.S_IWRITE)
-                                        os.remove(marker_path)
-                                    except OSError:
-                                        pass
                                 _kill_all(procs)
                                 time.sleep(1)
-                                _launch()
+                                _launch()   # clears the marker itself, see _clear_marker
             except Exception as e:
                 _log(f'Supervisor tick error (continuing): {e}')
             time.sleep(POLL_INTERVAL_S)
