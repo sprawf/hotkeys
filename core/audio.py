@@ -130,6 +130,19 @@ class AudioCapture:
         # start_recording to block briefly on cold-start so users don't
         # start speaking into a not-yet-flowing WASAPI stream.
         self._first_chunk_seen: bool = False
+        # Updated on EVERY callback (not just the first) so start_recording's
+        # fast path can tell "prewarmed days ago" apart from "actually still
+        # flowing right now." A PortAudio/WASAPI stream can go zombie —
+        # .active keeps reporting True while the underlying HRESULT is
+        # dead (this class's own docstring already names that failure
+        # mode) — and with the app now able to stay up for days/weeks
+        # (the 2026-09-12 supervisor auto-recovery work), that's no
+        # longer a rare edge case, it's the normal long-uptime state.
+        # Confirmed directly: a clearly-spoken recording after 4 days of
+        # uptime came back as a single "." — the fast path trusted a
+        # first-chunk-seen flag set once, days earlier, with no check
+        # that anything had actually arrived since.
+        self._last_chunk_time: float = 0.0
         # Surfaced to the UI: when non-empty, the last open-stream error
         # message, lets the "Microphone unavailable" dialog show what
         # actually went wrong (sample rate? permissions? device gone?).
@@ -331,6 +344,7 @@ class AudioCapture:
         # recordings hit the fast path (stream already flowing).
         if not self._first_chunk_seen:
             self._first_chunk_seen = True
+        self._last_chunk_time = time.perf_counter()
         try:
             chunk = np.clip(indata[:, 0].copy(), -1.0, 1.0)
             # Resample on the fly when the device couldn't give us 16 kHz
@@ -418,10 +432,20 @@ class AudioCapture:
             self._recording      = True
 
         # Fast path: existing stream is already open + streaming AND
-        # we've seen audio flow through it. Second-and-later presses go
-        # here (~0 ms latency).
+        # we've seen audio flow through it RECENTLY (not just ever —
+        # see _last_chunk_time's comment in __init__). PortAudio's
+        # callback fires continuously the whole time the stream is
+        # open, recording or not, at roughly one chunk per 32ms — so
+        # for a genuinely healthy stream this gap is never more than
+        # a few callback intervals. Anything past this threshold means
+        # the callback has actually stopped firing despite .active
+        # still reporting True (the zombie-stream case), and trusting
+        # the fast path here is exactly how a clearly-spoken recording
+        # came back as a single "." after days of uptime.
+        _STREAM_STALE_S = 2.0
         if (self._stream is not None and self._stream.active
-                and self._first_chunk_seen):
+                and self._first_chunk_seen
+                and (time.perf_counter() - self._last_chunk_time) < _STREAM_STALE_S):
             return
 
         # Slow path: stream is None or inactive. Clean up any zombie
