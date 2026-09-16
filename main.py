@@ -7828,20 +7828,37 @@ class App:
         self._whisper_recording = True
         self._whisper_t0 = time.time()
         self._vad.reset()
-        try:
-            # audio.start_recording() now has its own escalating-backoff
-            # retry (up to ~2.6s total) for transient PortAudio/WASAPI
-            # busy conditions. By the time it raises here, we've tried
-            # 4 times and the mic is genuinely inaccessible.
-            self._audio.start_recording()
-        except Exception as e:
-            self._whisper_recording = False
-            logger.error(f'Microphone error (after 4 retries): {e}')
-            self._show_mic_error(str(e))
-            return
+        # Feedback FIRST, mic warmup in the background. audio.start_recording()
+        # sets its internal _recording flag (which gates buffering) synchronously
+        # before doing anything slow, so kicking it off on a thread loses zero
+        # audio. But on a cold stream it can block up to ~650ms (retry backoff +
+        # WASAPI warmup settle) before returning — and play_start()/show_recording()
+        # used to wait for that return. Result: on the first press after launch
+        # (prewarm not yet finished) the user got zero sound/pill for up to
+        # 650ms, assumed the hotkey didn't register, pressed Alt+Space again,
+        # and immediately stopped the barely-started recording (toggle hotkey).
+        # That's the "first message always clipped" bug. Showing feedback up
+        # front removes the ambiguity that caused the double-press.
         play_start()
         self.whisper_overlay.show_recording()
         self._update_tray()
+
+        def _start_audio():
+            try:
+                # audio.start_recording() now has its own escalating-backoff
+                # retry (up to ~2.6s total) for transient PortAudio/WASAPI
+                # busy conditions. By the time it raises here, we've tried
+                # 4 times and the mic is genuinely inaccessible.
+                self._audio.start_recording()
+            except Exception as e:
+                logger.error(f'Microphone error (after 4 retries): {e}')
+                def _fail():
+                    self._whisper_recording = False
+                    self._show_mic_error(str(e))
+                self.root.after(0, _fail)
+
+        threading.Thread(target=_start_audio, daemon=True,
+                         name='whisper-mic-start').start()
         logger.info('Whisper recording started.')
 
     def _whisper_stop_recording(self) -> None:

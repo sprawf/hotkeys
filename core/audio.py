@@ -527,6 +527,65 @@ class AudioCapture:
                 'stop_recording: audio buffer was empty; downstream will '
                 'show "No audio" pill instead of getting stuck'
             )
+        else:
+            # DIAGNOSTIC 2026-09-16: two real recordings in a row came
+            # back transcribed as a bare "." despite the user clearly
+            # speaking (confirmed not the zombie-stream bug fixed
+            # earlier today — this happened <2 minutes after a fresh
+            # prewarm). This logs actual captured signal level so the
+            # next occurrence shows whether real voice-level energy
+            # ever reached the buffer (points at Whisper/VAD/trimming)
+            # or the buffer was already near-silent at capture time
+            # (points at the device/routing itself).
+            try:
+                peak = float(np.max(np.abs(audio)))
+                rms  = float(np.sqrt(np.mean(audio.astype(np.float64) ** 2)))
+                peak_db = 20 * np.log10(peak + 1e-9)
+                rms_db  = 20 * np.log10(rms + 1e-9)
+                import logging
+                _logger = logging.getLogger(__name__)
+                _logger.info(
+                    f'stop_recording: {len(audio)} samples '
+                    f'({len(audio) / SAMPLE_RATE:.2f}s), '
+                    f'peak={peak_db:.1f}dBFS rms={rms_db:.1f}dBFS'
+                )
+                # Per-200ms-segment RMS: shows WHEN in the window any
+                # real signal appears, not just whether it exists
+                # anywhere — a single loud click vs sustained speech
+                # look identical in the whole-buffer peak/rms above.
+                seg_len = int(SAMPLE_RATE * 0.2)
+                segs = []
+                for i in range(0, len(audio), seg_len):
+                    seg = audio[i:i + seg_len]
+                    if len(seg) == 0:
+                        continue
+                    seg_rms = float(np.sqrt(np.mean(seg.astype(np.float64) ** 2)))
+                    segs.append(20 * np.log10(seg_rms + 1e-9))
+                _logger.info(
+                    'stop_recording: per-200ms rms(dBFS) = '
+                    + ' '.join(f'{v:.0f}' for v in segs)
+                )
+                # Save the raw capture to disk for direct inspection —
+                # two recordings in a row with real signal present
+                # (per the peak above) still transcribed as near-empty,
+                # so the next one needs to be actually inspectable, not
+                # just measured in aggregate.
+                try:
+                    import os
+                    import wave
+                    from storage import appdata_dir
+                    dbg_path = os.path.join(appdata_dir(), '_debug_last_recording.wav')
+                    with wave.open(dbg_path, 'wb') as wf:
+                        wf.setnchannels(1)
+                        wf.setsampwidth(2)
+                        wf.setframerate(SAMPLE_RATE)
+                        pcm16 = np.clip(audio * 32767, -32768, 32767).astype(np.int16)
+                        wf.writeframes(pcm16.tobytes())
+                    _logger.info(f'stop_recording: raw capture saved to {dbg_path}')
+                except Exception as e:
+                    _logger.warning(f'stop_recording: WAV dump failed: {e}')
+            except Exception:
+                pass
         try:
             self._on_utterance_ready(audio)
         except Exception:
