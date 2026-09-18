@@ -34,7 +34,7 @@ PROVIDER_LABELS  = {
     'gemini':    'Google Gemini  (free tier available · bring your own key)',
     'custom':    'Custom  (any OpenAI-compatible endpoint)',
 }
-GROQ_MODELS      = ['openai/gpt-oss-120b', 'qwen/qwen3.6-27b',
+GROQ_MODELS      = ['openai/gpt-oss-120b', 'qwen/qwen3.8-27b',
                     'llama-3.1-8b-instant']
 CEREBRAS_MODELS  = ['gpt-oss-120b', 'gemma-4-31b']
 # Cerebras Developer-tier model roster verified live 2026-07-18 against

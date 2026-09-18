@@ -496,7 +496,7 @@ DEFAULT_CONFIG: dict = {
     'providers': {
         'local':    {'model_id': 'Qwen/Qwen2.5-1.5B-Instruct-GGUF'},
         'groq':     {'api_key': '', 'model': 'openai/gpt-oss-120b',
-                     'vision_model': 'qwen/qwen3.6-27b'},
+                     'vision_model': 'qwen/qwen3.8-27b'},
         # llama3.1-8b was retired by Cerebras (404s on every call); the
         # current default matches engine.CEREBRAS_MODELS[0].
         'cerebras': {'api_key': '', 'model': 'gpt-oss-120b'},
@@ -644,12 +644,14 @@ def load_config() -> dict:
         # Groq periodically retires model IDs. Any saved config naming a
         # dead one → 404 the moment the user hits PrtSc translate. When
         # we spot a known-retired ID, silently snap to the current
-        # default (qwen/qwen3.6-27b) and re-save so the fix survives
+        # default (qwen/qwen3.8-27b) and re-save so the fix survives
         # relaunches.
         # Retired history (Groq):
         #   • llama-4-maverick — never actually on Groq's inventory
         #   • meta-llama/llama-4-scout-17b-16e-instruct — retired 2026-07
-        _RETIRED_VISION = ('maverick', 'llama-4-scout', 'scout-17b')
+        #   • qwen/qwen3.6-27b — retired 2026-09, replaced by qwen3.8-27b
+        _RETIRED_VISION = ('maverick', 'llama-4-scout', 'scout-17b',
+                            'qwen3.6-27b')
         _migrated = False
         try:
             _gq = merged['providers'].get('groq', {})
