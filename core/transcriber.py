@@ -629,6 +629,15 @@ class Transcriber:
         '♪',
         '[music]',
         '(music)',
+        # Whisper's most infamous non-English hallucination: Japanese
+        # YouTube sign-offs, invented on silence regardless of what
+        # language the app is actually configured for. ご視聴
+        # ありがとうございました = "Thanks for watching",
+        # ありがとうございました = "Thank you very much".
+        'ご視聴ありがとうございました',
+        'ありがとうございました',
+        'ご視聴ありがとうございます',
+        'ありがとうございます',
     })
 
     def _looks_like_hallucination(self, text: str, audio: 'np.ndarray | None') -> bool:
@@ -641,7 +650,10 @@ class Transcriber:
         """
         if not text or audio is None or len(audio) == 0:
             return False
-        normalised = text.strip().lower().rstrip('.!?,;:')
+        # Strip full-width Japanese punctuation (。！？、) too, not just
+        # ASCII, so 'ありがとうございました。' still matches the bare
+        # phrase in _HALLUCINATION_PHRASES.
+        normalised = text.strip().lower().rstrip('.!?,;:。!?、')
         if normalised not in self._HALLUCINATION_PHRASES:
             return False
         try:
