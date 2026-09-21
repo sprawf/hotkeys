@@ -490,8 +490,32 @@ class AudioCapture:
                     # buffer — without this, first-syllable of user's
                     # speech still gets truncated even though the
                     # callback has fired.
+                    t_first = self._last_chunk_time
                     time.sleep(0.15)
                     warmup_ms = (time.perf_counter() - t0) * 1000
+                    if self._last_chunk_time <= t_first:
+                        # Zombie-on-open: exactly one callback arrived
+                        # (enough to satisfy _first_chunk_seen) and then
+                        # the stream went silent — confirmed live via a
+                        # user report: pressed the hotkey right after
+                        # testing the same physical mic in a browser tab,
+                        # got a genuinely empty buffer over a real 3s
+                        # "recording", second press (mic now fully
+                        # released by the browser) worked fine. WASAPI's
+                        # handoff after another app releases the device
+                        # isn't always instant — opening during that
+                        # window yields a stream that LOOKS opened but
+                        # never actually starts capturing. Treat this as
+                        # a failed attempt so the existing backoff/retry
+                        # below gets a fresh stream instead of confidently
+                        # "recording" into a dead one.
+                        logger.warning(
+                            f'Mic stream went silent immediately after '
+                            f'opening (1 callback at {warmup_ms:.0f}ms, '
+                            f'none since) — zombie-on-open, retrying.')
+                        raise RuntimeError(
+                            'Mic stream went silent immediately after '
+                            'opening (zombie-on-open)')
                     if warmup_ms > 50:
                         logger.info(f'Mic cold-start warmup: {warmup_ms:.0f}ms (+150ms settle)')
                 else:
