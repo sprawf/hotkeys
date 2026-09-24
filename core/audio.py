@@ -108,6 +108,7 @@ class AudioCapture:
         self._cfg    = cfg
         self._stream = None
         self._lock   = threading.Lock()
+        self._open_lock = threading.Lock()
         self._recording      = False
         self._buffer         = []
         self._interim_last_n = 0
@@ -152,6 +153,70 @@ class AudioCapture:
     def db(self):
         return self._db
 
+    @staticmethod
+    def _discard_stream(stream) -> None:
+        """Stop+close a stream on a throwaway thread. Closing a dead/zombie
+        WASAPI stream can block for ~10 s; never do it on a path the user
+        is waiting on."""
+        def _run():
+            try: stream.stop()
+            except Exception: pass
+            try: stream.close()
+            except Exception: pass
+        threading.Thread(target=_run, daemon=True, name='mic-discard').start()
+
+    def start_keepalive(self) -> None:
+        """Background self-heal: if the idle mic stream stops delivering
+        callbacks (device reset, sleep/resume, days of uptime), reopen it
+        NOW so the user's next hotkey press hits a live stream instead of
+        discovering a dead one mid-sentence (the 'first press always says
+        no speech' bug)."""
+        if getattr(self, '_keepalive_started', False):
+            return
+        self._keepalive_started = True
+
+        def _loop():
+            while True:
+                time.sleep(5.0)
+                try:
+                    if self._recording:
+                        continue
+                    stale = (self._stream is None
+                             or not self._stream.active
+                             or (time.perf_counter() - self._last_chunk_time) > 2.0)
+                    if not stale:
+                        continue
+                    if not self._open_lock.acquire(blocking=False):
+                        continue
+                    try:
+                        if self._recording:
+                            continue
+                        logger.info('Mic keepalive: stream stale, reopening.')
+                        old = self._stream
+                        self._stream = None
+                        if old is not None:
+                            self._discard_stream(old)
+                        self._first_chunk_seen = False
+                        self._open_stream()
+                        t0 = time.perf_counter()
+                        while not self._first_chunk_seen and (time.perf_counter() - t0) < 0.8:
+                            time.sleep(0.01)
+                        t_first = self._last_chunk_time
+                        time.sleep(0.3)
+                        if not self._first_chunk_seen or self._last_chunk_time <= t_first:
+                            logger.warning('Mic keepalive: reopened stream is dead, discarding.')
+                            if self._stream is not None:
+                                self._discard_stream(self._stream)
+                                self._stream = None
+                        else:
+                            logger.info('Mic keepalive: stream healthy again.')
+                    finally:
+                        self._open_lock.release()
+                except Exception as e:
+                    logger.debug(f'Mic keepalive error: {e}')
+
+        threading.Thread(target=_loop, daemon=True, name='mic-keepalive').start()
+
     def prewarm(self) -> bool:
         """Open the mic once at app startup so the first Ctrl+Enter /
         Alt+Space has zero cold-start latency.
@@ -168,6 +233,7 @@ class AudioCapture:
         Idempotent: safe to call multiple times. Returns True on success,
         False on any failure (including "stream already open").
         """
+        self.start_keepalive()
         if self._stream is not None and self._stream.active:
             return True
         try:
@@ -410,6 +476,10 @@ class AudioCapture:
                 pass
 
     def start_recording(self):
+        with self._open_lock:
+            self._start_recording_impl()
+
+    def _start_recording_impl(self):
         """Start capturing to the buffer. Robust against transient PortAudio /
         WASAPI failures.
 
@@ -453,14 +523,7 @@ class AudioCapture:
         # sd.InputStream instance and doesn't confuse PortAudio's
         # per-device state.
         if self._stream is not None:
-            try:
-                self._stream.stop()
-            except Exception:
-                pass
-            try:
-                self._stream.close()
-            except Exception:
-                pass
+            self._discard_stream(self._stream)
             self._stream = None
 
         # Escalating backoff. Total budget ~2.6 s across 4 attempts.
@@ -523,10 +586,11 @@ class AudioCapture:
                 return  # success
             except Exception as e:
                 last_exc = e
-                # Clean up any partial state before the next retry.
+                # Clean up any partial state before the next retry. Async:
+                # closing a dead WASAPI stream can block ~10 s, which
+                # previously ate the whole recording window.
                 if self._stream is not None:
-                    try: self._stream.close()
-                    except Exception: pass
+                    self._discard_stream(self._stream)
                     self._stream = None
         # All retries exhausted — surface the last error.
         with self._lock:
