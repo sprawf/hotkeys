@@ -9522,6 +9522,17 @@ def _find_other_hotkeys_pids() -> list[int]:
                 cmdline = ' '.join(proc.info['cmdline'] or []).lower()
                 if 'hotkeys' not in cmdline:
                     continue
+                # NEVER match the supervisor. It also runs "main.py" (with
+                # --supervisor appended), so without this exclusion every
+                # single-instance sweep — which runs on EVERY normal
+                # relaunch, not just genuine duplicate-instance conflicts —
+                # kills the supervisor as a false-positive "other instance".
+                # Confirmed live 2026-09-28: this is why supervisor.log had
+                # been silent for 12 days and nothing recovered from a real
+                # AppHang crash on 2026-09-24 — not a one-off mistake,
+                # every relaunch (mine or the user's) was killing it.
+                if '--supervisor' in cmdline:
+                    continue
                 if 'main.py' in cmdline or 'whiteboard.py' in cmdline:
                     candidates[proc.pid] = proc.info.get('ppid') or 0
         except Exception:
