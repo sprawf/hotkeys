@@ -187,6 +187,74 @@ if __name__ == '__main__' and '--supervisor' in sys.argv:
         KILL_WINDOW_S        = 600
         recent_kills: list[float] = []
 
+        # ── Live hang-capture ────────────────────────────────────────────
+        # The recurring cross-process AppHang (5 occurrences: 2026-09-08,
+        # -11, -12, -24, -28, identical WER fault bucket every time) has
+        # never once come with a usable stack trace — Windows' own crash
+        # report is metadata-only for this event type. Every occurrence
+        # was preceded by the same log line ~30s earlier: "Root received
+        # WM_DELETE_WINDOW; re-withdrawing to keep the app alive." That's
+        # a reliable enough precursor to arm on. The moment it appears,
+        # fire py-spy against every live Hotkeys pid repeatedly through
+        # the ~30s window Windows gives before it force-closes the app,
+        # so the NEXT occurrence leaves an actual thread dump instead of
+        # nothing. Runs unconditionally whenever the supervisor is up —
+        # no one has to notice the app died and go tell me; the evidence
+        # is captured automatically at the moment it happens.
+        pyspy_path = os.path.join(app_dir, 'venv', 'Scripts', 'py-spy.exe')
+        hang_log_path = os.path.join(appdata_dir(), 'app.log')
+        dump_dir = os.path.join(appdata_dir(), 'hang_dumps')
+
+        def _run_hang_watcher() -> None:
+            if not os.path.isfile(pyspy_path):
+                _log('Hang-watcher: py-spy.exe not found, skipping (dev-only diagnostic).')
+                return
+            os.makedirs(dump_dir, exist_ok=True)
+            # Wait for app.log to exist (first-ever launch on a fresh
+            # machine won't have it yet) rather than crashing this thread.
+            while not os.path.isfile(hang_log_path):
+                time.sleep(5)
+            try:
+                f = open(hang_log_path, 'r', encoding='utf-8', errors='replace')
+                f.seek(0, os.SEEK_END)
+            except Exception as e:
+                _log(f'Hang-watcher: cannot open app.log ({e}), giving up.')
+                return
+            _log('Hang-watcher: armed, tailing app.log for WM_DELETE_WINDOW precursor.')
+            while True:
+                line = f.readline()
+                if not line:
+                    time.sleep(0.5)
+                    continue
+                if 'WM_DELETE_WINDOW' not in line:
+                    continue
+                ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+                _log(f'Hang-watcher: precursor seen, capturing dumps for ~30s (ts={ts}).')
+                for tick in range(8):
+                    procs = _find_procs() or []
+                    for p, _ct in procs:
+                        out_path = os.path.join(dump_dir, f'dump_{ts}_pid{p.pid}_t{tick}.txt')
+                        try:
+                            with open(out_path, 'w', encoding='utf-8') as outf:
+                                subprocess.run(
+                                    [pyspy_path, 'dump', '--pid', str(p.pid)],
+                                    stdout=outf, stderr=subprocess.STDOUT, timeout=10)
+                        except Exception as e:
+                            try:
+                                with open(out_path, 'w', encoding='utf-8') as outf:
+                                    outf.write(f'dump failed: {e}\n')
+                            except Exception:
+                                pass
+                    time.sleep(4)
+                _log(f'Hang-watcher: capture done (ts={ts}), dumps in {dump_dir}.')
+
+        try:
+            import threading as _threading
+            _threading.Thread(target=_run_hang_watcher, daemon=True,
+                              name='hang-watcher').start()
+        except Exception as e:
+            _log(f'Hang-watcher: failed to start: {e}')
+
         _log(f'Supervisor started (frozen={frozen}, app_dir={app_dir}).')
         while True:
             try:
