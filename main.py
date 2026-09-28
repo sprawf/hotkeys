@@ -127,16 +127,6 @@ if __name__ == '__main__' and '--supervisor' in sys.argv:
             found.sort(key=lambda t: t[1])
             return found
 
-        def _kill_all(procs) -> None:
-            for p, _ct in procs:
-                try:
-                    for child in p.children(recursive=True):
-                        try: child.kill()
-                        except Exception: pass
-                    p.kill()
-                except Exception:
-                    pass
-
         def _clear_marker() -> None:
             """Delete any leftover marker before launching. A marker
             from a PREVIOUS process (whether we just killed it or it
@@ -172,20 +162,6 @@ if __name__ == '__main__' and '--supervisor' in sys.argv:
                 _log('Launched Hotkeys.')
             except Exception as e:
                 _log(f'Launch FAILED: {e}')
-
-        # Loop-protection: if the marker path itself is ever
-        # permanently unwritable for some unrelated reason (disk
-        # full, a corrupted ACL, persistent AV interference), a
-        # perfectly healthy app would never manage to write a fresh
-        # marker after being relaunched, and every cycle from then on
-        # would look identical to a fresh hang — an infinite kill
-        # loop against an app that was actually fine. Cap it: past a
-        # handful of kills in a short window, stop acting and just
-        # keep logging loudly, so the failure mode is "stopped
-        # helping" rather than "destroys the app forever."
-        MAX_KILLS_PER_WINDOW = 3
-        KILL_WINDOW_S        = 600
-        recent_kills: list[float] = []
 
         # ── Live hang-capture ────────────────────────────────────────────
         # The recurring cross-process AppHang (5 occurrences: 2026-09-08,
@@ -269,6 +245,18 @@ if __name__ == '__main__' and '--supervisor' in sys.argv:
                     _log('No Hotkeys process found; launching.')
                     _launch()
                 else:
+                    # NOTE: this branch used to kill-and-relaunch a process
+                    # whose liveness marker went stale (i.e. actually hung,
+                    # not just closed). Removed 2026-09-28 per explicit
+                    # request: auto-recovering a hang destroys the exact
+                    # evidence needed to find its root cause, and the
+                    # recurring AppHang still isn't root-caused. Detection
+                    # stays (useful signal in supervisor.log), but the
+                    # process is left alone — hung/closed state is now
+                    # preserved for inspection instead of erased. The
+                    # hang_watcher thread above already captures a live
+                    # py-spy dump independently of this branch, well before
+                    # any staleness would even be detected here.
                     oldest_age = time.time() - procs[0][1]
                     if oldest_age >= STARTUP_GRACE_S:
                         try:
@@ -276,22 +264,11 @@ if __name__ == '__main__' and '--supervisor' in sys.argv:
                         except OSError:
                             marker_age = None  # no marker yet this run; don't guess
                         if marker_age is not None and marker_age > STALE_MARKER_S:
-                            now = time.time()
-                            recent_kills = [t for t in recent_kills if now - t < KILL_WINDOW_S]
-                            if len(recent_kills) >= MAX_KILLS_PER_WINDOW:
-                                _log(f'Hotkeys alive {oldest_age:.0f}s, marker stale '
-                                     f'{marker_age:.0f}s, but already killed '
-                                     f'{len(recent_kills)}x in the last '
-                                     f'{KILL_WINDOW_S}s — standing down instead of '
-                                     f'risking a kill loop. Investigate manually.')
-                            else:
-                                recent_kills.append(now)
-                                _log(f'Hotkeys alive {oldest_age:.0f}s but liveness marker '
-                                     f'stale {marker_age:.0f}s — treating as hung. '
-                                     f'Killing and relaunching.')
-                                _kill_all(procs)
-                                time.sleep(1)
-                                _launch()   # clears the marker itself, see _clear_marker
+                            _log(f'Hotkeys alive {oldest_age:.0f}s but liveness marker '
+                                 f'stale {marker_age:.0f}s — looks hung. NOT '
+                                 f'auto-restarting (disabled by request); leaving it '
+                                 f'as-is so it can be inspected. Check hang_dumps\\ '
+                                 f'and relaunch manually when ready.')
             except Exception as e:
                 _log(f'Supervisor tick error (continuing): {e}')
             time.sleep(POLL_INTERVAL_S)
