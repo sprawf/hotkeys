@@ -238,7 +238,11 @@ if __name__ == '__main__' and '--supervisor' in sys.argv:
                             with open(out_path, 'w', encoding='utf-8') as outf:
                                 subprocess.run(
                                     [pyspy_path, 'dump', '--pid', str(p.pid)],
-                                    stdout=outf, stderr=subprocess.STDOUT, timeout=10)
+                                    stdout=outf, stderr=subprocess.STDOUT, timeout=10,
+                                    # py-spy.exe is a console-subsystem exe; spawning
+                                    # it from windowless pythonw.exe would otherwise
+                                    # flash a visible console window on screen.
+                                    creationflags=subprocess.CREATE_NO_WINDOW)
                         except Exception as e:
                             try:
                                 with open(out_path, 'w', encoding='utf-8') as outf:
