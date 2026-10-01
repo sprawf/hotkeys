@@ -370,6 +370,41 @@ import tkinter as tk
 import datetime
 
 import customtkinter as ctk
+
+# ── CTkTextbox eternal-scrollbar-poll fix ──────────────────────────────────
+# CustomTkinter's CTkTextbox self-reschedules _check_if_scrollbars_needed
+# every 200ms FOREVER once created (continue_loop=True), regardless of
+# whether the textbox is actually visible. library.py keeps built tabs
+# cached rather than destroyed ("'prompts' already built" etc in app.log),
+# so every textbox in every tab a user has ever opened keeps polling
+# .xview()/.yview() and calling grid_rowconfigure()/grid()/grid_forget()
+# 5x/second forever in the background, even hidden behind another tab.
+# A live py-spy dump (hang_dumps\, 2026-09-30) caught the main thread
+# "active+gil" inside exactly this call chain — _check_if_scrollbars_needed
+# -> _create_grid_for_text_and_scrollbars -> grid_rowconfigure — during a
+# real AppHang after days of uptime. Dozens of these timers compounding
+# over days is a plausible contributor to the main thread eventually
+# stalling long enough for Windows to consider it unresponsive. Patch:
+# skip all the xview/yview/grid work while the textbox isn't mapped
+# (hidden tab) — still reschedules so it resumes instantly once shown
+# again, just does zero work while hidden.
+_orig_check_scrollbars_needed = ctk.CTkTextbox._check_if_scrollbars_needed
+
+
+def _patched_check_scrollbars_needed(self, event=None, continue_loop: bool = False):
+    try:
+        if not self.winfo_ismapped():
+            if self._textbox.winfo_exists() and continue_loop is True:
+                self.after(self._scrollbar_update_time,
+                           lambda: self._check_if_scrollbars_needed(continue_loop=True))
+            return
+    except Exception:
+        pass
+    _orig_check_scrollbars_needed(self, event, continue_loop)
+
+
+ctk.CTkTextbox._check_if_scrollbars_needed = _patched_check_scrollbars_needed
+
 # Register HEIC/HEIF opener for Pillow so iPhone photos work in the scan
 # flow when pasted from clipboard / saved as files. Silent if not installed.
 try:
