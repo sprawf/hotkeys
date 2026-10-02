@@ -181,6 +181,23 @@ if __name__ == '__main__' and '--supervisor' in sys.argv:
         hang_log_path = os.path.join(appdata_dir(), 'app.log')
         dump_dir = os.path.join(appdata_dir(), 'hang_dumps')
 
+        def _dump_pid(pid: int, out_path: str) -> None:
+            try:
+                with open(out_path, 'w', encoding='utf-8') as outf:
+                    subprocess.run(
+                        [pyspy_path, 'dump', '--pid', str(pid)],
+                        stdout=outf, stderr=subprocess.STDOUT, timeout=10,
+                        # py-spy.exe is a console-subsystem exe; spawning it
+                        # from windowless pythonw.exe would otherwise flash
+                        # a visible console window on screen.
+                        creationflags=subprocess.CREATE_NO_WINDOW)
+            except Exception as e:
+                try:
+                    with open(out_path, 'w', encoding='utf-8') as outf:
+                        outf.write(f'dump failed: {e}\n')
+                except Exception:
+                    pass
+
         def _run_hang_watcher() -> None:
             if not os.path.isfile(pyspy_path):
                 _log('Hang-watcher: py-spy.exe not found, skipping (dev-only diagnostic).')
@@ -205,33 +222,63 @@ if __name__ == '__main__' and '--supervisor' in sys.argv:
                 if 'WM_DELETE_WINDOW' not in line:
                     continue
                 ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-                _log(f'Hang-watcher: precursor seen, capturing dumps for ~30s (ts={ts}).')
+                _log(f'Hang-watcher(log): precursor seen, capturing dumps for ~30s (ts={ts}).')
                 for tick in range(8):
                     procs = _find_procs() or []
                     for p, _ct in procs:
-                        out_path = os.path.join(dump_dir, f'dump_{ts}_pid{p.pid}_t{tick}.txt')
-                        try:
-                            with open(out_path, 'w', encoding='utf-8') as outf:
-                                subprocess.run(
-                                    [pyspy_path, 'dump', '--pid', str(p.pid)],
-                                    stdout=outf, stderr=subprocess.STDOUT, timeout=10,
-                                    # py-spy.exe is a console-subsystem exe; spawning
-                                    # it from windowless pythonw.exe would otherwise
-                                    # flash a visible console window on screen.
-                                    creationflags=subprocess.CREATE_NO_WINDOW)
-                        except Exception as e:
-                            try:
-                                with open(out_path, 'w', encoding='utf-8') as outf:
-                                    outf.write(f'dump failed: {e}\n')
-                            except Exception:
-                                pass
+                        _dump_pid(p.pid, os.path.join(dump_dir, f'dump_{ts}_pid{p.pid}_t{tick}.txt'))
                     time.sleep(4)
-                _log(f'Hang-watcher: capture done (ts={ts}), dumps in {dump_dir}.')
+                _log(f'Hang-watcher(log): capture done (ts={ts}), dumps in {dump_dir}.')
+
+        def _run_hang_watcher_hwnd() -> None:
+            """Primary hang detector. WM_DELETE_WINDOW (above) only fires
+            AFTER the main thread recovers enough to process the already-
+            queued close message — confirmed directly 2026-10-02: a dump
+            triggered by that precursor showed every thread already idle,
+            meaning the real stall had already ended before we could
+            capture it. Windows' own IsHungAppWindow() answers "is this
+            window responding to messages RIGHT NOW" with no such lag, so
+            polling it catches the actual onset of a freeze, not its
+            aftermath, and keeps dumping for as long as it stays frozen."""
+            if not os.path.isfile(pyspy_path):
+                return
+            os.makedirs(dump_dir, exist_ok=True)
+            try:
+                import ctypes
+                user32 = ctypes.windll.user32
+            except Exception as e:
+                _log(f'Hang-watcher(hwnd): ctypes unavailable: {e}')
+                return
+            _log('Hang-watcher(hwnd): armed, polling IsHungAppWindow.')
+            was_hung = False
+            ts = ''
+            tick = 0
+            while True:
+                try:
+                    hwnd = user32.FindWindowW(None, 'Hotkeys')
+                    hung = bool(hwnd) and bool(user32.IsHungAppWindow(hwnd))
+                    if hung and not was_hung:
+                        ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+                        tick = 0
+                        _log(f'Hang-watcher(hwnd): IsHungAppWindow TRUE — hang onset (ts={ts}). Capturing.')
+                    if hung:
+                        for p, _ct in (_find_procs() or []):
+                            _dump_pid(p.pid, os.path.join(
+                                dump_dir, f'hwndhang_{ts}_pid{p.pid}_t{tick}.txt'))
+                        tick += 1
+                    elif was_hung:
+                        _log(f'Hang-watcher(hwnd): recovered (ts={ts}, {tick} dumps captured).')
+                    was_hung = hung
+                except Exception as e:
+                    _log(f'Hang-watcher(hwnd) tick error: {e}')
+                time.sleep(1.0)
 
         try:
             import threading as _threading
             _threading.Thread(target=_run_hang_watcher, daemon=True,
                               name='hang-watcher').start()
+            _threading.Thread(target=_run_hang_watcher_hwnd, daemon=True,
+                              name='hang-watcher-hwnd').start()
         except Exception as e:
             _log(f'Hang-watcher: failed to start: {e}')
 
