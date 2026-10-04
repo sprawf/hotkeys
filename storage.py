@@ -443,7 +443,7 @@ def assets_dir() -> str:
 
 DEFAULT_CONFIG: dict = {
     'version':         VERSION,
-    'active_provider': 'cerebras',   # fastest out of the box
+    'active_provider': 'groq',       # free, fast, out of the box
     # Portable dist gets shared as a zip — autostart=True writes the
     # extract path into the Run registry key. If the user later moves
     # or deletes the folder, that registry entry points at a missing
@@ -497,9 +497,6 @@ DEFAULT_CONFIG: dict = {
         'local':    {'model_id': 'Qwen/Qwen2.5-1.5B-Instruct-GGUF'},
         'groq':     {'api_key': '', 'model': 'openai/gpt-oss-120b',
                      'vision_model': 'qwen/qwen3.8-27b'},
-        # llama3.1-8b was retired by Cerebras (404s on every call); the
-        # current default matches engine.CEREBRAS_MODELS[0].
-        'cerebras': {'api_key': '', 'model': 'gpt-oss-120b'},
     },
     'whisper': {
         'model': {
@@ -593,36 +590,29 @@ def load_config() -> dict:
         for _dead in ('slot11', 'slot12'):
             merged['hotkeys'].pop(_dead, None)
         merged['whisper']   = _deep_merge(DEFAULT_CONFIG['whisper'], cfg.get('whisper', {}))
-        # ── Migration: retired provider models ────────────────────────────
-        # If the saved config still names a Cerebras model that the
-        # provider has retired (e.g. llama3.1-8b → 404 on every call),
-        # silently upgrade to the current default so the user doesn't
-        # have to discover Settings and re-pick. The user's API key
-        # still works; only the model id was retired.
-        # Cerebras deprecation history (Developer tier):
-        #   • llama3.1-8b, llama3.1-70b — retired earlier
-        #   • llama-3.3-70b — retired (404s since 2026-07)
-        #   • glm-4.7 — retired 2026-08-17 per Cerebras 30-day notice
-        _RETIRED_CEREBRAS = {
-            'llama3.1-8b', 'llama3.1-70b', 'llama-3.3-70b',
-            'glm-4.7', 'zai-glm-4.7',
-        }
+        # ── Migration: Cerebras removed ──────────────────────────────────
+        # Cerebras went paid-only (402 payment_required on every call, both
+        # bundled keys and every model, 2026-10) and this app only ships
+        # free providers. Anyone still set to it is moved to Groq, which
+        # hosts the same models for free, and the dead section is dropped.
+        _dropped_cb = False
         try:
-            _cb = merged['providers'].get('cerebras', {})
-            if _cb.get('model') in _RETIRED_CEREBRAS:
-                _new = DEFAULT_CONFIG['providers']['cerebras']['model']
-                logger.info(
-                    f'Config migration: Cerebras model '
-                    f'{_cb.get("model")!r} retired, upgrading to {_new!r}.')
-                _cb['model'] = _new
-                merged['providers']['cerebras'] = _cb
+            if merged.get('active_provider') == 'cerebras':
+                merged['active_provider'] = 'groq'
+                _dropped_cb = True
+            if 'cerebras' in merged.get('providers', {}):
+                merged['providers'].pop('cerebras', None)
+                _dropped_cb = True
+            if _dropped_cb:
+                logger.info('Config migration: Cerebras provider removed '
+                            '(paid-only); now using Groq.')
         except Exception:
-            pass
+            _dropped_cb = False
         # ── Migration: retired Groq CHAT model (separate from vision_model
         # below — this is providers.groq.model, used by Refine/Ask/Chains).
         # Groq retires model IDs periodically; a saved config naming a dead
         # one 404s on every refine call, forcing an immediate fall-through
-        # to Cerebras (and then local, if that's also unavailable) instead
+        # to local (if available) instead
         # of ever reaching Groq at all. Verified live via refresh_models.py:
         #   • llama-3.1-8b-instant   — retired
         #   • llama-3.3-70b-versatile — retired (404 since ~2026-08)
@@ -652,7 +642,7 @@ def load_config() -> dict:
         #   • qwen/qwen3.6-27b — retired 2026-09, replaced by qwen3.8-27b
         _RETIRED_VISION = ('maverick', 'llama-4-scout', 'scout-17b',
                             'qwen3.6-27b')
-        _migrated = False
+        _migrated = _dropped_cb
         try:
             _gq = merged['providers'].get('groq', {})
             _vm = _gq.get('vision_model', '')

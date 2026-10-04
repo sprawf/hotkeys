@@ -33,7 +33,7 @@ Most AI writing tools make you open a browser tab, paste your text, wait, copy t
 | 🎵 **Audio Editor** | Built-in waveform editor for trimming, mixing, exporting audio |
 | 🎤 **File Transcriber** | Drop an MP3 / MP4 / YouTube link; get a transcript with optional speaker labels |
 
-**No API key needed.** Cerebras + Groq keys are baked in. Just download and run.
+**No API key needed.** Groq keys are baked in. Just download and run.
 
 ---
 
@@ -185,7 +185,7 @@ No Python. No pip. No API key. No installing anything.
 
 Everything is configurable. Open the library (`Alt+Shift+E`) and click the gear icon, or right-click the tray icon.
 
-- **AI Provider**, switch between Cerebras and Groq, or enter your own API key
+- **AI Provider**, uses Groq, or enter your own API key
 - **Hotkeys**, change any global shortcut to whatever you prefer
 - **Voice model**, choose Whisper base (fast), small (default), large-v3 (best), pick your microphone
 - **Transcription**, language, beam size, custom vocabulary, diarization on/off
@@ -224,11 +224,10 @@ All hotkeys are customisable in Settings. Per-prompt hotkeys are assigned per pr
 
 Hotkeys works **out of the box** with no setup required, API access is built in.
 
-If you want to use your own key (for higher limits or your own account), both providers are free:
+If you want to use your own key (for higher limits or your own account), Groq is free:
 
 | Provider | Speed | Free tier | Sign up |
 |---|---|---|---|
-| **Cerebras** | ~0.3 s | ✅ Yes | [cerebras.ai](https://cerebras.ai) |
 | **Groq** | ~0.5 s | ✅ Yes | [console.groq.com](https://console.groq.com) |
 
 Sign up → copy your API key → paste it into Settings → done.
@@ -242,7 +241,7 @@ Voice-to-text (Whisper), file transcription, speaker diarization, and the whiteb
 - 🔒 **Voice + file transcription run locally**, Whisper model is bundled, nothing sent anywhere
 - 🔒 **Speaker diarization runs locally**, pyannote model is bundled, runs in its own subprocess
 - 🔒 **Whiteboard runs locally**, Excalidraw is bundled, no remote calls
-- 🌐 **Text refinement** goes to Cerebras or Groq, same as any AI assistant you use
+- 🌐 **Text refinement** goes to Groq, same as any AI assistant you use
 - 🚫 No analytics, no telemetry, no account required
 
 ---
@@ -311,7 +310,7 @@ venv/bin/python3 main.py
 | Speech-to-text | faster-whisper (offline) |
 | Speaker diarization | pyannote.audio + torch (out-of-process worker) |
 | Voice activity detection | Silero VAD |
-| AI text refinement | Cerebras / Groq API |
+| AI text refinement | Groq API |
 | Spell check | pyspellchecker |
 | Global hotkeys | keyboard |
 | Macro recorder | pynput |

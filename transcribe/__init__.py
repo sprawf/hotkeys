@@ -8,7 +8,7 @@ top of the dependencies the Hotkeys app already ships:
   • pyannote.audio  → speaker diarization (added: ~280 MB to dist incl. CPU torch)
   • yt-dlp          → YouTube ingest (pure-Python, ~5 MB)
   • fpdf2 / python-docx → PDF / DOCX export
-  • Groq / Cerebras → AI summary (already used for refine / ask)
+  • Groq → AI summary (already used for refine / ask)
 
 Public API:
 

@@ -21,7 +21,6 @@ pythonnet>=3.0.3; sys_platform == "win32"
 
 # ── Text-refine providers ─────────────────────────────────────────────────────
 groq>=0.4.0
-cerebras-cloud-sdk>=1.0.0
 httpx>=0.25.0
 certifi>=2024.0.0
 truststore>=0.9.0       # makes Python trust OS cert store → AV/corporate SSL works

@@ -8,7 +8,7 @@ from typing import Callable
 import customtkinter as ctk
 
 from dialogs import alert
-from engine  import (PROVIDER_KEYS, GROQ_MODELS, CEREBRAS_MODELS, provider_available,
+from engine  import (PROVIDER_KEYS, GROQ_MODELS, provider_available,
                      OPENAI_MODELS, ANTHROPIC_MODELS, GEMINI_MODELS,
                      local_provider_available)
 import os
@@ -283,7 +283,7 @@ class SettingsWindow:
         ctk.CTkLabel(scroll, text='ACTIVE PROVIDER', font=(FONT_FAMILY, 9, 'bold'),
                      text_color=TEXT_S).pack(anchor='w', padx=PAD, pady=(PAD, 4))
 
-        self._provider_var = tk.StringVar(value=self.config.get('active_provider', 'cerebras'))
+        self._provider_var = tk.StringVar(value=self.config.get('active_provider', 'groq'))
 
         prov_grid = ctk.CTkFrame(scroll, fg_color='transparent')
         prov_grid.pack(fill='x', padx=PAD, pady=(0, PAD_SM))
@@ -292,7 +292,6 @@ class SettingsWindow:
         short_desc = {
             'local':     'Free · Offline',
             'groq':      'Free tier',
-            'cerebras':  'Free tier · Fast',
             'openai':    'Paid · GPT-4o',
             'anthropic': 'Paid · Claude',
             'gemini':    'Free tier',
@@ -338,7 +337,6 @@ class SettingsWindow:
         # ── Standard providers: API key + model ───────────────────────────────────
         _std_models: dict[str, list[str]] = {
             'groq':      GROQ_MODELS,
-            'cerebras':  CEREBRAS_MODELS,
             'openai':    OPENAI_MODELS,
             'anthropic': ANTHROPIC_MODELS,
             'gemini':    GEMINI_MODELS,
@@ -380,8 +378,8 @@ class SettingsWindow:
             ctk.CTkLabel(cframe, text='Model', font=FONT_SM_BOLD,
                          text_color=TEXT_S).pack(anchor='w', pady=(0, 2))
             model_var = tk.StringVar(value=p.get('model', models[0]))
-            # groq/cerebras: readonly (curated list); others: editable (user may type newer IDs)
-            cb_state  = 'readonly' if key in ('groq', 'cerebras') else 'normal'
+            # groq: readonly (curated list); others: editable (user may type newer IDs)
+            cb_state  = 'readonly' if key == 'groq' else 'normal'
             ctk.CTkComboBox(cframe, values=models, variable=model_var, width=320,
                             fg_color=SURF2, border_color=BORDER2, border_width=1,
                             text_color=TEXT_P, button_color=SURF3,
@@ -672,17 +670,6 @@ class SettingsWindow:
                         max_tokens=1,
                     )
                     success = True
-                elif provider == 'cerebras':
-                    import cerebras.cloud.sdk as _cerebras
-                    # Pull from engine.CEREBRAS_MODELS so the Test
-                    # button doesn't break when Cerebras rotates models.
-                    from engine import CEREBRAS_MODELS
-                    _cerebras.Cerebras(api_key=api_key).chat.completions.create(
-                        model=CEREBRAS_MODELS[0],
-                        messages=[{'role': 'user', 'content': 'hi'}],
-                        max_tokens=1,
-                    )
-                    success = True
                 elif provider == 'openai':
                     from openai import OpenAI
                     OpenAI(api_key=api_key).chat.completions.create(
@@ -816,7 +803,7 @@ class SettingsWindow:
 
         # Providers, standard (API key + model)
         cfg.setdefault('providers', {})
-        for key in ['groq', 'cerebras', 'openai', 'anthropic', 'gemini']:
+        for key in ['groq', 'openai', 'anthropic', 'gemini']:
             if key not in self._api_widgets:
                 continue
             w = self._api_widgets[key]

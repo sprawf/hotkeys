@@ -33,7 +33,7 @@ def file_exists(rel: str) -> tuple[bool, str]:
 
 
 def bundled_keys_valid() -> tuple[bool, str]:
-    """_bundled_keys.py must exist AND contain non-empty GROQ + CEREBRAS
+    """_bundled_keys.py must exist AND contain non-empty GROQ
     keys with the right prefix. Empty strings would silently break cloud
     features same as missing file."""
     for parent in (DIST, INTERNAL):
@@ -45,8 +45,6 @@ def bundled_keys_valid() -> tuple[bool, str]:
             'GROQ':       "gsk_",
             'GROQ_2':     "gsk_",
             'GROQ_3':     "gsk_",
-            'CEREBRAS':   "csk-",
-            'CEREBRAS_2': "csk-",
         }
         missing = []
         for name, prefix in checks.items():
@@ -64,7 +62,7 @@ def bundled_keys_valid() -> tuple[bool, str]:
                     break
         if missing:
             return False, f'_bundled_keys.py present at {p} but INVALID: ' + '; '.join(missing)
-        return True, f'_bundled_keys.py at {p} ({p.stat().st_size} bytes, GROQ+GROQ_2+CEREBRAS all valid)'
+        return True, f'_bundled_keys.py at {p} ({p.stat().st_size} bytes, GROQ+GROQ_2+GROQ_3 all valid)'
     return False, (
         f'_bundled_keys.py MISSING from BOTH {DIST} and {INTERNAL}. '
         f'Cloud STT/refine/vision will silently fall back to local-only. '

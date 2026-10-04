@@ -1,4 +1,4 @@
-"""Model roster freshness check for Cerebras + Groq.
+"""Model roster freshness check for Groq.
 
 Run this quarterly (or whenever a chat call starts 404-ing) to see:
   1. Every model each provider currently exposes to your bundled key.
@@ -9,7 +9,7 @@ Run this quarterly (or whenever a chat call starts 404-ing) to see:
 Usage:
     python E:\\Hotkeys\\refresh_models.py
 
-Exit code 0 = every model in engine.CEREBRAS_MODELS / engine.GROQ_MODELS
+Exit code 0 = every model in engine.GROQ_MODELS
 is confirmed live. Non-zero = one or more have died and the source
 comments in engine.py need updating.
 
@@ -24,23 +24,20 @@ sys.path.insert(0, r'E:\Hotkeys')
 import requests
 import engine as hk_engine
 try:
-    from _bundled_keys import CEREBRAS, GROQ, GROQ_2
-    KEYS = {'cerebras': [CEREBRAS], 'groq': [GROQ, GROQ_2]}
+    from _bundled_keys import GROQ, GROQ_2
+    KEYS = {'groq': [GROQ, GROQ_2]}
 except Exception:
     print('_bundled_keys not importable — using user-config keys instead.')
     import storage
     cfg = storage.load_config()
     KEYS = {
-        'cerebras': hk_engine._resolve_keys(cfg, 'cerebras'),
         'groq':     hk_engine._resolve_keys(cfg, 'groq'),
     }
 
 ENDPOINTS = {
-    'cerebras': 'https://api.cerebras.ai/v1/models',
     'groq':     'https://api.groq.com/openai/v1/models',
 }
 HARDCODED = {
-    'cerebras': hk_engine.CEREBRAS_MODELS,
     'groq':     hk_engine.GROQ_MODELS,
 }
 
@@ -61,7 +58,7 @@ def fetch(provider: str) -> set[str] | None:
 
 def main() -> int:
     dead: list[tuple[str, str]] = []
-    for provider in ('cerebras', 'groq'):
+    for provider in ('groq',):
         print(f'\n=== {provider} ===')
         live = fetch(provider)
         if live is None:

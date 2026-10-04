@@ -1,6 +1,6 @@
 """
 Hotkeys, unified text refinement + speech-to-text app.
-Merges PromptRefiner (Groq / Cerebras / local Qwen) with KaiWhisper (faster-whisper).
+Merges PromptRefiner (Groq / local Qwen) with KaiWhisper (faster-whisper).
 One tray icon, both features, keyboard-library hotkeys.
 """
 import os
@@ -677,7 +677,7 @@ class SplashScreen:
       • whisper    , load the faster-whisper model from disk
       • whisper_jit, JIT-warm CTranslate2's CPU kernels
       • cloud      , open TLS connection to Groq for cloud transcription
-      • provider   , pre-warm the LLM provider (Groq/Cerebras/local)
+      • provider   , pre-warm the LLM provider (Groq/local)
 
     Callers use:
       mark_done('whisper')        # default 1.0, fully done
@@ -1146,7 +1146,7 @@ class App:
         if isinstance(self.provider, LocalProvider):
             _prov_label = 'Loading local Qwen model'
         elif self.provider.ready:
-            _active = self.config.get('active_provider', 'cerebras').title()
+            _active = self.config.get('active_provider', 'groq').title()
             _prov_label = f'Connecting to {_active}'
         else:
             _prov_label = 'AI provider (add API key in Settings)'
@@ -2142,7 +2142,7 @@ class App:
 
         # ── 0b. Cancel any in-flight chat-note LLM stream ────────────────
         # The chat panel inside Quick Notes (Shift+F4 follow-ups) can
-        # have a refine() worker out talking to Cerebras/Groq. Per the
+        # have a refine() worker out talking to Groq. Per the
         # tray coverage rule, Stop everything must abort that so a
         # stale answer doesn't land in the transcript after reset.
         try:
@@ -9286,14 +9286,10 @@ class App:
             pystray.MenuItem('🤖  AI Brain', pystray.Menu(
                 *([prov_item('local', 'Qwen 2.5 1.5B  (Local · Free)')]
                   if local_provider_available() else []),
-                # Cerebras serves Llama on dedicated inference hardware,
-                # it's measurably the fastest for Refine / Ask / Chain.
-                # Groq is still fast but second; it's also the only one
-                # that exposes a Whisper endpoint, so dictation + F9
-                # transcribe always route through Groq regardless of which
-                # one is picked here.
-                prov_item('cerebras', 'Cerebras  (fastest)'),
-                prov_item('groq',     'Groq  (also fast)'),
+                # Groq is the only bundled cloud provider (Cerebras went
+                # paid-only), and it also exposes the Whisper endpoint, so
+                # dictation + F9 transcribe route through Groq regardless.
+                prov_item('groq',     'Groq  (free, fast)'),
             )),
             pystray.MenuItem('🎤  Dictation mode', pystray.Menu(
                 pystray.MenuItem(
@@ -9377,7 +9373,7 @@ class App:
         logger.info(f'Push-to-talk toggled: {state}')
 
     def _tooltip(self) -> str:
-        active  = self.config.get('active_provider', 'cerebras')
+        active  = self.config.get('active_provider', 'groq')
         r_state = 'Ready' if self.provider.ready else 'Loading…'
         w_state = '🔴 Recording' if self._whisper_recording else 'Idle'
         paused = ''

@@ -26,7 +26,7 @@ Developer reference for AI-assisted sessions. Complements FIXES.md (bug history)
 | `macros/save_prompt.py` | "Save this macro?" dialog |
 | `settings.py` | Settings window |
 | `storage.py` | All path helpers + config/prompts/history I/O |
-| `engine.py` | AI provider abstraction (Groq / Cerebras / Local) |
+| `engine.py` | AI provider abstraction (Groq / Local) |
 | `theme.py` | Colour constants shared across all UI files |
 | `vision.py` | Groq vision API — OCR images for Explain feature |
 | `sticky_note.py` | Per-prompt floating note (per-prompt hotkeys) |

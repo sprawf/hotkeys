@@ -15,7 +15,7 @@ Usage examples:
     # All 6 formats
     python -m transcribe.cli E:/clip.mp3 --formats txt,srt,vtt,csv,docx,pdf --out E:/out
 
-    # With AI summary (uses the same Groq/Cerebras provider as the app)
+    # With AI summary (uses the same Groq provider as the app)
     python -m transcribe.cli E:/clip.mp3 --summary --out E:/out
 
 Phase progress is printed to stderr so stdout stays clean for piping the
@@ -43,7 +43,7 @@ def _set_console_utf8() -> None:
 
 def _summarize(job) -> str:
     """Send the joined transcript through engine.py's configured provider
-    (Groq / Cerebras / local) for a TL;DR summary. Best-effort, returns
+    (Groq / local) for a TL;DR summary. Best-effort, returns
     '' on any failure so the rest of the pipeline still ships."""
     try:
         # Lazy import so a --help with no deps still works.

@@ -302,7 +302,7 @@ def _postprocess_answer(answer: str, *,
     answer text.
     """
     # ── CJK-bracket normalisation ──────────────────────────────────────────
-    # Cerebras' gpt-oss-120b non-deterministically emits fullwidth CJK
+    # gpt-oss-120b non-deterministically emits fullwidth CJK
     # brackets 【N】 instead of ASCII [N] around citations. The rest of
     # this function (and the UI citation-chip renderer) matches only
     # ASCII, so without this the chips silently don't render and
@@ -351,7 +351,7 @@ def _postprocess_answer(answer: str, *,
     answer = re.sub(r'\[(\d+)\]', _fix_cite, answer)
 
     # Collapse consecutive duplicate citation markers: "[13] [13]" or
-    # "[7][7][7]" → "[13]" / "[7]". Cerebras' reasoning models occasionally
+    # "[7][7][7]" → "[13]" / "[7]". Reasoning models occasionally
     # emit the same chunk id back-to-back when they double-cite for
     # emphasis; a single chip reads cleaner.
     answer = re.sub(r'(\[(\d+)\])(?:\s*\[\2\])+', r'\1', answer)
@@ -611,11 +611,11 @@ def ask(nb_id: str, question: str, *,
     # For a corpus like the Quran morphology (~900 char/chunk) that's
     # still ~30-35 chunks — plenty to enumerate a term appearing 5-25
     # times across the file.
-    # Cerebras gpt-oss-120b is primary and has huge context; 50k fits
-    # ~55 chunks of ~900 chars each. On a Groq fallback this will 413
-    # (Groq caps around 40k body) but Cerebras stays up 99% of the time.
-    # Higher would need per-provider dispatch.
-    char_budget = 50_000 if is_exhaustive else _CONTEXT_CHAR_BUDGET
+    # Groq is the only cloud provider now. Measured live 2026-10-04 against
+    # openai/gpt-oss-120b: a 50k-char context gets "413 Request too large"
+    # (which is what every exhaustive question hit once Cerebras, the old
+    # primary that tolerated 50k, went paid-only); 30k succeeds.
+    char_budget = 30_000 if is_exhaustive else _CONTEXT_CHAR_BUDGET
     for n, hit in enumerate(hits, start=1):
         chunk_text = hit['text']
         # Stop adding chunks once we'd exceed the context budget — keeps

@@ -103,7 +103,7 @@ datas += [(str(ROOT / 'assets'), 'assets')]
 # Prompt library
 datas += [(str(ROOT / 'prompts.json'), '.')]
 
-# ── Bundled API keys (Cerebras + Groq) — CRITICAL ────────────────────────────
+# ── Bundled API keys (Groq) — CRITICAL ────────────────────────────
 # _bundled_keys.py provides the free-tier API keys baked into every dist so
 # users get instant cloud STT / refine / vision without needing to sign up
 # for their own keys. Listing it in hiddenimports alone is NOT enough:
@@ -118,7 +118,7 @@ else:
     raise SystemExit(
         f'!! FATAL: {_bk} missing. Every dist without it silently falls '
         f'back to local models for cloud features. Create the file with '
-        f'CEREBRAS/GROQ/CEREBRAS_2/GROQ_2 keys before building.'
+        f'GROQ/GROQ_2/GROQ_3 keys before building.'
     )
 
 # ── Ask Docs (Shift+F11 NotebookLM-style Q&A subpackage) ────────────────────
@@ -315,9 +315,6 @@ hiddenimports = [
 
     # AI providers
     'groq',
-    'cerebras',
-    'cerebras.cloud',
-    'cerebras.cloud.sdk',
     'httpx',
     'certifi',
     'truststore',
@@ -453,7 +450,6 @@ hiddenimports += _mg_hidden   # magika submodules
 hiddenimports += collect_submodules('ctranslate2')
 hiddenimports += [m for m in collect_submodules('onnxruntime') if 'quantization' not in m and 'onnx' not in m]
 hiddenimports += collect_submodules('groq')
-hiddenimports += collect_submodules('cerebras')
 hiddenimports += collect_submodules('pystray')
 hiddenimports += collect_submodules('scipy.signal')
 hiddenimports += _pynput_hidden   # pynput submodules from collect_all

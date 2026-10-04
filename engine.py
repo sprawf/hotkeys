@@ -24,11 +24,10 @@ except Exception as _ts_err:
 
 # ── Provider metadata ────────────────────────────────────────────────────────
 
-PROVIDER_KEYS    = ['local', 'groq', 'cerebras', 'openai', 'anthropic', 'gemini', 'custom']
+PROVIDER_KEYS    = ['local', 'groq', 'openai', 'anthropic', 'gemini', 'custom']
 PROVIDER_LABELS  = {
     'local':     'Qwen 2.5 1.5B  (Local · Free · GPU accelerated)',
-    'groq':      'Groq  (Free tier · 70B · sub-1s · falls back to Cerebras)',
-    'cerebras':  'Cerebras  (Free tier · ultra-fast · falls back to Groq)',
+    'groq':      'Groq  (Free tier · 120B · sub-1s · falls back to local)',
     'openai':    'OpenAI  (GPT-4o · paid · bring your own key)',
     'anthropic': 'Anthropic Claude  (Claude 3.5 · paid · bring your own key)',
     'gemini':    'Google Gemini  (free tier available · bring your own key)',
@@ -36,22 +35,6 @@ PROVIDER_LABELS  = {
 }
 GROQ_MODELS      = ['openai/gpt-oss-120b', 'qwen/qwen3.8-27b',
                     'llama-3.1-8b-instant']
-CEREBRAS_MODELS  = ['gpt-oss-120b', 'gemma-4-31b']
-# Cerebras Developer-tier model roster verified live 2026-07-18 against
-# GET /v1/models with the bundled key (see refresh_models.py):
-#   • gpt-oss-120b   — reasoning model, primary; ~600ms end-to-end at
-#                      max_tokens=4096. Needs the reasoning-aware refine()
-#                      path below (spends ~100 tokens on internal reasoning
-#                      before emitting content).
-#   • gemma-4-31b    — plain chat model, ~1.4s. Reliable fallback when
-#                      reasoning models truncate.
-# Deliberately EXCLUDED even though currently live:
-#   • zai-glm-4.7    — Cerebras served a 30-day retirement notice
-#                      effective 2026-08-17. Not offered as a Settings
-#                      choice; storage.py's migration set already
-#                      auto-rescues any user who's saved it.
-# Retired (all 404 now): llama3.1-8b, llama3.1-70b, llama-3.3-70b.
-# Re-verify quarterly with:  python E:\Hotkeys\refresh_models.py
 OPENAI_MODELS    = ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-3.5-turbo', 'o1', 'o1-mini']
 ANTHROPIC_MODELS = ['claude-3-5-sonnet-20241022', 'claude-3-5-haiku-20241022',
                     'claude-3-opus-20240229', 'claude-3-haiku-20240307']
@@ -61,26 +44,19 @@ GEMINI_MODELS    = ['gemini-2.0-flash', 'gemini-1.5-pro', 'gemini-1.5-flash', 'g
 # Loaded from _bundled_keys.py (gitignored, baked into installer builds).
 # Falls back to empty strings in open-source / dev builds.
 try:
-    from _bundled_keys import CEREBRAS as _CB_KEY, GROQ as _GQ_KEY
+    from _bundled_keys import GROQ as _GQ_KEY
     try:
-        from _bundled_keys import CEREBRAS_2 as _CB_KEY_2, GROQ_2 as _GQ_KEY_2
+        from _bundled_keys import GROQ_2 as _GQ_KEY_2
     except ImportError:
-        _CB_KEY_2 = _GQ_KEY_2 = ''
+        _GQ_KEY_2 = ''
     try:
         from _bundled_keys import GROQ_3 as _GQ_KEY_3
     except ImportError:
         _GQ_KEY_3 = ''
-    try:
-        from _bundled_keys import CEREBRAS_3 as _CB_KEY_3
-    except ImportError:
-        _CB_KEY_3 = ''
     _BUNDLED = {
         'groq':       _GQ_KEY,
         'groq_2':     _GQ_KEY_2,
         'groq_3':     _GQ_KEY_3,
-        'cerebras':   _CB_KEY,
-        'cerebras_2': _CB_KEY_2,
-        'cerebras_3': _CB_KEY_3,
     }
 except ImportError as _bk_exc:
     # LOUD — missing bundled keys is a critical dist bug.
@@ -91,8 +67,7 @@ except ImportError as _bk_exc:
         f'Settings. This is almost always a dist packaging bug — '
         f'_bundled_keys.py should be beside the .exe.'
     )
-    _BUNDLED: dict = {'groq': '', 'groq_2': '', 'groq_3': '',
-                      'cerebras': '', 'cerebras_2': '', 'cerebras_3': ''}
+    _BUNDLED: dict = {'groq': '', 'groq_2': '', 'groq_3': ''}
 
 _SSL_ERRS = (
     # SSL / TLS layer (all AV vendors)
@@ -121,7 +96,7 @@ def _mark_ssl_broken() -> None:
         _ssl_ok = False
         logger.warning(
             'Antivirus SSL inspection detected, switching to verify=False. '
-            'To fix permanently: add api.groq.com / api.cerebras.ai to your '
+            'To fix permanently: add api.groq.com to your '
             'antivirus HTTPS scanning exclusions.'
         )
 
@@ -180,7 +155,7 @@ def friendly_error_message(exc: BaseException | str, *, feature: str,
         exc:             the exception (or its str()) to translate.
         feature:         short name for the action that failed
                          ("Refine", "Ask", "Chain", "OCR", "Explain").
-        active_provider: 'local' / 'groq' / 'cerebras' / ..., when
+        active_provider: 'local' / 'groq' / ..., when
                          present and the user is offline, the message
                          distinguishes "switch to Local" from "you're
                          already local but vision needs online".
@@ -192,7 +167,7 @@ def friendly_error_message(exc: BaseException | str, *, feature: str,
             # User is already on local but the FEATURE itself needs a
             # vision-capable model that only ships in cloud providers.
             return (f'{feature} needs an online provider, '
-                    f'switch to Groq/Cerebras in Settings')
+                    f'switch to Groq in Settings')
         return f'You appear to be offline, {feature} needs an internet connection'
 
     msg_l = msg.lower()
@@ -219,11 +194,11 @@ def provider_available(key: str) -> bool:
     Dist excludes heavy optional SDKs (openai, anthropic, google-genai)
     to keep the zip small; the Settings dropdown should hide options
     that would raise "pip install X" on use — users can't pip in a
-    frozen exe. groq + cerebras are always bundled.
+    frozen exe. groq is always bundled.
     """
     if key == 'local':
         return local_provider_available()
-    if key in ('groq', 'cerebras', 'custom'):
+    if key in ('groq', 'custom'):
         return True
     _pkg = {'openai': 'openai', 'anthropic': 'anthropic', 'gemini': 'google.genai'}.get(key)
     if _pkg is None:
@@ -358,7 +333,7 @@ def _robust_post(url: str, payload: dict, headers: dict,
     raise RuntimeError(
         f'Network blocked by antivirus (all methods failed).\n'
         f'Fix: open AVG → Settings → Shields → Web Shield → '
-        f'HTTPS Scanning → add exceptions: api.groq.com, api.cerebras.ai\n'
+        f'HTTPS Scanning → add exceptions: api.groq.com\n'
         f'Last error: {str(last_exc)[:120]}'
     )
 
@@ -487,7 +462,7 @@ class LocalProvider(Provider):
         Why scoped instead of permanent: the previous implementation
         replaced `requests.Session.send` at the class level, which
         silently disabled TLS verification for every HTTPS call in the
-        process (Groq, Cerebras, ask_docs LLM, future plugins) for the
+        process (Groq, ask_docs LLM, future plugins) for the
         rest of the session. A real MITM (public Wi-Fi, hostile proxy)
         would have gone undetected. Now the bypass is contained to
         exactly the huggingface download that needed it."""
@@ -531,7 +506,7 @@ class LocalProvider(Provider):
         except ImportError:
             raise RuntimeError(
                 'Local AI is not included in this build.\n'
-                'Use Groq or Cerebras instead, both are free and much faster.'
+                'Use Groq instead, it is free and much faster.'
             )
         self._loading = True
         logger.info('Loading local GGUF model…')
@@ -616,62 +591,6 @@ class GroqProvider(Provider):
         raise last_err or RuntimeError('All Groq keys exhausted')
 
 
-class CerebrasProvider(Provider):
-    _URL = 'https://api.cerebras.ai/v1/chat/completions'
-
-    def __init__(self, api_keys: list[str], model: str = CEREBRAS_MODELS[0]) -> None:
-        self.api_keys = api_keys
-        self.model    = model
-
-    @property
-    def name(self)  -> str:  return f'Cerebras ({self.model})'
-    @property
-    def ready(self) -> bool: return bool(self.api_keys)
-
-    def refine(self, text: str, system_prompt: str) -> str:
-        # Cerebras' current lineup includes reasoning models (gpt-oss-120b,
-        # zai-glm-4.7) whose `reasoning` trace can easily exceed 4k tokens
-        # on complex exhaustive prompts. 16384 gives the reasoning stage
-        # room to finish AND emit a several-hundred-item answer (each
-        # bullet ~25-40 tokens, so 16k output = up to ~400 bullets).
-        # Plain-chat models (gemma-4-31b) are unaffected — they use what
-        # they need.
-        payload = {
-            'model': self.model,
-            'messages': [{'role': 'system', 'content': system_prompt},
-                         {'role': 'user',   'content': text}],
-            'max_tokens': 16384,
-        }
-        last_err: Exception | None = None
-        for key in self.api_keys:
-            try:
-                headers = {'Authorization': f'Bearer {key}',
-                           'Content-Type': 'application/json'}
-                data = _robust_post(self._URL, payload, headers)
-                # Reasoning models: response is {content: '...', reasoning: '...'}.
-                # Non-reasoning models: response is {content: '...'} only.
-                # A 200 with empty content means the model burned every token
-                # on reasoning without producing an answer — treat as a
-                # transient failure so the FallbackProvider rotates to Groq
-                # instead of crashing with a KeyError.
-                msg = data.get('choices', [{}])[0].get('message', {})
-                content = (msg.get('content') or '').strip()
-                if not content:
-                    raise RuntimeError(
-                        f'Cerebras {self.model}: empty content '
-                        f'(reasoning tokens={len(msg.get("reasoning", ""))}, '
-                        f'try a higher max_tokens or a non-reasoning model)'
-                    )
-                return _clean(content)
-            except RuntimeError as e:
-                if _is_rate_limit(e):
-                    logger.warning(f'Cerebras key …{key[-6:]} rate-limited, rotating to next key')
-                    last_err = e
-                    continue
-                raise
-        raise last_err or RuntimeError('All Cerebras keys exhausted')
-
-
 class _OpenAICompatProvider(Provider):
     """Shared base for providers that speak the OpenAI chat-completions API.
 
@@ -695,7 +614,7 @@ class _OpenAICompatProvider(Provider):
             # The OpenAI SDK defaults to a 600 s timeout and 2 internal
             # retries — blackholed network / dead Ollama host could leave
             # the "Thinking…" pill stuck for tens of minutes. Match the
-            # Groq / Cerebras `_robust_post` budget instead.
+            # Groq `_robust_post` budget instead.
             kw.setdefault('timeout', 30.0)
             kw.setdefault('max_retries', 0)
             resp = OpenAI(**kw).chat.completions.create(
@@ -818,7 +737,7 @@ class AnthropicProvider(Provider):
                         _httpx.Client(verify=False))
                 kw['http_client'] = (
                     self.__class__._SHARED_NO_VERIFY_CLIENT_ANTHROPIC)
-            # Bound the call to 30 s + 0 retries, matching Groq/Cerebras.
+            # Bound the call to 30 s + 0 retries, matching Groq.
             # Without this Anthropic's SDK default (~600 s, 2 retries)
             # could leave the user staring at "Thinking…" for tens of
             # minutes when the network is blackholed.
@@ -856,7 +775,7 @@ class FallbackProvider(Provider):
         # active provider is exactly LocalProvider, so a chained Local
         # tier (active='local' with bundled cloud keys) never loaded,
         # and the first refine() call AttributeError'd → silent fall to
-        # Cerebras, breaking the "stays on-device" promise.
+        # the cloud, breaking the "stays on-device" promise.
         import threading as _threading
         def _walk(p):
             if isinstance(p, FallbackProvider):
@@ -912,14 +831,15 @@ def build_provider(config: dict) -> Provider:
     Each cloud provider rotates through its keys on rate-limit before handing
     off to the next tier.  Local Qwen is always the last resort.
     """
-    active = config.get('active_provider', 'cerebras')
+    active = config.get('active_provider', 'groq')
+    if active == 'cerebras':
+        # Cerebras went paid-only (402 on every call, 2026-10); old configs
+        # that still name it are served by Groq, which hosts the same models.
+        active = 'groq'
     pcfg   = config.get('providers', {})
 
-    groq_model = pcfg.get('groq',     {}).get('model', GROQ_MODELS[0])
-    cb_model   = pcfg.get('cerebras', {}).get('model', CEREBRAS_MODELS[0])
-
-    groq     = GroqProvider(api_keys=_resolve_keys(config, 'groq'),      model=groq_model)
-    cerebras = CerebrasProvider(api_keys=_resolve_keys(config, 'cerebras'), model=cb_model)
+    groq_model = pcfg.get('groq', {}).get('model', GROQ_MODELS[0])
+    groq = GroqProvider(api_keys=_resolve_keys(config, 'groq'), model=groq_model)
 
     # ── Single-provider modes (no bundled fallback chain) ─────────────────────
     if active == 'openai':
@@ -945,28 +865,17 @@ def build_provider(config: dict) -> Provider:
         return CustomProvider(api_key=key, base_url=base_url, model=model)
 
     # ── Cloud + local chain ───────────────────────────────────────────────────
-    # Build ordered list: selected provider first, other cloud second, Local last.
     local = LocalProvider() if local_provider_available() else None
 
     if active == 'groq':
         tiers: list[Provider] = []
-        if groq.ready:     tiers.append(groq)
-        if cerebras.ready: tiers.append(cerebras)
-        if local:          tiers.append(local)
+        if groq.ready: tiers.append(groq)
+        if local:      tiers.append(local)
         return _chain(tiers) if tiers else groq   # groq shown as not-ready if nothing available
 
-    if active == 'cerebras':
-        tiers = []
-        if cerebras.ready: tiers.append(cerebras)
-        if groq.ready:     tiers.append(groq)
-        if local:          tiers.append(local)
-        return _chain(tiers) if tiers else cerebras
-
-    # 'local' selected, local first, cloud as silent backup
+    # 'local' selected, local first, Groq as silent backup
     if local:
         tiers = [local]
-        if cerebras.ready: tiers.append(cerebras)
-        if groq.ready:     tiers.append(groq)
+        if groq.ready: tiers.append(groq)
         return _chain(tiers)
-    if cerebras.ready: return FallbackProvider(cerebras, groq) if groq.ready else cerebras
     return groq

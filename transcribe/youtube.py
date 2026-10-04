@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 # Plug truststore into SSL once at import so yt-dlp's urllib calls trust the
 # Windows root cert store instead of the empty venv bundle. The rest of the
-# Hotkeys app already does the same trick for Groq/Cerebras (see
+# Hotkeys app already does the same trick for Groq (see
 # hotkeys.spec hiddenimports). Falling back to no-op keeps non-Windows
 # platforms unaffected.
 try:
