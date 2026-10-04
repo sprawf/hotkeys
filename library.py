@@ -4699,18 +4699,18 @@ class LibraryWindow:
             # Historic bug: main.py forgot to wire library._on_open_ask_docs,
             # the button did nothing, no error appeared anywhere. Log every
             # click, log whether the callback was set, log any exception.
-            logger.info('Ask Docs tab: Open button clicked.')
+            _log.info('Ask Docs tab: Open button clicked.')
             if self._on_open_ask_docs is None:
-                logger.error('Ask Docs tab: _on_open_ask_docs callback is '
+                _log.error('Ask Docs tab: _on_open_ask_docs callback is '
                              'None — main.py wiring bug. Fix: '
                              'self.library._on_open_ask_docs = '
                              'self._do_open_ask_docs')
                 return
             try:
                 self._on_open_ask_docs()
-                logger.info('Ask Docs tab: callback returned OK.')
+                _log.info('Ask Docs tab: callback returned OK.')
             except Exception:
-                logger.exception('Ask Docs tab: callback raised')
+                _log.exception('Ask Docs tab: callback raised')
 
         _btn(container, f'📚  Open Ask Docs  ({ad_hk})', _open, width=260,
              fg_color=ACCENT, hover=ACCENTL,

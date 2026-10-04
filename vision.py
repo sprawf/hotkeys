@@ -186,6 +186,57 @@ def _resize(img):
     return img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
 
 
+# Qwen-VL style vision models turn an image into a number of patches that
+# scales with its pixel area. A small crop (one line of text selected with
+# the PrtSc box) yields so few patches that the model stops transcribing
+# and starts hallucinating: measured live 2026-10-05 on qwen/qwen3.8-27b,
+# a 520x120 one-line crop came back as a 3,200-char invented HTML page
+# (5/5 runs) or as duplicated half-lines, while the same crop upscaled 3x
+# was transcribed cleanly (4/4). So small images are upscaled first.
+_MIN_AREA_PX = 400_000
+_MAX_UPSCALE = 4.0
+
+_OCR_SYSTEM = (
+    'You are an OCR engine. Transcribe the text visible in the image as '
+    'plain text, exactly as written. Never output HTML, CSS, code, '
+    'markdown, code fences, or any commentary, and never recreate or '
+    'describe the layout.'
+)
+_RETRY_PROMPT = ('Transcribe all the text in this image exactly as written. '
+                 'Output only the text.')
+
+
+def _upscale_small(img):
+    """Upscale low-pixel-count images so the vision model gets enough
+    patches to read them. No-op for normal screenshots."""
+    from PIL import Image
+    w, h = img.size
+    area = w * h
+    if area <= 0 or area >= _MIN_AREA_PX or max(w, h) >= _MAX_PX:
+        return img
+    factor = min((_MIN_AREA_PX / area) ** 0.5, _MAX_PX / max(w, h), _MAX_UPSCALE)
+    if factor <= 1.05:
+        return img
+    return img.resize((int(w * factor), int(h * factor)), Image.LANCZOS)
+
+
+def _looks_like_invented_html(text: str) -> bool:
+    low = text.lstrip().lower()
+    return (low.startswith('```html') or low.startswith('<!doctype')
+            or '<html' in low[:300])
+
+
+def _unfence(text: str) -> str:
+    """Strip a code fence the model wrapped around the whole answer."""
+    t = text.strip()
+    if t.startswith('```') and t.endswith('```') and len(t) > 6:
+        t = t[3:-3]
+        nl = t.find('\n')
+        if nl != -1 and t[:nl].strip().isalpha():   # language tag line
+            t = t[nl + 1:]
+    return t.strip()
+
+
 def _to_base64(img) -> str:
     """Encode a PIL Image as a JPEG base64 string."""
     buf = io.BytesIO()
@@ -220,21 +271,22 @@ def extract_text(img, api_key: str, model: str = DEFAULT_VISION_MODEL) -> str:
             'Add your key in Settings → Providers → Groq.'
         )
 
-    img = _resize(img)
+    img = _upscale_small(_resize(img))
     b64 = _to_base64(img)
 
-    payload = {
-        'model': model,
-        'messages': [{
+    def _payload(system, prompt):
+        msgs = [{'role': 'system', 'content': system}] if system else []
+        msgs.append({
             'role':    'user',
             'content': [
-                {'type': 'text',      'text': _EXTRACT_PROMPT},
+                {'type': 'text',      'text': prompt},
                 {'type': 'image_url', 'image_url': {'url': f'data:image/jpeg;base64,{b64}'}},
             ],
-        }],
-        'max_tokens':  4096,
-        'temperature': 0.0,
-    }
+        })
+        return {'model': model, 'messages': msgs,
+                'max_tokens': 4096, 'temperature': 0.0}
+
+    payload = _payload(_OCR_SYSTEM, _EXTRACT_PROMPT)
     headers = {
         'Authorization': f'Bearer {api_key}',
         'Content-Type':  'application/json',
@@ -255,11 +307,23 @@ def extract_text(img, api_key: str, model: str = DEFAULT_VISION_MODEL) -> str:
     except Exception as exc:
         raise RuntimeError(f'Unexpected API response: {exc}') from exc
 
+    # Safety net: if the model still invented an HTML page instead of
+    # transcribing, retry once with the plain prompt (no system message),
+    # which transcribed correctly in testing.
+    if _looks_like_invented_html(_THINK_BLOCK.sub('', text)):
+        logger.warning('vision: model returned HTML instead of text; retrying once.')
+        try:
+            retry = _robust_post(url, _payload(None, _RETRY_PROMPT), headers,
+                                 timeout=_TIMEOUT)
+            text = retry['choices'][0]['message']['content']
+        except Exception as exc:
+            logger.warning(f'vision: retry failed ({exc}); using first answer.')
+
     # Strip <think>...</think> blocks from reasoning models (qwen3.6, gpt-oss).
     # These carry model reasoning that would otherwise pollute the OCR output.
     text = _THINK_BLOCK.sub('', text)
     text = _THINK_ORPHAN.sub('', text)   # unmatched leftover if truncated
-    text = text.strip()
+    text = _unfence(text)
 
     logger.info(f'vision: extracted {len(text)} chars from image via {model}')
     return text

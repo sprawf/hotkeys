@@ -8028,9 +8028,12 @@ class App:
                 self._audio.start_recording()
             except Exception as e:
                 logger.error(f'Microphone error (after 4 retries): {e}')
+                # `e` is unbound once this except block ends, but _fail
+                # runs later on the Tk thread, so capture the text now.
+                err_text = str(e)
                 def _fail():
                     self._whisper_recording = False
-                    self._show_mic_error(str(e))
+                    self._show_mic_error(err_text)
                 self.root.after(0, _fail)
 
         threading.Thread(target=_start_audio, daemon=True,
