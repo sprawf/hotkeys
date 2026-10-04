@@ -100,6 +100,53 @@ def _pick_best_physical_mic(exclude: set | None = None) -> int | None:
     return idx
 
 
+_PA_LOCK = threading.Lock()
+
+
+def _reinit_portaudio() -> bool:
+    """Tear down and re-initialize PortAudio so it re-enumerates devices.
+
+    PortAudio snapshots the device list once at initialization and never
+    refreshes it. When Windows re-enumerates audio endpoints (a flapping
+    headset/mic jack, a driver reset, USB/Bluetooth device churn) the
+    snapshot goes stale: device indices shift and every open fails with
+    "Invalid sample rate" / "Unsupported format" / DirectSound "no driver"
+    / "Insufficient memory", while other apps (a browser tab in a Meet
+    call) work fine because they enumerate live. Re-initializing is the
+    only way to pick up the new device table. CALLER MUST have closed this
+    process's own input stream first (Pa_Terminate closes streams, and a
+    later GC close of a dangling stream is unsafe)."""
+    with _PA_LOCK:
+        try:
+            sd._terminate()
+        except Exception as e:
+            logger.warning(f'PortAudio terminate failed: {e}')
+        try:
+            sd._initialize()
+        except Exception as e:
+            logger.error(f'PortAudio re-initialize FAILED: {e}')
+            return False
+    logger.info('PortAudio re-initialized (device table refreshed).')
+    return True
+
+
+def _close_bounded(stream, timeout: float = 3.0) -> bool:
+    """stop+close a stream on a helper thread; True if it finished within
+    `timeout`. Closing a dead WASAPI stream can block ~10 s."""
+    if stream is None:
+        return True
+    done = threading.Event()
+
+    def _run():
+        try: stream.stop()
+        except Exception: pass
+        try: stream.close()
+        except Exception: pass
+        done.set()
+    threading.Thread(target=_run, daemon=True, name='mic-close').start()
+    return done.wait(timeout)
+
+
 class AudioCapture:
     def __init__(self, on_chunk, on_utterance_ready, cfg, on_interim=None):
         self._on_chunk           = on_chunk
@@ -153,17 +200,71 @@ class AudioCapture:
     def db(self):
         return self._db
 
-    @staticmethod
-    def _discard_stream(stream) -> None:
+    def _discard_stream(self, stream) -> None:
         """Stop+close a stream on a throwaway thread. Closing a dead/zombie
         WASAPI stream can block for ~10 s; never do it on a path the user
-        is waiting on."""
+        is waiting on. Threads are tracked so a PortAudio re-init can wait
+        for them (terminating PortAudio under a concurrent close is unsafe)."""
         def _run():
             try: stream.stop()
             except Exception: pass
             try: stream.close()
             except Exception: pass
-        threading.Thread(target=_run, daemon=True, name='mic-discard').start()
+        t = threading.Thread(target=_run, daemon=True, name='mic-discard')
+        self._pending_discards = [x for x in getattr(self, '_pending_discards', [])
+                                  if x.is_alive()] + [t]
+        t.start()
+
+    def _reinit_audio_stack(self) -> bool:
+        """Close our stream (bounded) and re-initialize PortAudio. Returns
+        False, without touching PortAudio, if anything we own is still
+        mid-close: re-initializing under it is not safe."""
+        stream, self._stream = self._stream, None
+        if not _close_bounded(stream, 3.0):
+            logger.warning('PortAudio re-init skipped: old stream would not close in time.')
+            return False
+        for t in getattr(self, '_pending_discards', []):
+            t.join(3.0)
+            if t.is_alive():
+                logger.warning('PortAudio re-init skipped: a stream is still closing.')
+                return False
+        self._pending_discards = []
+        return _reinit_portaudio()
+
+    def _verify_flowing(self) -> bool:
+        """After an open: True only if callbacks keep arriving."""
+        t0 = time.perf_counter()
+        while not self._first_chunk_seen and (time.perf_counter() - t0) < 0.8:
+            time.sleep(0.01)
+        if not self._first_chunk_seen:
+            return False
+        t_first = self._last_chunk_time
+        time.sleep(0.3)
+        return self._last_chunk_time > t_first
+
+    def _keepalive_reopen(self) -> bool:
+        """One reopen cycle. Try a plain reopen first; if that fails, the
+        PortAudio device table is likely stale, so re-initialize it and
+        try once more."""
+        old, self._stream = self._stream, None
+        if old is not None:
+            self._discard_stream(old)
+        for attempt in (0, 1):
+            if attempt == 1:
+                if not self._reinit_audio_stack():
+                    return False
+            try:
+                self._first_chunk_seen = False
+                self._open_stream()
+                if self._verify_flowing():
+                    return True
+                logger.warning('Mic keepalive: reopened stream is dead, discarding.')
+            except Exception as e:
+                logger.debug(f'Mic keepalive: open failed: {e}')
+            if self._stream is not None:
+                self._discard_stream(self._stream)
+                self._stream = None
+        return False
 
     def start_keepalive(self) -> None:
         """Background self-heal: if the idle mic stream stops delivering
@@ -176,8 +277,11 @@ class AudioCapture:
         self._keepalive_started = True
 
         def _loop():
+            fail_streak = 0
+            wait_s = 5.0
             while True:
-                time.sleep(5.0)
+                time.sleep(wait_s)
+                wait_s = 5.0
                 try:
                     if self._recording:
                         continue
@@ -185,6 +289,7 @@ class AudioCapture:
                              or not self._stream.active
                              or (time.perf_counter() - self._last_chunk_time) > 2.0)
                     if not stale:
+                        fail_streak = 0
                         continue
                     if not self._open_lock.acquire(blocking=False):
                         continue
@@ -192,26 +297,21 @@ class AudioCapture:
                         if self._recording:
                             continue
                         logger.info('Mic keepalive: stream stale, reopening.')
-                        old = self._stream
-                        self._stream = None
-                        if old is not None:
-                            self._discard_stream(old)
-                        self._first_chunk_seen = False
-                        self._open_stream()
-                        t0 = time.perf_counter()
-                        while not self._first_chunk_seen and (time.perf_counter() - t0) < 0.8:
-                            time.sleep(0.01)
-                        t_first = self._last_chunk_time
-                        time.sleep(0.3)
-                        if not self._first_chunk_seen or self._last_chunk_time <= t_first:
-                            logger.warning('Mic keepalive: reopened stream is dead, discarding.')
-                            if self._stream is not None:
-                                self._discard_stream(self._stream)
-                                self._stream = None
-                        else:
-                            logger.info('Mic keepalive: stream healthy again.')
+                        ok = self._keepalive_reopen()
                     finally:
                         self._open_lock.release()
+                    if ok:
+                        fail_streak = 0
+                        logger.info('Mic keepalive: stream healthy again.')
+                    else:
+                        # Back off instead of hammering a broken audio
+                        # stack every 5 s (PortAudio's own heap can corrupt
+                        # after repeated failed opens).
+                        fail_streak += 1
+                        wait_s = min(5.0 * (2 ** fail_streak), 120.0)
+                        logger.warning(
+                            f'Mic keepalive: reopen failed (#{fail_streak}); '
+                            f'next try in {wait_s:.0f}s.')
                 except Exception as e:
                     logger.debug(f'Mic keepalive error: {e}')
 
@@ -476,8 +576,16 @@ class AudioCapture:
                 pass
 
     def start_recording(self):
-        with self._open_lock:
+        # Fail fast rather than silently recording nothing if the audio
+        # stack is wedged inside another open attempt.
+        if not self._open_lock.acquire(timeout=8.0):
+            raise RuntimeError(
+                'Microphone is busy (audio system is re-initializing). '
+                'Try again in a few seconds.')
+        try:
             self._start_recording_impl()
+        finally:
+            self._open_lock.release()
 
     def _start_recording_impl(self):
         """Start capturing to the buffer. Robust against transient PortAudio /
@@ -535,6 +643,10 @@ class AudioCapture:
             if delay > 0:
                 logger.info(f'Mic open retry #{attempt} after {delay*1000:.0f}ms')
                 time.sleep(delay)
+            if attempt >= 1:
+                # A plain retry already failed: PortAudio's device table is
+                # probably stale (jack flap / driver reset). Refresh it.
+                self._reinit_audio_stack()
             try:
                 self._first_chunk_seen = False
                 self._open_stream()

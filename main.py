@@ -207,19 +207,31 @@ if __name__ == '__main__' and '--supervisor' in sys.argv:
             # machine won't have it yet) rather than crashing this thread.
             while not os.path.isfile(hang_log_path):
                 time.sleep(5)
+            # Poll by byte offset and open/close the file on every read.
+            # Holding it open for tailing blocks Windows from renaming
+            # app.log during rotation (no delete-sharing), which silently
+            # kills all app logging at the 1 MB cap.
             try:
-                f = open(hang_log_path, 'r', encoding='utf-8', errors='replace')
-                f.seek(0, os.SEEK_END)
-            except Exception as e:
-                _log(f'Hang-watcher: cannot open app.log ({e}), giving up.')
+                pos = os.path.getsize(hang_log_path)
+            except OSError as e:
+                _log(f'Hang-watcher: cannot stat app.log ({e}), giving up.')
                 return
             _log('Hang-watcher: armed, tailing app.log for WM_DELETE_WINDOW precursor.')
             while True:
-                line = f.readline()
-                if not line:
-                    time.sleep(0.5)
+                time.sleep(0.5)
+                try:
+                    size = os.path.getsize(hang_log_path)
+                    if size < pos:
+                        pos = 0          # rotated / truncated
+                    if size == pos:
+                        continue
+                    with open(hang_log_path, 'rb') as f:
+                        f.seek(pos)
+                        data = f.read(size - pos)
+                    pos = size
+                except OSError:
                     continue
-                if 'WM_DELETE_WINDOW' not in line:
+                if b'WM_DELETE_WINDOW' not in data:
                     continue
                 ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
                 _log(f'Hang-watcher(log): precursor seen, capturing dumps for ~30s (ts={ts}).')
@@ -521,7 +533,40 @@ ctk.set_default_color_theme('dark-blue')
 # one dedicated listener thread — if THAT blocks, only log delivery
 # lags; nothing the user touches waits on it.
 os.makedirs(appdata_dir(), exist_ok=True)
-_log_file_handler = logging.handlers.RotatingFileHandler(
+
+
+class _SafeRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """RotatingFileHandler that never lets a failed rotation silence logging.
+
+    Windows refuses to rename app.log while ANY other process holds it open
+    without delete-sharing (a tailer, an indexer, AV, a second handler). The
+    stock handler then raises inside every emit(), drops the record, and
+    stays at the size cap forever: the app keeps running but its log goes
+    completely dark (confirmed 2026-10-04: app.log frozen at 999,9xx bytes
+    for days, no backup newer than July, so a live "no speech" incident was
+    invisible). Here a failed rotation just keeps appending and retries
+    after a cooldown."""
+
+    _ROTATE_RETRY_S = 60.0
+
+    def shouldRollover(self, record):
+        if time.time() < getattr(self, '_no_rotate_until', 0.0):
+            return False
+        return super().shouldRollover(record)
+
+    def doRollover(self):
+        try:
+            super().doRollover()
+        except Exception:
+            self._no_rotate_until = time.time() + self._ROTATE_RETRY_S
+            try:
+                if self.stream is None:
+                    self.stream = self._open()
+            except Exception:
+                pass
+
+
+_log_file_handler = _SafeRotatingFileHandler(
     log_path(), maxBytes=1_000_000, backupCount=3, encoding='utf-8',
 )
 _log_file_handler.setFormatter(logging.Formatter('%(asctime)s  %(levelname)-8s  %(name)s: %(message)s'))
@@ -7841,7 +7886,7 @@ class App:
                 _restore_log_ok = False
             finally:
                 try:
-                    _log_file_handler = logging.handlers.RotatingFileHandler(
+                    _log_file_handler = _SafeRotatingFileHandler(
                         lp, maxBytes=1_000_000, backupCount=3, encoding='utf-8')
                     _log_file_handler.setFormatter(logging.Formatter(
                         '%(asctime)s  %(levelname)-8s  %(name)s: %(message)s'))
